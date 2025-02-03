@@ -101,8 +101,6 @@ github.com/go-ozzo/ozzo-validation/v4 v4.3.0/go.mod h1:2NKgrcHl3z6cJs+3Oo940FPRi
 github.com/go-sql-driver/mysql v1.4.1/go.mod h1:zAC/RDZ24gD3HViQzih4MyKcchzm+sOG5ZlKdlhCg5w=
 github.com/go-sql-driver/mysql v1.8.1 h1:LedoTUt/eveggdHS9qUFC1EFSa8bU2+1pZjSRpvNJ1Y=
 github.com/go-sql-driver/mysql v1.8.1/go.mod h1:wEBSXgmK//2ZFJyE+qWnIsVGmvmEKlqwuVSjsCm7DZg=
-github.com/go-telegram/bot v1.12.1 h1:2CSwMd+g71/XrmuSpvEjLtsmkfL/s63PdnLboGJQxtw=
-github.com/go-telegram/bot v1.12.1/go.mod h1:i2TRs7fXWIeaceF3z7KzsMt/he0TwkVC680mvdTFYeM=
 github.com/golang-jwt/jwt/v4 v4.5.1 h1:JdqV9zKUdtaa9gdPlywC3aeoEsR681PlKC+4F5gQgeo=
 github.com/golang-jwt/jwt/v4 v4.5.1/go.mod h1:m21LjoU+eqJr34lmDMbreY2eSTRJ1cv77w39/MY0Ch0=
 github.com/golang/glog v0.0.0-20160126235308-23def4e6c14b/go.mod h1:SBH7ygxi8pfUlaOkMMuAQtPIUF8ecWP5IEl/CR7VP2Q=
@@ -143,12 +141,6 @@ github.com/googleapis/enterprise-certificate-proxy v0.3.4 h1:XYIDZApgAnrN1c855gT
 github.com/googleapis/enterprise-certificate-proxy v0.3.4/go.mod h1:YKe7cfqYXjKGpGvmSg28/fFvhNzinZQm8DGnaburhGA=
 github.com/googleapis/gax-go/v2 v2.14.1 h1:hb0FFeiPaQskmvakKu5EbCbpntQn48jyHuvrkurSS/Q=
 github.com/googleapis/gax-go/v2 v2.14.1/go.mod h1:Hb/NubMaVM88SrNkvl8X/o8XWwDJEPqouaLeN2IUxoA=
-github.com/hablullah/go-juliandays v1.0.1-0.20220316153050-f56193695a5b h1:Qp6WC5idnPxaUQpX50s+1jrrjIqaCSuCu2BkQgGx/tQ=
-github.com/hablullah/go-juliandays v1.0.1-0.20220316153050-f56193695a5b/go.mod h1:0JOYq4oFOuDja+oospuc61YoX+uNEn7Z6uHYTbBzdGc=
-github.com/hablullah/go-prayer v1.1.1 h1:pxIj6mJPSBNe2w3G1XUgkGTRXyGzRkwRUkLAjU1b6os=
-github.com/hablullah/go-prayer v1.1.1/go.mod h1:SIKN4PmnPu/jbvTM/9mepX19FyWvLRcFPyvKfMDsyYw=
-github.com/hablullah/go-sampa v1.0.0 h1:8SiiPC7LktYsBYkoitGGPRL416TDXjkECRZsAkUbgy4=
-github.com/hablullah/go-sampa v1.0.0/go.mod h1:NgDnpqL95HgRPkal510TVk7tI6+aLwO3wJgoj0dQ4Pc=
 github.com/hashicorp/golang-lru/v2 v2.0.7 h1:a+bsQ5rvGLjzHuww6tVxozPZFVghXaHOwFs4luLUK2k=
 github.com/hashicorp/golang-lru/v2 v2.0.7/go.mod h1:QeFd9opnmA6QUJc5vARoKUSoFhyfM2/ZepoAG6RGpeM=
 github.com/hinshun/vt10x v0.0.0-20220119200601-820417d04eec h1:qv2VnGeEQHchGaZ/u7lxST/RaJw+cv273q79D81Xbog=

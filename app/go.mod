@@ -3,8 +3,6 @@ module gitlab.saidoff.uz/company/muslim-administration/reading/back
 go 1.23.3
 
 require (
-	github.com/go-telegram/bot v1.12.1
-	github.com/hablullah/go-prayer v1.1.1
 	github.com/ilyakaznacheev/cleanenv v1.5.0
 	github.com/pocketbase/dbx v1.11.0
 	github.com/pocketbase/pocketbase v0.23.12
@@ -44,8 +42,6 @@ require (
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/googleapis/gax-go/v2 v2.14.1 // indirect
-	github.com/hablullah/go-juliandays v1.0.1-0.20220316153050-f56193695a5b // indirect
-	github.com/hablullah/go-sampa v1.0.0 // indirect
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/joho/godotenv v1.5.1 // indirect
