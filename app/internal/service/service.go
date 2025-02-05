@@ -10,6 +10,8 @@ type AuthorizationI interface {
 	OtpRequest(e *core.RecordCreateOTPRequestEvent) error
 	ResetPasswordRequest(e *core.RecordRequestPasswordResetRequestEvent) error
 	ResetPasswordOTPConfirm(req *model.PasswordResetOTPConfirmRequest) (string, error)
+	BookRatingCalculate(e *core.RecordEvent) error
+	BookRatingUpdate(e *core.RecordEvent) error
 }
 
 type I interface {

@@ -1,7 +1,10 @@
 package model
 
 const (
-	UsersCollection           = "users"
+	UsersCollection         = "users"
+	UserBookRatesCollection = "user_book_rates"
+	BooksCollection         = "books"
+
 	NewsCollection            = "news"
 	NewsPublishersCollection  = "news_publishers"
 	MosquesCollection         = "mosques"
