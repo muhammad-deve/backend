@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	_ "errors"
 	"fmt"
 	"github.com/pocketbase/dbx"
@@ -110,4 +111,21 @@ func (a *AuthorizationS) ResetPasswordOTPConfirm(req *model.PasswordResetOTPConf
 	queryStr := fmt.Sprintf("SELECT resetPasswordToken FROM %s WHERE id = {:otpId} AND password = {:password}", model.OtpCollection)
 	err := a.db.NewQuery(queryStr).Bind(dbx.Params{"otpId": req.OtpId, "password": req.Password}).Row(&token)
 	return token, err
+}
+
+func (a *AuthorizationS) IncrementBookViews(bookID string) (int, error) {
+	var newViews int
+
+	queryStr := fmt.Sprintf(
+		"UPDATE %s SET views = views + 1 WHERE id = {:bookId} RETURNING views", model.BooksCollection)
+
+	err := a.db.NewQuery(queryStr).
+		Bind(dbx.Params{"bookId": bookID}).
+		Row(&newViews)
+
+	if err != nil {
+		return 0, errors.New("failed to update book views")
+	}
+
+	return newViews, nil
 }

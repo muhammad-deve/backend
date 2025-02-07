@@ -23,3 +23,16 @@ func (h *Handler) PasswordResetOTPConfirmHandler(e *core.RequestEvent) error {
 	}
 	return h.NewSuccessResponse(e, http.StatusOK, map[string]string{"token": token})
 }
+
+func (h *Handler) RecalculateViewsOfBook(e *core.RequestEvent) error {
+	var bookID string
+	err := e.BindBody(bookID)
+
+	newViews, err := h.service.Authorization().IncrementBookViews(bookID)
+	if err != nil {
+		return h.NewErrorResponse(e, http.StatusBadRequest, "invalid request")
+	}
+
+	return h.NewSuccessResponse(e, http.StatusOK, map[string]int{"views": newViews})
+
+}
