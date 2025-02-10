@@ -1,6 +1,7 @@
 package service
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"github.com/pocketbase/dbx"
@@ -50,6 +51,7 @@ func (b *BookS) BookRatingUpdate(e *core.RecordEvent) error {
 
 	return err
 }
+
 func (b *BookS) BookRatingCalculate(e *core.RecordEvent) error {
 	bookId := e.Record.GetString("book")
 	userRating := e.Record.GetFloat("rating")
@@ -87,6 +89,26 @@ func (b *BookS) IncrementBookViews(id string) error {
 
 	if err != nil {
 		_ = errors.New("failed to update book views")
+	}
+
+	return nil
+}
+
+func (b *BookS) UserBookSaved(e *core.RecordRequestEvent) error {
+	book := e.Record.GetString("id")
+
+	if e.Auth != nil {
+		userId := e.Auth.Id
+		if userId != "" {
+			_, err := e.App.FindFirstRecordByFilter(model.UserSavedBooksCollection, "book={:id} && user={:userId}", dbx.Params{"id": book, "userId": userId})
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+
+			if err == nil {
+				e.Record.Set("isSaved", true)
+			}
+		}
 	}
 
 	return nil

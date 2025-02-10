@@ -124,3 +124,13 @@ func BookUpdateRatingWrapper(fn func(e *core.RecordEvent) error) func(e *core.Re
 		return e.Next()
 	}
 }
+
+func BookIsSavedWrapper(fn func(e *core.RecordRequestEvent) error) func(e *core.RecordRequestEvent) error {
+	return func(e *core.RecordRequestEvent) error {
+		err := fn(e)
+		if err != nil {
+			return err
+		}
+		return e.Next()
+	}
+}

@@ -15,6 +15,7 @@ type BookI interface {
 	IncrementBookViews(id string) error
 	BookRatingCalculate(e *core.RecordEvent) error
 	BookRatingUpdate(e *core.RecordEvent) error
+	UserBookSaved(e *core.RecordRequestEvent) error
 }
 
 type I interface {

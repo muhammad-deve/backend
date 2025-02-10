@@ -19,3 +19,7 @@ func (h *Hook) bookRatingUpdate(e *core.RecordEvent) error {
 	return h.service.Book().BookRatingUpdate(e)
 
 }
+
+func (h *Hook) userBookSaved(e *core.RecordRequestEvent) error {
+	return h.service.Book().UserBookSaved(e)
+}

@@ -18,6 +18,7 @@ func (h *Hook) Register(app *pocketbase.PocketBase) {
 	app.OnRecordAuthRefreshRequest()
 	app.OnRecordAfterCreateSuccess(model.UserBookRatesCollection).BindFunc(BookRatingWrapper(h.bookRatingCalculate))
 	app.OnRecordUpdate(model.UserBookRatesCollection).BindFunc(BookUpdateRatingWrapper(h.bookRatingUpdate))
+	app.OnRecordViewRequest(model.BooksCollection).BindFunc(BookIsSavedWrapper(h.userBookSaved))
 
 	app.OnMailerRecordPasswordResetSend().BindFunc(mailerRecordPasswordResetSendEventWrapper)
 	app.OnMailerRecordOTPSend().BindFunc(mailerRecordOTPSendEventWrapper)
