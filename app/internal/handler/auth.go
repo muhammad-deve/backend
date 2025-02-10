@@ -25,14 +25,13 @@ func (h *Handler) PasswordResetOTPConfirmHandler(e *core.RequestEvent) error {
 }
 
 func (h *Handler) RecalculateViewsOfBook(e *core.RequestEvent) error {
-	var bookID string
-	err := e.BindBody(bookID)
+	id := e.Request.PathValue("id")
 
-	newViews, err := h.service.Authorization().IncrementBookViews(bookID)
+	err := h.service.Book().IncrementBookViews(id)
 	if err != nil {
 		return h.NewErrorResponse(e, http.StatusBadRequest, "invalid request")
 	}
 
-	return h.NewSuccessResponse(e, http.StatusOK, map[string]int{"views": newViews})
+	return h.NewSuccessResponse(e, http.StatusOK, "ok")
 
 }

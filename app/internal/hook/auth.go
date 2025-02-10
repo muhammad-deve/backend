@@ -11,11 +11,11 @@ func (h *Hook) passwordResetRequest(e *core.RecordRequestPasswordResetRequestEve
 }
 
 func (h *Hook) bookRatingCalculate(e *core.RecordEvent) error {
-	return h.service.Authorization().BookRatingCalculate(e)
+	return h.service.Book().BookRatingCalculate(e)
 
 }
 
 func (h *Hook) bookRatingUpdate(e *core.RecordEvent) error {
-	return h.service.Authorization().BookRatingUpdate(e)
+	return h.service.Book().BookRatingUpdate(e)
 
 }
