@@ -24,6 +24,7 @@ func (h *Handler) Register(router *router.Router[*core.RequestEvent]) {
 		views := api.Group("/books")
 		{
 			views.GET("/inc-views-count/{id}", h.RecalculateViewsOfBook)
+			views.GET("/suggestion", h.MakeSuggestionBooks)
 		}
 	}
 }

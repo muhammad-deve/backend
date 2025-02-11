@@ -2,11 +2,13 @@ package service
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
 	"gitlab.saidoff.uz/company/muslim-administration/reading/back/internal/model"
+	"sort"
 )
 
 type BookS struct {
@@ -94,19 +96,59 @@ func (b *BookS) IncrementBookViews(id string) error {
 	return nil
 }
 
+func (b *BookS) SuggestionMaker(genres []string) ([]model.Book, error) {
+	var books []model.Book
+	rows, err := b.db.Select("id", "name", "file", "bookImage", "author", "genres", "views", "rating",
+		"rateCount", "collection", "totalpages", "suitAge", "info", "created", "updated").
+		From("books").
+		Rows()
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch books: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var book model.Book
+		var rawGenres string // DB dagi genres ustuni string sifatida olinadi
+
+		err := rows.Scan(&book.ID, &book.Name, &book.File, &book.BookImage, &book.Author, &rawGenres, &book.Views,
+			&book.Rating, &book.RateCount, &book.Collection, &book.TotalPages, &book.SuitAge, &book.Info,
+			&book.Created, &book.Updated)
+
+		if err != nil {
+			return nil, fmt.Errorf("scan error: %w", err)
+		}
+
+		if err := json.Unmarshal([]byte(rawGenres), &book.Genres); err != nil {
+			return nil, fmt.Errorf("failed to parse genres: %w", err)
+		}
+
+		books = append(books, book)
+	}
+
+	sort.Slice(books, func(i, j int) bool {
+		return books[i].Rating > books[j].Rating
+	})
+
+	return books, nil
+}
+
 func (b *BookS) UserBookSaved(e *core.RecordRequestEvent) error {
 	book := e.Record.GetString("id")
 
 	if e.Auth != nil {
 		userId := e.Auth.Id
 		if userId != "" {
-			_, err := e.App.FindFirstRecordByFilter(model.UserSavedBooksCollection, "book={:id} && user={:userId}", dbx.Params{"id": book, "userId": userId})
+			r, err := e.App.FindFirstRecordByFilter(model.UserSavedBooksCollection, "book={:id} && user={:userId}", dbx.Params{"id": book, "userId": userId})
 			if err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return err
 			}
 
 			if err == nil {
 				e.Record.Set("isSaved", true)
+				savedId := r.GetString("id")
+				e.Record.Set("savedId", savedId)
 			}
 		}
 	}

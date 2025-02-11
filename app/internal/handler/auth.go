@@ -35,3 +35,24 @@ func (h *Handler) RecalculateViewsOfBook(e *core.RequestEvent) error {
 	return h.NewSuccessResponse(e, http.StatusOK, "ok")
 
 }
+
+func (h *Handler) MakeSuggestionBooks(e *core.RequestEvent) error {
+
+	var genres []string
+	if e.Auth != nil {
+		rawGenres := e.Auth.Get("genres")
+		if userGenres, ok := rawGenres.([]interface{}); ok {
+			for _, g := range userGenres {
+				if genreStr, ok := g.(string); ok {
+					genres = append(genres, genreStr)
+				}
+			}
+		}
+	}
+
+	books, err := h.service.Book().SuggestionMaker(genres)
+	if err != nil {
+		return h.NewErrorResponse(e, http.StatusBadRequest, "invalid request")
+	}
+	return h.NewSuccessResponse(e, http.StatusOK, books)
+}

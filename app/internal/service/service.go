@@ -16,6 +16,7 @@ type BookI interface {
 	BookRatingCalculate(e *core.RecordEvent) error
 	BookRatingUpdate(e *core.RecordEvent) error
 	UserBookSaved(e *core.RecordRequestEvent) error
+	SuggestionMaker(genres []string) ([]model.Book, error)
 }
 
 type I interface {
