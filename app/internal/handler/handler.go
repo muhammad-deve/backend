@@ -21,11 +21,7 @@ func (h *Handler) Register(router *router.Router[*core.RequestEvent]) {
 		{
 			auth.POST("/password-reset-otp-confirm", h.PasswordResetOTPConfirmHandler)
 		}
-		views := api.Group("/books")
-		{
-			views.GET("/inc-views-count/{id}", h.RecalculateViewsOfBook)
-			views.GET("/suggestion", h.MakeSuggestionBooks)
-		}
+
 	}
 }
 

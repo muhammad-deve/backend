@@ -2,7 +2,6 @@ package hook
 
 import (
 	"github.com/pocketbase/pocketbase"
-	"gitlab.saidoff.uz/company/muslim-administration/reading/back/internal/model"
 	"gitlab.saidoff.uz/company/muslim-administration/reading/back/internal/service"
 	"log/slog"
 )
@@ -13,15 +12,11 @@ type Hook struct {
 }
 
 func (h *Hook) Register(app *pocketbase.PocketBase) {
-	app.OnRecordRequestOTPRequest(model.UsersCollection).BindFunc(recordRequestOTPRequestEventWrapper(h.otpRequest))
-	app.OnRecordRequestPasswordResetRequest(model.UsersCollection).BindFunc(recordRequestPasswordResetRequestEventWrapper(h.passwordResetRequest))
-	app.OnRecordAuthRefreshRequest()
-	app.OnRecordAfterCreateSuccess(model.UserBookRatesCollection).BindFunc(BookRatingWrapper(h.bookRatingCalculate))
-	app.OnRecordUpdate(model.UserBookRatesCollection).BindFunc(BookUpdateRatingWrapper(h.bookRatingUpdate))
-	app.OnRecordViewRequest(model.BooksCollection).BindFunc(BookIsSavedWrapper(h.userBookSaved))
-
-	app.OnMailerRecordPasswordResetSend().BindFunc(mailerRecordPasswordResetSendEventWrapper)
-	app.OnMailerRecordOTPSend().BindFunc(mailerRecordOTPSendEventWrapper)
+	//app.OnRecordRequestOTPRequest(model.UsersCollection).BindFunc(recordRequestOTPRequestEventWrapper(h.otpRequest))
+	//app.OnRecordRequestPasswordResetRequest(model.UsersCollection).BindFunc(recordRequestPasswordResetRequestEventWrapper(h.passwordResetRequest))
+	//
+	//app.OnMailerRecordPasswordResetSend().BindFunc(mailerRecordPasswordResetSendEventWrapper)
+	//app.OnMailerRecordOTPSend().BindFunc(mailerRecordOTPSendEventWrapper)
 }
 
 func New(logger *slog.Logger, service service.I) *Hook {

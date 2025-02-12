@@ -105,32 +105,3 @@ func recordsListRequestEventWrapper(fn func(e *core.RecordsListRequestEvent) err
 		return e.Next()
 	}
 }
-
-func BookRatingWrapper(fn func(e *core.RecordEvent) error) func(e *core.RecordEvent) error {
-	return func(e *core.RecordEvent) error {
-		err := fn(e)
-		if err != nil {
-			return err
-		}
-		return e.Next()
-	}
-}
-func BookUpdateRatingWrapper(fn func(e *core.RecordEvent) error) func(e *core.RecordEvent) error {
-	return func(e *core.RecordEvent) error {
-		err := fn(e)
-		if err != nil {
-			return err
-		}
-		return e.Next()
-	}
-}
-
-func BookIsSavedWrapper(fn func(e *core.RecordRequestEvent) error) func(e *core.RecordRequestEvent) error {
-	return func(e *core.RecordRequestEvent) error {
-		err := fn(e)
-		if err != nil {
-			return err
-		}
-		return e.Next()
-	}
-}

@@ -43,7 +43,7 @@ deploy_prod:
     - ssh -o StrictHostKeyChecking=no ${USER_DEV}@${IP_DEV} "
       docker login $CI_REGISTRY --username $CI_REGISTRY_USER --password $CI_REGISTRY_PASSWORD &&
       docker pull ${CI_REGISTRY}/${CI_PROJECT_NAMESPACE}/${CI_PROJECT_NAME}:latest &&
-      docker service update --force reading_back &&
+      docker service update --force template &&
       docker container prune -f --filter 'until=24h' || true &&
       docker image prune -f --filter 'until=24h' || true
       "
