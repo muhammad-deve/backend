@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"fmt"
 	"github.com/pocketbase/pocketbase/core"
 	"gitlab.saidoff.uz/company/muslim-administration/reading/back/internal/model"
 	"net/http"
@@ -37,22 +38,11 @@ func (h *Handler) RecalculateViewsOfBook(e *core.RequestEvent) error {
 }
 
 func (h *Handler) MakeSuggestionBooks(e *core.RequestEvent) error {
-
-	var genres []string
-	if e.Auth != nil {
-		rawGenres := e.Auth.Get("genres")
-		if userGenres, ok := rawGenres.([]interface{}); ok {
-			for _, g := range userGenres {
-				if genreStr, ok := g.(string); ok {
-					genres = append(genres, genreStr)
-				}
-			}
-		}
-	}
-
-	books, err := h.service.Book().SuggestionMaker(genres)
+	books, err := h.service.Book().SuggestionMaker(e)
 	if err != nil {
+		fmt.Println("❌ Error fetching books:", err) // ✅ Log qo‘shdik
 		return h.NewErrorResponse(e, http.StatusBadRequest, "invalid request")
 	}
+
 	return h.NewSuccessResponse(e, http.StatusOK, books)
 }

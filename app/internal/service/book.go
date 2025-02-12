@@ -2,13 +2,14 @@ package service
 
 import (
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
 	"gitlab.saidoff.uz/company/muslim-administration/reading/back/internal/model"
-	"sort"
+	"math"
+	"strconv"
+	"strings"
 )
 
 type BookS struct {
@@ -96,42 +97,60 @@ func (b *BookS) IncrementBookViews(id string) error {
 	return nil
 }
 
-func (b *BookS) SuggestionMaker(genres []string) ([]model.Book, error) {
-	var books []model.Book
-	rows, err := b.db.Select("id", "name", "file", "bookImage", "author", "genres", "views", "rating",
-		"rateCount", "collection", "totalpages", "suitAge", "info", "created", "updated").
-		From("books").
-		Rows()
+func (b *BookS) SuggestionMaker(e *core.RequestEvent) (*model.PaginatedItems, error) {
+	query := e.Request.URL.Query()
 
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch books: %w", err)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var book model.Book
-		var rawGenres string // DB dagi genres ustuni string sifatida olinadi
-
-		err := rows.Scan(&book.ID, &book.Name, &book.File, &book.BookImage, &book.Author, &rawGenres, &book.Views,
-			&book.Rating, &book.RateCount, &book.Collection, &book.TotalPages, &book.SuitAge, &book.Info,
-			&book.Created, &book.Updated)
-
-		if err != nil {
-			return nil, fmt.Errorf("scan error: %w", err)
-		}
-
-		if err := json.Unmarshal([]byte(rawGenres), &book.Genres); err != nil {
-			return nil, fmt.Errorf("failed to parse genres: %w", err)
-		}
-
-		books = append(books, book)
+	page, err := strconv.Atoi(query.Get("page"))
+	if err != nil || page <= 0 {
+		page = model.DefaultPagination.Page
 	}
 
-	sort.Slice(books, func(i, j int) bool {
-		return books[i].Rating > books[j].Rating
-	})
+	perPage, err := strconv.Atoi(query.Get("perPage"))
+	if err != nil || perPage <= 0 {
+		perPage = model.DefaultPagination.PerPage
+	}
 
-	return books, nil
+	limit := perPage
+	offset := (page - 1) * perPage
+
+	var genres []string
+	if e.Auth != nil {
+		genres = e.Auth.GetStringSlice("favourite_genre")
+	}
+
+	genresFilterStr := makeGenresFilterStr(genres)
+	books, err := e.App.FindRecordsByFilter(
+		model.BooksCollection,
+		genresFilterStr,
+		"-rating",
+		limit,
+		offset,
+	)
+
+	totalItems := len(books)
+	totalPages := int(math.Ceil(float64(totalItems) / float64(perPage)))
+	result := &model.PaginatedItems{
+		Items:      books,
+		Page:       page,
+		PerPage:    perPage,
+		TotalPages: totalPages,
+		TotalItems: totalItems,
+	}
+
+	return result, err
+}
+
+func makeGenresFilterStr(genres []string) string {
+	if len(genres) == 0 {
+		return ""
+	}
+
+	var conditions []string
+	for _, genre := range genres {
+		conditions = append(conditions, fmt.Sprintf("genres?~'%s'", genre))
+	}
+
+	return strings.Join(conditions, " || ")
 }
 
 func (b *BookS) UserBookSaved(e *core.RecordRequestEvent) error {
