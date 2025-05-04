@@ -4,11 +4,11 @@ import (
 	"github.com/pocketbase/pocketbase"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/plugins/migratecmd"
-	_ "gitlab.saidoff.uz/company/muslim-administration/reading/back/artifacts/migrations"
-	"gitlab.saidoff.uz/company/muslim-administration/reading/back/internal/config"
-	"gitlab.saidoff.uz/company/muslim-administration/reading/back/internal/handler"
-	"gitlab.saidoff.uz/company/muslim-administration/reading/back/internal/hook"
-	"gitlab.saidoff.uz/company/muslim-administration/reading/back/internal/service"
+	_ "gitlab.yurtal.tech/company/pocketbase-app-template/artifacts/migrations"
+	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/config"
+	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/handler"
+	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/hook"
+	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/service"
 )
 
 func NewApp(config *config.Config) *pocketbase.PocketBase {

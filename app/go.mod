@@ -1,4 +1,4 @@
-module gitlab.saidoff.uz/company/muslim-administration/reading/back
+module gitlab.yurtal.tech/company/pocketbase-app-template
 
 go 1.23.3
 

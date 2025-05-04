@@ -3,8 +3,8 @@ package main
 import (
 	"log"
 
-	application "gitlab.saidoff.uz/company/muslim-administration/reading/back/internal/app"
-	"gitlab.saidoff.uz/company/muslim-administration/reading/back/internal/config"
+	application "gitlab.yurtal.tech/company/pocketbase-app-template/internal/app"
+	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/config"
 )
 
 func main() {

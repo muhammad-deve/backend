@@ -2,7 +2,7 @@ package handler
 
 import (
 	"github.com/pocketbase/pocketbase/core"
-	"gitlab.saidoff.uz/company/muslim-administration/reading/back/internal/model"
+	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/model"
 	"net/http"
 )
 

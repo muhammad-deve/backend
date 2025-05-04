@@ -3,8 +3,8 @@ package handler
 import (
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/router"
-	"gitlab.saidoff.uz/company/muslim-administration/reading/back/internal/config"
-	"gitlab.saidoff.uz/company/muslim-administration/reading/back/internal/service"
+	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/config"
+	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/service"
 	"log/slog"
 )
 

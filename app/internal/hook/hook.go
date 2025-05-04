@@ -2,7 +2,7 @@ package hook
 
 import (
 	"github.com/pocketbase/pocketbase"
-	"gitlab.saidoff.uz/company/muslim-administration/reading/back/internal/service"
+	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/service"
 	"log/slog"
 )
 

@@ -2,7 +2,7 @@ package repository
 
 import (
 	"github.com/pocketbase/dbx"
-	"gitlab.saidoff.uz/company/muslim-administration/reading/back/internal/repository/sqlite"
+	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/repository/sqlite"
 )
 
 type AuthorizationI interface {
