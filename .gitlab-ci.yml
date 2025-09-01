@@ -3,36 +3,61 @@ stages:
   - deploy
 
 variables:
-  TAG: "latest"
+  TAG_PROD: "latest"
+  TAG_STAGING: "staging"
   DOCKERFILE: $CI_PROJECT_DIR/Dockerfile
   ARGUMENTS: ""
 
-build-image:
+# build
+build_image_prod:
   stage: build
   image:
     name: gcr.io/kaniko-project/executor:v1.21.0-debug
     entrypoint: [ "" ]
+  only:
+    - master
   script:
-    - echo "Build with tag $TAG"
+    - echo "Build with tag $TAG_PROD"
     - mkdir -p /kaniko/.docker
     - echo "{\"auths\":{\"${CI_REGISTRY}\":{\"auth\":\"$(printf "%s:%s" "${CI_REGISTRY_USER}" "${CI_REGISTRY_PASSWORD}" | base64 | tr -d '\n')\"},\"$(echo -n $CI_DEPENDENCY_PROXY_SERVER | awk -F[:] '{print $1}')\":{\"auth\":\"$(printf "%s:%s" ${CI_DEPENDENCY_PROXY_USER} "${CI_DEPENDENCY_PROXY_PASSWORD}" | base64 | tr -d '\n')\"}}}" > /kaniko/.docker/config.json
     - >-
       /kaniko/executor
       --context $CI_PROJECT_DIR
       --dockerfile $DOCKERFILE
-      --destination $CI_REGISTRY_IMAGE:$TAG
+      --destination $CI_REGISTRY_IMAGE:$TAG_PROD
       --cache=true
       --cache-repo=$CI_REGISTRY_IMAGE/cache
       --verbosity=error
       $ARGUMENTS
-  rules:
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      when: on_success
 
+build_image_staging:
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:v1.21.0-debug
+    entrypoint: [ "" ]
+  only:
+    - staging
+  script:
+    - echo "Build with tag $TAG_STAGING"
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"${CI_REGISTRY}\":{\"auth\":\"$(printf "%s:%s" "${CI_REGISTRY_USER}" "${CI_REGISTRY_PASSWORD}" | base64 | tr -d '\n')\"},\"$(echo -n $CI_DEPENDENCY_PROXY_SERVER | awk -F[:] '{print $1}')\":{\"auth\":\"$(printf "%s:%s" ${CI_DEPENDENCY_PROXY_USER} "${CI_DEPENDENCY_PROXY_PASSWORD}" | base64 | tr -d '\n')\"}}}" > /kaniko/.docker/config.json
+    - >-
+      /kaniko/executor
+      --context $CI_PROJECT_DIR
+      --dockerfile $DOCKERFILE
+      --destination $CI_REGISTRY_IMAGE:$TAG_STAGING
+      --cache=true
+      --cache-repo=$CI_REGISTRY_IMAGE/cache
+      --verbosity=error
+      $ARGUMENTS
+
+# deploy
 deploy_prod:
   stage: deploy
   image:
     name: alpine:3.19
+  only:
+    - master
   before_script:
     - apk add --no-cache openssh-client
   script:
@@ -43,7 +68,28 @@ deploy_prod:
     - ssh -o StrictHostKeyChecking=no ${USER_DEV}@${IP_DEV} "
       docker login $CI_REGISTRY --username $CI_REGISTRY_USER --password $CI_REGISTRY_PASSWORD &&
       docker pull ${CI_REGISTRY}/${CI_PROJECT_NAMESPACE}/${CI_PROJECT_NAME}:latest &&
-      docker service update --force template &&
+      docker service update --force template_back &&
+      docker container prune -f --filter 'until=24h' || true &&
+      docker image prune -f --filter 'until=24h' || true
+      "
+
+deploy_staging:
+  stage: deploy
+  image:
+    name: alpine:3.19
+  only:
+    - staging
+  before_script:
+    - apk add --no-cache openssh-client
+  script:
+    - eval $(ssh-agent -s)
+    - echo "$PRIVATE_KEY_DEV" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - ssh -o StrictHostKeyChecking=no ${USER_DEV}@${IP_DEV} "
+      docker login $CI_REGISTRY --username $CI_REGISTRY_USER --password $CI_REGISTRY_PASSWORD &&
+      docker pull ${CI_REGISTRY}/${CI_PROJECT_NAMESPACE}/${CI_PROJECT_NAME}:staging &&
+      docker service update --force template_back_staging &&
       docker container prune -f --filter 'until=24h' || true &&
       docker image prune -f --filter 'until=24h' || true
       "
