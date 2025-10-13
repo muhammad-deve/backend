@@ -1,25 +1,34 @@
 package handler
 
 import (
-	"github.com/pocketbase/pocketbase/core"
-	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/model"
+	"fmt"
 	"net/http"
+
+	"github.com/pocketbase/pocketbase/core"
+	"gitlab.yurtal.tech/company/blitz/business-card/back/internal/model"
 )
 
-func (h *Handler) PasswordResetOTPConfirmHandler(e *core.RequestEvent) error {
-	body := &model.PasswordResetOTPConfirmRequest{}
-	err := e.BindBody(body)
+func (h *Handler) AuthHandler(e *core.RequestEvent) error {
+	q := e.Request.URL.Query()
+	code := q.Get("code")
+	referer := q.Get("referer")
+	clientID := q.Get("client_id")
+
+	if code == "" || referer == "" || clientID == "" {
+		fmt.Println("Missing required query params: code, referer, client_id")
+		return fmt.Errorf("missing required query params: code, referer, client_id")
+	}
+
+	req := model.AmoCRMTokenExchangeRequest{
+		Domain:   referer,
+		ClientID: clientID,
+		Code:     code,
+	}
+
+	resp, err := h.service.Authorization().AmoCRMTokenExchange(&req)
 	if err != nil {
 		return err
 	}
 
-	if body.OtpId == "" || body.Password == "" {
-		return h.NewErrorResponse(e, http.StatusBadRequest, "invalid request")
-	}
-
-	token, err := h.service.Authorization().ResetPasswordOTPConfirm(body)
-	if err != nil {
-		return h.NewErrorResponse(e, http.StatusInternalServerError, err.Error())
-	}
-	return h.NewSuccessResponse(e, http.StatusOK, map[string]string{"token": token})
+	return e.JSON(http.StatusOK, resp)
 }

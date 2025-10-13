@@ -1,9 +1,10 @@
 package hook
 
 import (
-	"github.com/pocketbase/pocketbase"
-	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/service"
 	"log/slog"
+
+	"github.com/pocketbase/pocketbase"
+	"gitlab.yurtal.tech/company/blitz/business-card/back/internal/service"
 )
 
 type Hook struct {
@@ -12,11 +13,6 @@ type Hook struct {
 }
 
 func (h *Hook) Register(app *pocketbase.PocketBase) {
-	//app.OnRecordRequestOTPRequest(model.UsersCollection).BindFunc(recordRequestOTPRequestEventWrapper(h.otpRequest))
-	//app.OnRecordRequestPasswordResetRequest(model.UsersCollection).BindFunc(recordRequestPasswordResetRequestEventWrapper(h.passwordResetRequest))
-	//
-	//app.OnMailerRecordPasswordResetSend().BindFunc(mailerRecordPasswordResetSendEventWrapper)
-	//app.OnMailerRecordOTPSend().BindFunc(mailerRecordOTPSendEventWrapper)
 }
 
 func New(logger *slog.Logger, service service.I) *Hook {

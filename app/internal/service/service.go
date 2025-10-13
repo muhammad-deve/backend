@@ -1,15 +1,12 @@
 package service
 
 import (
-	"github.com/pocketbase/dbx"
-	"github.com/pocketbase/pocketbase/core"
-	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/model"
+	"github.com/pocketbase/pocketbase"
+	"gitlab.yurtal.tech/company/blitz/business-card/back/internal/model"
 )
 
 type AuthorizationI interface {
-	OtpRequest(e *core.RecordCreateOTPRequestEvent) error
-	ResetPasswordRequest(e *core.RecordRequestPasswordResetRequestEvent) error
-	ResetPasswordOTPConfirm(req *model.PasswordResetOTPConfirmRequest) (string, error)
+	AmoCRMTokenExchange(req *model.AmoCRMTokenExchangeRequest) (*model.AmoCRMTokenExchangeResponse, error)
 }
 
 type I interface {
@@ -24,8 +21,8 @@ func (s *service) Authorization() AuthorizationI {
 	return s.AuthorizationI
 }
 
-func NewService(db dbx.Builder) I {
+func NewService(app *pocketbase.PocketBase) I {
 	return &service{
-		AuthorizationI: NewAuthorizationS(db),
+		AuthorizationI: NewAuthorizationS(app),
 	}
 }

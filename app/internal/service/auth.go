@@ -1,54 +1,103 @@
 package service
 
 import (
-	_ "errors"
+	"bytes"
+	"encoding/json"
 	"fmt"
-	"github.com/pocketbase/dbx"
-	"github.com/pocketbase/pocketbase/core"
-	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/model"
+	"io"
 	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/pocketbase/pocketbase"
+	"gitlab.yurtal.tech/company/blitz/business-card/back/internal/model"
 )
 
 type AuthorizationS struct {
-	db dbx.Builder
+	app *pocketbase.PocketBase
 }
 
-func (a *AuthorizationS) OtpRequest(e *core.RecordCreateOTPRequestEvent) error {
-	//TODO implement me
-	panic("implement me")
+func NewAuthorizationS(app *pocketbase.PocketBase) *AuthorizationS {
+	return &AuthorizationS{app: app}
 }
 
-func NewAuthorizationS(db dbx.Builder) *AuthorizationS {
-	return &AuthorizationS{db: db}
-}
-
-func (a *AuthorizationS) ResetPasswordRequest(e *core.RecordRequestPasswordResetRequestEvent) error {
-	collectionRef := e.Collection.Id
-	recordRef := e.Record.Id
-	token, err := e.Record.NewPasswordResetToken()
-	otpId := ""
-
-	queryStr := fmt.Sprintf("INSERT INTO %s (collectionRef, recordRef, password, resetPasswordToken) VALUES ({:collectionRef}, {:recordRef}, {:password}, {:resetPasswordToken}) RETURNING id", model.OtpCollection)
-	insertQ := a.db.NewQuery(queryStr).
-		Bind(dbx.Params{
-			"collectionRef":      collectionRef,
-			"recordRef":          recordRef,
-			"password":           model.StaticOtpCode,
-			"resetPasswordToken": token,
-		})
-
-	err = insertQ.Row(&otpId)
+func (a *AuthorizationS) AmoCRMTokenExchange(req *model.AmoCRMTokenExchangeRequest) (*model.AmoCRMTokenExchangeResponse, error) {
+	filter := fmt.Sprintf("domain = '%s' && clientId = '%s'", req.Domain, req.ClientID)
+	amoCRMConfig, err := a.app.FindFirstRecordByFilter(model.AmoCredentialsCollection, filter)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	if amoCRMConfig == nil {
+		return nil, fmt.Errorf("no amoCRM credentials found")
+	}
+	clientSecret := amoCRMConfig.GetString("clientSecret")
+	redirectUri := amoCRMConfig.GetString("redirectUri")
+	referer := req.Domain
+
+	if clientSecret == "" || redirectUri == "" {
+		fmt.Println("Server is missing AMOCRM_CLIENT_SECRET or AMOCRM_REDIRECT_URI")
+		return nil, fmt.Errorf("server is missing AMOCRM_CLIENT_SECRET or AMOCRM_REDIRECT_URI")
 	}
 
-	err = e.JSON(http.StatusOK, map[string]string{"otpId": otpId})
-	return err
-}
+	// Normalize domain from referer (can be full URL or hostname)
+	domain := strings.TrimSpace(referer)
+	if strings.HasPrefix(domain, "http://") || strings.HasPrefix(domain, "https://") {
+		u, err := url.Parse(domain)
+		if err == nil && u.Host != "" {
+			domain = u.Host
+		}
+	}
+	domain = strings.TrimSuffix(domain, "/")
+	if domain == "" {
+		return nil, fmt.Errorf("invalid referer domain")
+	}
 
-func (a *AuthorizationS) ResetPasswordOTPConfirm(req *model.PasswordResetOTPConfirmRequest) (string, error) {
-	token := ""
-	queryStr := fmt.Sprintf("SELECT resetPasswordToken FROM %s WHERE id = {:otpId} AND password = {:password}", model.OtpCollection)
-	err := a.db.NewQuery(queryStr).Bind(dbx.Params{"otpId": req.OtpId, "password": req.Password}).Row(&token)
-	return token, err
+	payload := &model.AmoCRMAccessTokenRequest{
+		ClientID:     req.ClientID,
+		ClientSecret: clientSecret,
+		GrantType:    model.AmoCRMGrantTypeAuthorizationCode,
+		Code:         req.Code,
+		RedirectURI:  redirectUri,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		fmt.Println("Failed to marshal request")
+		return nil, fmt.Errorf("failed to marshal request")
+	}
+
+	urlStr := fmt.Sprintf("https://%s/oauth2/access_token", domain)
+	client := &http.Client{Timeout: 10 * time.Second}
+	atReq, err := http.NewRequest("POST", urlStr, bytes.NewBuffer(body))
+	if err != nil {
+		fmt.Println("Failed to create request")
+		return nil, fmt.Errorf("failed to create request")
+	}
+	atReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(atReq)
+	if err != nil {
+		fmt.Println("Request error:", err)
+		return nil, fmt.Errorf("request error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		fmt.Println("Token exchange failed:", string(respBody))
+		return nil, fmt.Errorf("token exchange failed: %s", string(respBody))
+	}
+
+	var tokenResp model.AmoCRMTokenExchangeResponse
+	if err := json.Unmarshal(respBody, &tokenResp); err != nil {
+		fmt.Println("Failed to parse token response")
+		return nil, fmt.Errorf("failed to parse token response")
+	}
+
+	amoCRMConfig.Set("refreshToken", tokenResp.RefreshToken)
+	if err := a.app.Save(amoCRMConfig); err != nil {
+		return nil, err
+	}
+
+	return &tokenResp, nil
 }

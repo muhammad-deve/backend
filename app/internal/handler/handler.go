@@ -1,11 +1,12 @@
 package handler
 
 import (
+	"log/slog"
+
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/router"
-	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/config"
-	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/service"
-	"log/slog"
+	"gitlab.yurtal.tech/company/blitz/business-card/back/internal/config"
+	"gitlab.yurtal.tech/company/blitz/business-card/back/internal/service"
 )
 
 type Handler struct {
@@ -19,7 +20,7 @@ func (h *Handler) Register(router *router.Router[*core.RequestEvent]) {
 	{
 		auth := api.Group("/auth")
 		{
-			auth.POST("/password-reset-otp-confirm", h.PasswordResetOTPConfirmHandler)
+			auth.GET("/", h.AuthHandler)
 		}
 
 	}

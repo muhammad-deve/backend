@@ -3,8 +3,8 @@ package main
 import (
 	"log"
 
-	application "gitlab.yurtal.tech/company/pocketbase-app-template/internal/app"
-	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/config"
+	application "gitlab.yurtal.tech/company/blitz/business-card/back/internal/app"
+	"gitlab.yurtal.tech/company/blitz/business-card/back/internal/config"
 )
 
 func main() {

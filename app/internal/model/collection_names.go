@@ -1,5 +1,7 @@
 package model
 
 const (
-	OtpCollection = "_otps"
+	OtpCollection            = "_otps"
+	CitiesCollection         = "cities"
+	AmoCredentialsCollection = "amoCredentials"
 )
