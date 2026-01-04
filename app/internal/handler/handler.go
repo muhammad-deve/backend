@@ -5,8 +5,8 @@ import (
 
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/router"
-	"gitlab.yurtal.tech/company/blitz/business-card/back/internal/config"
-	"gitlab.yurtal.tech/company/blitz/business-card/back/internal/service"
+	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/config"
+	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/service"
 )
 
 type Handler struct {

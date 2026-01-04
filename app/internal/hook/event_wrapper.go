@@ -4,7 +4,7 @@ import (
 	"strings"
 
 	"github.com/pocketbase/pocketbase/core"
-	"gitlab.yurtal.tech/company/blitz/business-card/back/pkg/utils"
+	"gitlab.yurtal.tech/company/pocketbase-app-template/pkg/utils"
 )
 
 func recordRequestOTPRequestEventWrapper(fn func(e *core.RecordCreateOTPRequestEvent) error) func(e *core.RecordCreateOTPRequestEvent) error {

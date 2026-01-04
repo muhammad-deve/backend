@@ -1,4 +1,4 @@
-module gitlab.yurtal.tech/company/blitz/business-card/back
+module gitlab.yurtal.tech/company/pocketbase-app-template
 
 go 1.23.3
 

@@ -3,10 +3,11 @@ package config
 import (
 	"flag"
 	"fmt"
-	"github.com/ilyakaznacheev/cleanenv"
 	"log"
 	"path/filepath"
 	"sync"
+
+	"github.com/ilyakaznacheev/cleanenv"
 )
 
 type Config struct {
@@ -30,7 +31,7 @@ func GetConfig() *Config {
 		}
 
 		if err := cleanenv.ReadConfig(envFilePath, instance); err != nil {
-			helpText := "Saidoff - Reading project!"
+			helpText := "Yurtal - Pocketbase template project!"
 			help, _ := cleanenv.GetDescription(instance, &helpText)
 			log.Print(help)
 			fmt.Println("Application is starting with default config")

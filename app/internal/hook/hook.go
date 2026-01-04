@@ -4,7 +4,7 @@ import (
 	"log/slog"
 
 	"github.com/pocketbase/pocketbase"
-	"gitlab.yurtal.tech/company/blitz/business-card/back/internal/service"
+	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/service"
 )
 
 type Hook struct {

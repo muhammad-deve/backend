@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/pocketbase/pocketbase"
-	"gitlab.yurtal.tech/company/blitz/business-card/back/internal/model"
+	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/model"
 )
 
 type AuthorizationS struct {
