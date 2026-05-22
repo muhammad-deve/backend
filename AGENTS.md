@@ -47,3 +47,108 @@ bd close <id>         # Complete work
 - NEVER say "ready to push when you are" - YOU must push
 - If push fails, resolve and retry until it succeeds
 <!-- END BEADS INTEGRATION -->
+
+
+## Project Architecture Rules
+
+This project uses a 3-layer backend architecture:
+
+1. **Handler layer**
+2. **Service layer**
+3. **Repository layer**
+
+### General Rules
+
+- Keep code as simple as possible.
+- Prefer clear, readable code over clever abstractions.
+- Add comments only for complex logic or non-obvious decisions.
+- Do not add comments for obvious code.
+- Keep each layer focused on its own responsibility.
+
+### Handler Layer Rules
+
+Handlers are responsible only for HTTP/request handling.
+
+Handlers may:
+
+- Read request data.
+- Validate request input.
+- Call the service layer.
+- Handle service errors and map them to HTTP responses.
+- Return responses to the client.
+
+Handlers must NOT:
+
+- Contain business logic.
+- Call repositories directly.
+- Access the database directly.
+- Make business decisions.
+- Perform data persistence logic.
+
+### Service Layer Rules
+
+Services contain all business logic.
+
+Services may:
+
+- Apply business rules.
+- Coordinate repositories.
+- Transform domain data.
+- Decide what should happen based on business requirements.
+- Return results or errors back to handlers.
+
+Services must NOT:
+
+- Write HTTP responses directly.
+- Depend on handler/request/response objects.
+- Return client responses directly.
+- Contain raw database query logic.
+
+### Repository Layer Rules
+
+Repositories are responsible only for database access.
+
+Repositories may:
+
+- Create, read, update, and delete database records.
+- Run database queries.
+- Map database records to domain/model structs.
+
+Repositories must NOT:
+
+- Contain business logic.
+- Handle HTTP requests or responses.
+- Validate request payloads.
+- Decide business rules.
+- Return user-facing responses.
+
+### Dependency Direction
+
+The dependency flow must stay one-way:
+
+```txt
+Handler → Service → Repository → Database
+```
+
+Do not skip layers.
+
+Bad:
+```txt
+Handler → Repository
+Handler → Database
+Repository → Service
+Service → Handler
+```
+
+Good:
+```txt
+Handler receives request
+Handler validates input
+Handler calls Service
+Service applies business logic
+Service calls Repository
+Repository talks to DB
+Repository returns data
+Service returns result
+Handler returns HTTP response
+```
