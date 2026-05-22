@@ -4,3 +4,8 @@ app/artifacts/pb_data/*
 .vscode
 .DS_Store
 /app/.env
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
