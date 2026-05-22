@@ -20,3 +20,6 @@ run-app:
 
 run-app-watch:
 	cd $(APP_DIR) && nodemon --watch './**/*.go' --ignore 'app/artifacts/migrations/**' --signal SIGTERM --exec go run cmd/main.go serve --dir=${PB_DATA_DIR}
+
+run:
+	cd ${CMD_DIR} && go run main.go serve --dir=${PB_DATA_DIR}
