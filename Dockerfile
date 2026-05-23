@@ -2,11 +2,9 @@ FROM golang:1.23-bullseye AS build
 
 WORKDIR /app
 
-COPY ./app/go.mod ./
+COPY ./app/go.mod ./app/go.sum ./
 
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    go mod download
+RUN go mod download
 
 COPY ./app .
 
