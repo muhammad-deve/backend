@@ -19,6 +19,11 @@ func NewApp(config *config.Config) *pocketbase.PocketBase {
 
 		services := service.NewService(app)
 
+		// Start TCP tunnel listener on port 7000
+		if err := services.TCP().Start(); err != nil {
+			logger.Error("failed to start TCP listener", "error", err)
+		}
+
 		handlers := handler.NewHandler(logger, services, config)
 		hooks := hook.New(logger, services)
 
