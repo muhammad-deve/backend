@@ -19,6 +19,7 @@ jobs:
             cd ~/personal/GoPort/backend
             git pull origin main
             cd ..
+            docker exec goport-backend sh -c 'if [ -d /pb_data ] && [ ! -f /app/pb_data/data.db ]; then cp -a /pb_data/. /app/pb_data/; fi' || true
             docker-compose build --no-cache backend
             docker-compose stop backend || true
             docker-compose rm -f backend || true

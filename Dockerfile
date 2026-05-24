@@ -12,6 +12,8 @@ RUN go build -ldflags="-linkmode external -extldflags -static" -tags netgo -o /a
 
 FROM alpine:3.19
 
-COPY --from=build /app/main /main
+WORKDIR /app
 
-CMD ["/main", "serve", "--http=0.0.0.0:8090"]
+COPY --from=build /app/main ./main
+
+CMD ["./main", "serve", "--http=0.0.0.0:8090", "--dir=/app/pb_data"]
