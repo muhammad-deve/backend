@@ -23,4 +23,4 @@ jobs:
             docker-compose build --no-cache backend
             docker-compose stop backend || true
             docker-compose rm -f backend || true
-            docker-compose up -d --no-deps backend
+            docker-compose up -d --no-deps --remove-orphans backend

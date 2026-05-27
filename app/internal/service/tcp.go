@@ -28,6 +28,7 @@ type tunnelRegistrationRequest struct {
 type tunnelRegistrationResponse struct {
 	Subdomain string `json:"subdomain"`
 	URL       string `json:"url"`
+	Error     string `json:"error,omitempty"`
 }
 
 type tcpService struct {
@@ -124,12 +125,14 @@ func (t *tcpService) handleConnection(conn net.Conn) {
 	}
 	if req.Port == "" {
 		log.Printf("tunnel registration missing port")
+		t.sendRegistrationError(conn, "missing port")
 		return
 	}
 
 	subdomain, err := t.createTunnel()
 	if err != nil {
 		log.Printf("failed to create tunnel: %v", err)
+		t.sendRegistrationError(conn, fmt.Sprintf("failed to create tunnel: %v", err))
 		return
 	}
 
@@ -151,6 +154,12 @@ func (t *tcpService) handleConnection(conn net.Conn) {
 		if err != nil {
 			return
 		}
+	}
+}
+
+func (t *tcpService) sendRegistrationError(conn net.Conn, msg string) {
+	if err := json.NewEncoder(conn).Encode(tunnelRegistrationResponse{Error: msg}); err != nil {
+		log.Printf("failed to send tunnel registration error: %v", err)
 	}
 }
 
