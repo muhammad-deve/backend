@@ -30,6 +30,6 @@ func (s *service) TCP() TCPI {
 func NewService(app *pocketbase.PocketBase) I {
 	return &service{
 		AuthorizationI: NewAuthorizationS(app),
-		tcpService:     NewTCPService(),
+		tcpService:     NewTCPService(app),
 	}
 }

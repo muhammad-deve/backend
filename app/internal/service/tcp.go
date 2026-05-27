@@ -1,11 +1,18 @@
 package service
 
 import (
+	"crypto/rand"
+	"database/sql"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"sync"
+
+	"github.com/pocketbase/dbx"
+	"github.com/pocketbase/pocketbase/core"
 )
 
 type TCPI interface {
@@ -13,22 +20,41 @@ type TCPI interface {
 	Stop()
 }
 
+type tunnelRegistrationRequest struct {
+	Type string `json:"type"`
+	Port string `json:"port"`
+}
+
+type tunnelRegistrationResponse struct {
+	Subdomain string `json:"subdomain"`
+	URL       string `json:"url"`
+}
+
 type tcpService struct {
 	listener net.Listener
 	addr     string
 	mu       sync.Mutex
 	conns    map[string]net.Conn
+	app      core.App
+	domain   string
 }
 
-func NewTCPService() TCPI {
+func NewTCPService(app core.App) TCPI {
 	port := os.Getenv("TCP_PORT")
 	if port == "" {
 		port = "7000"
 	}
 
+	domain := os.Getenv("GOPORT_DOMAIN")
+	if domain == "" {
+		domain = "goport.uz"
+	}
+
 	return &tcpService{
-		addr:  ":" + port,
-		conns: make(map[string]net.Conn),
+		addr:   ":" + port,
+		conns:  make(map[string]net.Conn),
+		app:    app,
+		domain: domain,
 	}
 }
 
@@ -91,9 +117,32 @@ func (t *tcpService) handleConnection(conn net.Conn) {
 		log.Printf("CLI disconnected: %s", remoteAddr)
 	}()
 
-	// TODO: Step 3 - JSON handshake (read token + port, reply with subdomain + url)
-	// TODO: Step 4 - yamux.Server(conn, nil) wraps connection
-	// TODO: Step 5 - Store session in tunnels map
+	var req tunnelRegistrationRequest
+	if err := json.NewDecoder(conn).Decode(&req); err != nil {
+		log.Printf("failed to read tunnel registration: %v", err)
+		return
+	}
+	if req.Port == "" {
+		log.Printf("tunnel registration missing port")
+		return
+	}
+
+	subdomain, err := t.createTunnel()
+	if err != nil {
+		log.Printf("failed to create tunnel: %v", err)
+		return
+	}
+
+	resp := tunnelRegistrationResponse{
+		Subdomain: subdomain,
+		URL:       fmt.Sprintf("https://%s.%s", subdomain, t.domain),
+	}
+	if err := json.NewEncoder(conn).Encode(resp); err != nil {
+		log.Printf("failed to send tunnel registration response: %v", err)
+		return
+	}
+
+	log.Printf("registered %s tunnel %s -> localhost:%s", req.Type, resp.URL, req.Port)
 
 	// For now, keep connection alive
 	buf := make([]byte, 4096)
@@ -103,4 +152,64 @@ func (t *tcpService) handleConnection(conn net.Conn) {
 			return
 		}
 	}
+}
+
+func (t *tcpService) createTunnel() (string, error) {
+	collection, err := t.app.FindCollectionByNameOrId("tunnels")
+	if err != nil {
+		return "", err
+	}
+
+	const userID = "5743847505m28jb"
+	subdomain, err := t.generateUniqueSubdomain()
+	if err != nil {
+		return "", err
+	}
+
+	record := core.NewRecord(collection)
+	record.Set("user", userID)
+	record.Set("subdomain", subdomain)
+	record.Set("is_custom", false)
+
+	if err := t.app.Save(record); err != nil {
+		return "", err
+	}
+
+	return subdomain, nil
+}
+
+func (t *tcpService) generateUniqueSubdomain() (string, error) {
+	for i := 0; i < 10; i++ {
+		subdomain, err := randomSubdomain(6)
+		if err != nil {
+			return "", err
+		}
+
+		_, err = t.app.FindFirstRecordByFilter("tunnels", "subdomain = {:subdomain}", dbx.Params{
+			"subdomain": subdomain,
+		})
+		if errors.Is(err, sql.ErrNoRows) {
+			return subdomain, nil
+		}
+		if err != nil {
+			return "", err
+		}
+	}
+
+	return "", fmt.Errorf("failed to generate unique subdomain")
+}
+
+func randomSubdomain(length int) (string, error) {
+	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+
+	bytes := make([]byte, length)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", err
+	}
+
+	for i := range bytes {
+		bytes[i] = alphabet[int(bytes[i])%len(alphabet)]
+	}
+
+	return string(bytes), nil
 }
