@@ -2,6 +2,7 @@ package service
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/rand"
 	"database/sql"
 	"encoding/json"
@@ -262,18 +263,30 @@ func (t *tcpService) HandleTunnelRequest(e *core.RequestEvent) (bool, error) {
 
 	stream, err := session.Open()
 	if err != nil {
+		log.Printf("tunnel %s: failed to open stream: %v", subdomain, err)
 		http.Error(e.Response, "failed to open tunnel stream", http.StatusBadGateway)
 		return true, nil
 	}
 	defer stream.Close()
 
-	if err := e.Request.Write(stream); err != nil {
+	// Build a clean outgoing request so Request.Write produces a valid wire-format request
+	// regardless of how the incoming request was processed by PocketBase's router.
+	outReq, err := buildForwardRequest(e.Request)
+	if err != nil {
+		log.Printf("tunnel %s: failed to build forward request: %v", subdomain, err)
+		http.Error(e.Response, "failed to prepare tunnel request", http.StatusBadGateway)
+		return true, nil
+	}
+
+	if err := outReq.Write(stream); err != nil {
+		log.Printf("tunnel %s: failed to write request to stream: %v", subdomain, err)
 		http.Error(e.Response, "failed to send request to tunnel", http.StatusBadGateway)
 		return true, nil
 	}
 
-	resp, err := http.ReadResponse(bufio.NewReader(stream), e.Request)
+	resp, err := http.ReadResponse(bufio.NewReader(stream), outReq)
 	if err != nil {
+		log.Printf("tunnel %s: failed to read response from stream: %v", subdomain, err)
 		http.Error(e.Response, "failed to read tunnel response", http.StatusBadGateway)
 		return true, nil
 	}
@@ -281,8 +294,65 @@ func (t *tcpService) HandleTunnelRequest(e *core.RequestEvent) (bool, error) {
 
 	copyHeaders(e.Response.Header(), resp.Header)
 	e.Response.WriteHeader(resp.StatusCode)
-	_, err = io.Copy(e.Response, resp.Body)
-	return true, err
+	if _, err := io.Copy(e.Response, resp.Body); err != nil && !isClosedErr(err) {
+		log.Printf("tunnel %s: error copying response body: %v", subdomain, err)
+		return true, nil
+	}
+	return true, nil
+}
+
+// buildForwardRequest reads the incoming request body and creates a fresh outbound
+// http.Request suitable for serializing over the tunnel stream with Request.Write.
+func buildForwardRequest(in *http.Request) (*http.Request, error) {
+	var body io.Reader
+	var contentLength int64 = -1
+
+	if in.Body != nil && in.Body != http.NoBody {
+		buf, err := io.ReadAll(in.Body)
+		if err != nil {
+			return nil, fmt.Errorf("read body: %w", err)
+		}
+		_ = in.Body.Close()
+		body = bytes.NewReader(buf)
+		contentLength = int64(len(buf))
+	}
+
+	out, err := http.NewRequest(in.Method, in.URL.RequestURI(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	// Copy non-hop headers; the local server should see the original headers.
+	for key, values := range in.Header {
+		if isHopByHopHeader(key) {
+			continue
+		}
+		// http.NewRequest may have set Content-Length from the body; skip duplicate.
+		if strings.EqualFold(key, "Content-Length") {
+			continue
+		}
+		for _, v := range values {
+			out.Header.Add(key, v)
+		}
+	}
+	out.Host = in.Host
+	if contentLength >= 0 {
+		out.ContentLength = contentLength
+	}
+	out.Close = true
+	out.Header.Set("Connection", "close")
+
+	return out, nil
+}
+
+func isClosedErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "use of closed network connection") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "connection reset by peer")
 }
 
 func (t *tcpService) subdomainFromHost(host string) (string, bool) {
