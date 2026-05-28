@@ -1,16 +1,21 @@
 package service
 
 import (
+	"bufio"
 	"crypto/rand"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
+	"strings"
 	"sync"
 
+	"github.com/hashicorp/yamux"
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
 )
@@ -18,6 +23,7 @@ import (
 type TCPI interface {
 	Start() error
 	Stop()
+	HandleTunnelRequest(e *core.RequestEvent) (bool, error)
 }
 
 type tunnelRegistrationRequest struct {
@@ -36,6 +42,7 @@ type tcpService struct {
 	addr     string
 	mu       sync.Mutex
 	conns    map[string]net.Conn
+	sessions map[string]*yamux.Session
 	app      core.App
 	domain   string
 }
@@ -52,10 +59,11 @@ func NewTCPService(app core.App) TCPI {
 	}
 
 	return &tcpService{
-		addr:   ":" + port,
-		conns:  make(map[string]net.Conn),
-		app:    app,
-		domain: domain,
+		addr:     ":" + port,
+		conns:    make(map[string]net.Conn),
+		sessions: make(map[string]*yamux.Session),
+		app:      app,
+		domain:   domain,
 	}
 }
 
@@ -82,6 +90,10 @@ func (t *tcpService) Stop() {
 		conn.Close()
 		delete(t.conns, addr)
 	}
+	for subdomain, session := range t.sessions {
+		session.Close()
+		delete(t.sessions, subdomain)
+	}
 	t.mu.Unlock()
 
 	log.Printf("TCP tunnel listener stopped")
@@ -107,12 +119,17 @@ func (t *tcpService) acceptLoop() {
 }
 
 func (t *tcpService) handleConnection(conn net.Conn) {
+	var subdomain string
+
 	defer func() {
 		remoteAddr := conn.RemoteAddr().String()
 		conn.Close()
 
 		t.mu.Lock()
 		delete(t.conns, remoteAddr)
+		if subdomain != "" {
+			delete(t.sessions, subdomain)
+		}
 		t.mu.Unlock()
 
 		log.Printf("CLI disconnected: %s", remoteAddr)
@@ -129,12 +146,13 @@ func (t *tcpService) handleConnection(conn net.Conn) {
 		return
 	}
 
-	subdomain, err := t.createTunnel()
+	createdSubdomain, err := t.createTunnel()
 	if err != nil {
 		log.Printf("failed to create tunnel: %v", err)
 		t.sendRegistrationError(conn, fmt.Sprintf("failed to create tunnel: %v", err))
 		return
 	}
+	subdomain = createdSubdomain
 
 	resp := tunnelRegistrationResponse{
 		Subdomain: subdomain,
@@ -147,14 +165,18 @@ func (t *tcpService) handleConnection(conn net.Conn) {
 
 	log.Printf("registered %s tunnel %s -> localhost:%s", req.Type, resp.URL, req.Port)
 
-	// For now, keep connection alive
-	buf := make([]byte, 4096)
-	for {
-		_, err := conn.Read(buf)
-		if err != nil {
-			return
-		}
+	session, err := yamux.Server(conn, nil)
+	if err != nil {
+		log.Printf("failed to start yamux server: %v", err)
+		return
 	}
+	defer session.Close()
+
+	t.mu.Lock()
+	t.sessions[subdomain] = session
+	t.mu.Unlock()
+
+	<-session.CloseChan()
 }
 
 func (t *tcpService) sendRegistrationError(conn net.Conn, msg string) {
@@ -221,4 +243,84 @@ func randomSubdomain(length int) (string, error) {
 	}
 
 	return string(bytes), nil
+}
+
+func (t *tcpService) HandleTunnelRequest(e *core.RequestEvent) (bool, error) {
+	subdomain, ok := t.subdomainFromHost(e.Request.Host)
+	if !ok {
+		return false, nil
+	}
+
+	t.mu.Lock()
+	session := t.sessions[subdomain]
+	t.mu.Unlock()
+
+	if session == nil || session.IsClosed() {
+		http.Error(e.Response, "tunnel is not connected", http.StatusBadGateway)
+		return true, nil
+	}
+
+	stream, err := session.Open()
+	if err != nil {
+		http.Error(e.Response, "failed to open tunnel stream", http.StatusBadGateway)
+		return true, nil
+	}
+	defer stream.Close()
+
+	if err := e.Request.Write(stream); err != nil {
+		http.Error(e.Response, "failed to send request to tunnel", http.StatusBadGateway)
+		return true, nil
+	}
+
+	resp, err := http.ReadResponse(bufio.NewReader(stream), e.Request)
+	if err != nil {
+		http.Error(e.Response, "failed to read tunnel response", http.StatusBadGateway)
+		return true, nil
+	}
+	defer resp.Body.Close()
+
+	copyHeaders(e.Response.Header(), resp.Header)
+	e.Response.WriteHeader(resp.StatusCode)
+	_, err = io.Copy(e.Response, resp.Body)
+	return true, err
+}
+
+func (t *tcpService) subdomainFromHost(host string) (string, bool) {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+
+	domain := strings.ToLower(strings.TrimSpace(t.domain))
+	suffix := "." + domain
+	if host == domain || host == "www."+domain || host == "back."+domain || !strings.HasSuffix(host, suffix) {
+		return "", false
+	}
+
+	subdomain := strings.TrimSuffix(host, suffix)
+	if subdomain == "" || strings.Contains(subdomain, ".") {
+		return "", false
+	}
+
+	return subdomain, true
+}
+
+func copyHeaders(dst, src http.Header) {
+	for key, values := range src {
+		if isHopByHopHeader(key) {
+			continue
+		}
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
+}
+
+func isHopByHopHeader(key string) bool {
+	switch strings.ToLower(key) {
+	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade":
+		return true
+	default:
+		return false
+	}
 }

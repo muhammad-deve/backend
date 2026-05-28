@@ -16,6 +16,14 @@ type Handler struct {
 }
 
 func (h *Handler) Register(router *router.Router[*core.RequestEvent]) {
+	router.BindFunc(func(e *core.RequestEvent) error {
+		handled, err := h.service.TCP().HandleTunnelRequest(e)
+		if handled || err != nil {
+			return err
+		}
+		return e.Next()
+	})
+
 	api := router.Group("/api/v1")
 	{
 		auth := api.Group("/auth")
