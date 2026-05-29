@@ -28,8 +28,10 @@ type TCPI interface {
 }
 
 type tunnelRegistrationRequest struct {
-	Type string `json:"type"`
-	Port string `json:"port"`
+	Type      string `json:"type"`
+	Port      string `json:"port"`
+	Subdomain string `json:"subdomain,omitempty"`
+	Reset     bool   `json:"reset,omitempty"`
 }
 
 type tunnelRegistrationResponse struct {
@@ -44,6 +46,7 @@ type tcpService struct {
 	mu       sync.Mutex
 	conns    map[string]net.Conn
 	sessions map[string]*yamux.Session
+	owners   map[string]net.Conn
 	app      core.App
 	domain   string
 }
@@ -63,6 +66,7 @@ func NewTCPService(app core.App) TCPI {
 		addr:     ":" + port,
 		conns:    make(map[string]net.Conn),
 		sessions: make(map[string]*yamux.Session),
+		owners:   make(map[string]net.Conn),
 		app:      app,
 		domain:   domain,
 	}
@@ -92,8 +96,11 @@ func (t *tcpService) Stop() {
 		delete(t.conns, addr)
 	}
 	for subdomain, session := range t.sessions {
-		session.Close()
+		if session != nil {
+			session.Close()
+		}
 		delete(t.sessions, subdomain)
+		delete(t.owners, subdomain)
 	}
 	t.mu.Unlock()
 
@@ -121,6 +128,7 @@ func (t *tcpService) acceptLoop() {
 
 func (t *tcpService) handleConnection(conn net.Conn) {
 	var subdomain string
+	var sessionReserved bool
 
 	defer func() {
 		remoteAddr := conn.RemoteAddr().String()
@@ -128,8 +136,9 @@ func (t *tcpService) handleConnection(conn net.Conn) {
 
 		t.mu.Lock()
 		delete(t.conns, remoteAddr)
-		if subdomain != "" {
+		if sessionReserved && subdomain != "" && t.owners[subdomain] == conn {
 			delete(t.sessions, subdomain)
+			delete(t.owners, subdomain)
 		}
 		t.mu.Unlock()
 
@@ -147,13 +156,18 @@ func (t *tcpService) handleConnection(conn net.Conn) {
 		return
 	}
 
-	createdSubdomain, err := t.createTunnel()
+	createdSubdomain, err := t.resolveTunnel(req)
 	if err != nil {
-		log.Printf("failed to create tunnel: %v", err)
-		t.sendRegistrationError(conn, fmt.Sprintf("failed to create tunnel: %v", err))
+		log.Printf("failed to register tunnel: %v", err)
+		t.sendRegistrationError(conn, fmt.Sprintf("failed to register tunnel: %v", err))
 		return
 	}
 	subdomain = createdSubdomain
+	if !t.reserveSession(subdomain, conn) {
+		t.sendRegistrationError(conn, fmt.Sprintf("subdomain %q is already connected", subdomain))
+		return
+	}
+	sessionReserved = true
 
 	resp := tunnelRegistrationResponse{
 		Subdomain: subdomain,
@@ -186,28 +200,167 @@ func (t *tcpService) sendRegistrationError(conn net.Conn, msg string) {
 	}
 }
 
-func (t *tcpService) createTunnel() (string, error) {
+const tunnelUserID = "5743847505m28jb"
+
+func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (string, error) {
+	if req.Reset && strings.TrimSpace(req.Subdomain) != "" {
+		return "", fmt.Errorf("reset and custom subdomain cannot be used together")
+	}
+
+	if strings.TrimSpace(req.Subdomain) != "" {
+		subdomain, err := normalizeRequestedSubdomain(req.Subdomain, t.domain)
+		if err != nil {
+			return "", err
+		}
+		return t.saveTunnel(subdomain, true)
+	}
+
+	if !req.Reset {
+		record, err := t.findCurrentTunnel()
+		if err == nil {
+			subdomain := record.GetString("subdomain")
+			if subdomain != "" {
+				return subdomain, nil
+			}
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return "", err
+		}
+	}
+
+	subdomain, err := t.generateUniqueSubdomain()
+	if err != nil {
+		return "", err
+	}
+	return t.saveTunnel(subdomain, false)
+}
+
+func (t *tcpService) saveTunnel(subdomain string, isCustom bool) (string, error) {
 	collection, err := t.app.FindCollectionByNameOrId("tunnels")
 	if err != nil {
 		return "", err
 	}
 
-	const userID = "5743847505m28jb"
-	subdomain, err := t.generateUniqueSubdomain()
-	if err != nil {
+	if existing, err := t.findTunnelBySubdomain(subdomain); err == nil {
+		if userID := existing.GetString("user"); userID != "" && userID != tunnelUserID {
+			return "", fmt.Errorf("subdomain %q is already taken", subdomain)
+		}
+		existing.Set("user", tunnelUserID)
+		existing.Set("is_custom", isCustom)
+		if err := t.app.Save(existing); err != nil {
+			return "", err
+		}
+		return subdomain, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
 		return "", err
 	}
 
-	record := core.NewRecord(collection)
-	record.Set("user", userID)
+	record, err := t.findCurrentTunnel()
+	if errors.Is(err, sql.ErrNoRows) {
+		record = core.NewRecord(collection)
+	} else if err != nil {
+		return "", err
+	}
+
+	record.Set("user", tunnelUserID)
 	record.Set("subdomain", subdomain)
-	record.Set("is_custom", false)
+	record.Set("is_custom", isCustom)
 
 	if err := t.app.Save(record); err != nil {
 		return "", err
 	}
 
 	return subdomain, nil
+}
+
+func (t *tcpService) findCurrentTunnel() (*core.Record, error) {
+	records, err := t.app.FindRecordsByFilter("tunnels", "user = {:user}", "-updated", 1, 0, dbx.Params{
+		"user": tunnelUserID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(records) == 0 {
+		return nil, sql.ErrNoRows
+	}
+	return records[0], nil
+}
+
+func (t *tcpService) findTunnelBySubdomain(subdomain string) (*core.Record, error) {
+	return t.app.FindFirstRecordByFilter("tunnels", "subdomain = {:subdomain}", dbx.Params{
+		"subdomain": subdomain,
+	})
+}
+
+func (t *tcpService) reserveSession(subdomain string, conn net.Conn) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if existing, ok := t.sessions[subdomain]; ok {
+		if existing == nil || !existing.IsClosed() {
+			return false
+		}
+		delete(t.sessions, subdomain)
+		delete(t.owners, subdomain)
+	}
+
+	t.sessions[subdomain] = nil
+	t.owners[subdomain] = conn
+	return true
+}
+
+func normalizeRequestedSubdomain(value, domain string) (string, error) {
+	subdomain := strings.ToLower(strings.TrimSpace(value))
+	domain = strings.ToLower(strings.TrimSpace(domain))
+
+	subdomain = strings.TrimPrefix(subdomain, "https://")
+	subdomain = strings.TrimPrefix(subdomain, "http://")
+	if i := strings.IndexAny(subdomain, "/:"); i >= 0 {
+		subdomain = subdomain[:i]
+	}
+	subdomain = strings.TrimSuffix(subdomain, ".")
+	if domain != "" {
+		subdomain = strings.TrimSuffix(subdomain, "."+domain)
+	}
+
+	if err := validateSubdomain(subdomain); err != nil {
+		return "", err
+	}
+	return subdomain, nil
+}
+
+func validateSubdomain(subdomain string) error {
+	if len(subdomain) == 0 || len(subdomain) > 63 {
+		return fmt.Errorf("subdomain must be 1-63 characters")
+	}
+	if subdomain[0] == '-' || subdomain[len(subdomain)-1] == '-' {
+		return fmt.Errorf("subdomain cannot start or end with '-'")
+	}
+	if isReservedSubdomain(subdomain) {
+		return fmt.Errorf("subdomain %q is reserved", subdomain)
+	}
+
+	for _, ch := range subdomain {
+		if ch >= 'a' && ch <= 'z' {
+			continue
+		}
+		if ch >= '0' && ch <= '9' {
+			continue
+		}
+		if ch == '-' {
+			continue
+		}
+		return fmt.Errorf("subdomain can only contain lowercase letters, numbers, and '-'")
+	}
+	return nil
+}
+
+func isReservedSubdomain(subdomain string) bool {
+	switch subdomain {
+	case "api", "admin", "back", "dashboard", "www":
+		return true
+	default:
+		return false
+	}
 }
 
 func (t *tcpService) generateUniqueSubdomain() (string, error) {
