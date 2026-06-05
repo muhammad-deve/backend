@@ -399,7 +399,20 @@ func randomSubdomain(length int) (string, error) {
 	return string(bytes), nil
 }
 
+// tunnelForwardedHeader marks a request that has already been routed through a
+// tunnel hop. The target of a tunnel may itself be a GoPort backend (for example
+// when exposing this very service for testing). Because the original public Host
+// header is preserved end-to-end, without this marker the forwarded request would
+// match the subdomain rule again on the target backend, find no session in its own
+// map, and fail with "tunnel is not connected".
+const tunnelForwardedHeader = "X-Goport-Tunnel"
+
 func (t *tcpService) HandleTunnelRequest(e *core.RequestEvent) (bool, error) {
+	// Already came out of a tunnel hop, so don't intercept it again.
+	if e.Request.Header.Get(tunnelForwardedHeader) != "" {
+		return false, nil
+	}
+
 	subdomain, ok := t.subdomainFromHost(e.Request.Host)
 	if !ok {
 		return false, nil
@@ -489,6 +502,9 @@ func buildForwardRequest(in *http.Request) (*http.Request, error) {
 		}
 	}
 	out.Host = in.Host
+	// Mark the request as tunnel-forwarded so a target that is itself a GoPort
+	// backend serves it normally instead of re-intercepting it.
+	out.Header.Set(tunnelForwardedHeader, "1")
 	if contentLength >= 0 {
 		out.ContentLength = contentLength
 	}
