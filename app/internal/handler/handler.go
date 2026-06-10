@@ -30,6 +30,9 @@ func (h *Handler) Register(router *router.Router[*core.RequestEvent]) {
 		{
 			auth.POST("/send-otp", h.SendOTPHandler)
 			auth.POST("/verify-otp", h.VerifyOTPHandler)
+			auth.POST("/complete-registration", h.CompleteRegistrationHandler)
+			auth.POST("/forgot-password", h.ForgotPasswordHandler)
+			auth.POST("/reset-password", h.ResetPasswordHandler)
 		}
 
 	}

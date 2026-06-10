@@ -41,9 +41,16 @@ func IsRateLimited(err error) (*errRateLimited, bool) {
 	return nil, false
 }
 
+// ErrEmailRegistered is returned when signup is attempted for an email that
+// already has a completed (verified) account.
+var ErrEmailRegistered = errors.New("this email is already registered")
+
 type OTPI interface {
 	SendOTP(req *model.SendOTPRequest) (*model.SendOTPResponse, error)
 	VerifyOTP(req *model.VerifyOTPRequest) (*model.VerifyOTPResponse, error)
+	CompleteRegistration(req *model.CompleteRegistrationRequest) (*model.CompleteRegistrationResponse, error)
+	ForgotPassword(req *model.ForgotPasswordRequest) (*model.SendOTPResponse, error)
+	ResetPassword(req *model.ResetPasswordRequest) (*model.ResetPasswordResponse, error)
 }
 
 type otpService struct {
@@ -61,7 +68,8 @@ func NewOTPService(app *pocketbase.PocketBase, email EmailI) OTPI {
 	}
 }
 
-// SendOTP finds-or-creates the user by email, issues a native PocketBase OTP
+// SendOTP starts signup: it rejects emails that are already registered,
+// finds-or-creates a pending (unverified) user, issues a native PocketBase OTP
 // linked to that user, emails the code, and returns the OTP id.
 func (s *otpService) SendOTP(req *model.SendOTPRequest) (*model.SendOTPResponse, error) {
 	email := strings.ToLower(strings.TrimSpace(req.Email))
@@ -70,56 +78,69 @@ func (s *otpService) SendOTP(req *model.SendOTPRequest) (*model.SendOTPResponse,
 	}
 	name := strings.TrimSpace(req.Name)
 
-	// Throttle before doing any work so abuse can't drive user creation or
-	// email sends. Keyed by email; resets on restart.
-	if allowed, retryAfter := s.limiter.Allow(email); !allowed {
-		return nil, &errRateLimited{retryAfter: retryAfter}
-	}
-
 	usersCollection, err := s.app.FindCollectionByNameOrId(model.UsersCollection)
 	if err != nil {
 		return nil, fmt.Errorf("users collection not found: %w", err)
 	}
 
-	// Find or create the auth record. The native _otps collection requires
-	// recordRef to point at an existing auth record, so the user must exist
-	// before an OTP can be stored.
-	user, err := s.app.FindAuthRecordByEmail(usersCollection, email)
-	if err != nil {
-		if !errors.Is(err, sql.ErrNoRows) {
-			return nil, fmt.Errorf("failed to lookup user: %w", err)
-		}
+	// Reject already-registered emails up front. A user is considered
+	// registered once they've completed signup (verified == true).
+	existing, err := s.app.FindAuthRecordByEmail(usersCollection, email)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("failed to lookup user: %w", err)
+	}
+	if existing != nil && existing.Verified() {
+		return nil, ErrEmailRegistered
+	}
+
+	// Throttle before doing further work so abuse can't drive user creation or
+	// email sends. Keyed by email; resets on restart.
+	if allowed, retryAfter := s.limiter.Allow(email); !allowed {
+		return nil, &errRateLimited{retryAfter: retryAfter}
+	}
+
+	// Find or create the pending auth record. The native _otps collection
+	// requires recordRef to point at an existing auth record, so the user must
+	// exist before an OTP can be stored.
+	user := existing
+	if user == nil {
 		user = core.NewRecord(usersCollection)
 		user.SetEmail(email)
 		if name != "" {
 			user.Set("name", name)
 		}
-		// Auth records require a password; the user authenticates via OTP only,
-		// so set a random one they never use.
+		// The real password is set later in CompleteRegistration; use a random
+		// placeholder so the auth record validates in the meantime.
 		user.SetPassword(security.RandomString(40))
 		if err := s.app.Save(user); err != nil {
 			return nil, fmt.Errorf("failed to create user: %w", err)
 		}
-	} else if name != "" && user.GetString("name") == "" {
-		// Backfill the name for an existing user that doesn't have one yet.
+	} else if name != "" && user.GetString("name") != name {
+		// Keep the latest name for a pending (unverified) signup.
 		user.Set("name", name)
 		if err := s.app.Save(user); err != nil {
 			return nil, fmt.Errorf("failed to update user: %w", err)
 		}
 	}
 
+	return s.issueOTP(usersCollection.Id, user)
+}
+
+// issueOTP creates a fresh OTP for the user, emails the code, and returns the
+// OTP id. The OTP is rolled back if the email send fails.
+func (s *otpService) issueOTP(collectionID string, user *core.Record) (*model.SendOTPResponse, error) {
 	code := security.RandomStringWithAlphabet(model.OTPCodeLength, model.OTPCodeAlphabet)
 
 	otp := core.NewOTP(s.app)
-	otp.SetCollectionRef(usersCollection.Id)
+	otp.SetCollectionRef(collectionID)
 	otp.SetRecordRef(user.Id)
-	otp.SetSentTo(email)
+	otp.SetSentTo(user.Email())
 	otp.SetPassword(code)
 	if err := s.app.Save(otp); err != nil {
 		return nil, fmt.Errorf("failed to create OTP: %w", err)
 	}
 
-	if err := s.email.SendOTP(email, user.GetString("name"), code); err != nil {
+	if err := s.email.SendOTP(user.Email(), user.GetString("name"), code); err != nil {
 		// Roll back the OTP so a failed send doesn't leave a dangling code.
 		if delErr := s.app.Delete(otp); delErr != nil {
 			s.app.Logger().Error("failed to delete OTP after email failure", "error", delErr, "otpId", otp.Id)
@@ -133,11 +154,135 @@ func (s *otpService) SendOTP(req *model.SendOTPRequest) (*model.SendOTPResponse,
 	}, nil
 }
 
-// VerifyOTP validates the submitted code against the issued OTP. On success it
-// marks the user verified, deletes the used OTP, and returns the user.
+// VerifyOTP validates the submitted code without consuming it. The OTP remains
+// valid so it can be re-checked by CompleteRegistration when the password is
+// set. Returns the pending user's email and name on success.
 func (s *otpService) VerifyOTP(req *model.VerifyOTPRequest) (*model.VerifyOTPResponse, error) {
-	otpID := strings.TrimSpace(req.OtpID)
-	code := strings.TrimSpace(req.Code)
+	otp, err := s.checkOTP(req.OtpID, req.Code)
+	if err != nil {
+		return nil, err
+	}
+
+	user, err := s.app.FindRecordById(otp.CollectionRef(), otp.RecordRef())
+	if err != nil {
+		return nil, fmt.Errorf("invalid or expired code")
+	}
+
+	return &model.VerifyOTPResponse{
+		Email:   user.Email(),
+		Name:    user.GetString("name"),
+		Valid:   true,
+		Message: "Code verified",
+	}, nil
+}
+
+// CompleteRegistration re-validates the OTP, applies the chosen password, marks
+// the user verified, and consumes the OTP. This is the final signup step.
+func (s *otpService) CompleteRegistration(req *model.CompleteRegistrationRequest) (*model.CompleteRegistrationResponse, error) {
+	if ok, reason := model.ValidatePassword(req.Password); !ok {
+		return nil, fmt.Errorf("%s", reason)
+	}
+
+	otp, err := s.checkOTP(req.OtpID, req.Code)
+	if err != nil {
+		return nil, err
+	}
+
+	user, err := s.app.FindRecordById(otp.CollectionRef(), otp.RecordRef())
+	if err != nil {
+		return nil, fmt.Errorf("invalid or expired code")
+	}
+
+	if user.Verified() {
+		return nil, ErrEmailRegistered
+	}
+	user.SetPassword(req.Password)
+	user.SetVerified(true)
+	if err := s.app.Save(user); err != nil {
+		return nil, fmt.Errorf("failed to complete registration: %w", err)
+	}
+
+	// Consume the OTP now that signup is finished.
+	if delErr := s.app.Delete(otp); delErr != nil {
+		s.app.Logger().Error("failed to delete used OTP", "error", delErr, "otpId", otp.Id)
+	}
+
+	return &model.CompleteRegistrationResponse{
+		UserID:  user.Id,
+		Email:   user.Email(),
+		Name:    user.GetString("name"),
+		Message: "Account created",
+	}, nil
+}
+
+// ForgotPassword issues a password-reset OTP for an existing, verified account.
+// To avoid leaking which emails exist, it returns a successful-looking response
+// even when no matching account is found (no email is sent in that case).
+func (s *otpService) ForgotPassword(req *model.ForgotPasswordRequest) (*model.SendOTPResponse, error) {
+	email := strings.ToLower(strings.TrimSpace(req.Email))
+	if email == "" || !strings.Contains(email, "@") {
+		return nil, fmt.Errorf("a valid email is required")
+	}
+
+	usersCollection, err := s.app.FindCollectionByNameOrId(model.UsersCollection)
+	if err != nil {
+		return nil, fmt.Errorf("users collection not found: %w", err)
+	}
+
+	if allowed, retryAfter := s.limiter.Allow("reset:" + email); !allowed {
+		return nil, &errRateLimited{retryAfter: retryAfter}
+	}
+
+	user, err := s.app.FindAuthRecordByEmail(usersCollection, email)
+	if err != nil || user == nil || !user.Verified() {
+		// Don't reveal whether the account exists. Return a generic OK with a
+		// throwaway otpId so the UI can advance to the code step uniformly.
+		return &model.SendOTPResponse{
+			OtpID:   core.GenerateDefaultRandomId(),
+			Message: "If the email is registered, a reset code has been sent",
+		}, nil
+	}
+
+	return s.issueOTP(usersCollection.Id, user)
+}
+
+// ResetPassword re-validates the OTP and sets a new password for the account.
+func (s *otpService) ResetPassword(req *model.ResetPasswordRequest) (*model.ResetPasswordResponse, error) {
+	if ok, reason := model.ValidatePassword(req.Password); !ok {
+		return nil, fmt.Errorf("%s", reason)
+	}
+
+	otp, err := s.checkOTP(req.OtpID, req.Code)
+	if err != nil {
+		return nil, err
+	}
+
+	user, err := s.app.FindRecordById(otp.CollectionRef(), otp.RecordRef())
+	if err != nil {
+		return nil, fmt.Errorf("invalid or expired code")
+	}
+
+	user.SetPassword(req.Password)
+	if err := s.app.Save(user); err != nil {
+		return nil, fmt.Errorf("failed to reset password: %w", err)
+	}
+
+	// Consume the OTP now that the reset is complete.
+	if delErr := s.app.Delete(otp); delErr != nil {
+		s.app.Logger().Error("failed to delete used OTP", "error", delErr, "otpId", otp.Id)
+	}
+
+	return &model.ResetPasswordResponse{
+		Email:   user.Email(),
+		Message: "Password updated",
+	}, nil
+}
+
+// checkOTP loads an OTP by id and validates the submitted code and expiry.
+// Expired OTPs are deleted. It does not consume valid OTPs.
+func (s *otpService) checkOTP(otpID, code string) (*core.OTP, error) {
+	otpID = strings.TrimSpace(otpID)
+	code = strings.TrimSpace(code)
 	if otpID == "" || code == "" {
 		return nil, fmt.Errorf("otpId and code are required")
 	}
@@ -158,28 +303,5 @@ func (s *otpService) VerifyOTP(req *model.VerifyOTPRequest) (*model.VerifyOTPRes
 		return nil, fmt.Errorf("invalid or expired code")
 	}
 
-	user, err := s.app.FindRecordById(otp.CollectionRef(), otp.RecordRef())
-	if err != nil {
-		return nil, fmt.Errorf("invalid or expired code")
-	}
-
-	if !user.Verified() {
-		user.SetVerified(true)
-		if err := s.app.Save(user); err != nil {
-			return nil, fmt.Errorf("failed to verify user: %w", err)
-		}
-	}
-
-	// Single-use: drop the OTP once consumed.
-	if delErr := s.app.Delete(otp); delErr != nil {
-		s.app.Logger().Error("failed to delete used OTP", "error", delErr, "otpId", otp.Id)
-	}
-
-	return &model.VerifyOTPResponse{
-		UserID:   user.Id,
-		Email:    user.Email(),
-		Name:     user.GetString("name"),
-		Verified: true,
-		Message:  "Verification successful",
-	}, nil
+	return otp, nil
 }
