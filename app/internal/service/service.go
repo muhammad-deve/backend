@@ -2,6 +2,7 @@ package service
 
 import (
 	"github.com/pocketbase/pocketbase"
+	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/config"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/model"
 )
 
@@ -12,11 +13,15 @@ type AuthorizationI interface {
 type I interface {
 	Authorization() AuthorizationI
 	TCP() TCPI
+	OTP() OTPI
+	Email() EmailI
 }
 
 type service struct {
 	AuthorizationI
-	tcpService TCPI
+	tcpService   TCPI
+	otpService   OTPI
+	emailService EmailI
 }
 
 func (s *service) Authorization() AuthorizationI {
@@ -27,9 +32,20 @@ func (s *service) TCP() TCPI {
 	return s.tcpService
 }
 
-func NewService(app *pocketbase.PocketBase) I {
+func (s *service) OTP() OTPI {
+	return s.otpService
+}
+
+func (s *service) Email() EmailI {
+	return s.emailService
+}
+
+func NewService(app *pocketbase.PocketBase, cfg *config.Config) I {
+	emailService := NewEmailService(cfg)
 	return &service{
 		AuthorizationI: NewAuthorizationS(app),
 		tcpService:     NewTCPService(app),
+		otpService:     NewOTPService(app, emailService),
+		emailService:   emailService,
 	}
 }

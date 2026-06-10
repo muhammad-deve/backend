@@ -1,5 +1,32 @@
 package model
 
+// SendOTPRequest is the payload for requesting an OTP code by email.
+type SendOTPRequest struct {
+	Email string `json:"email" form:"email"`
+	Name  string `json:"name" form:"name"`
+}
+
+// SendOTPResponse is returned after an OTP has been issued and emailed.
+type SendOTPResponse struct {
+	OtpID   string `json:"otpId"`
+	Message string `json:"message"`
+}
+
+// VerifyOTPRequest is the payload for verifying an OTP code.
+type VerifyOTPRequest struct {
+	OtpID string `json:"otpId" form:"otpId"`
+	Code  string `json:"code" form:"code"`
+}
+
+// VerifyOTPResponse is returned after a successful OTP verification.
+type VerifyOTPResponse struct {
+	UserID   string `json:"userId"`
+	Email    string `json:"email"`
+	Name     string `json:"name"`
+	Verified bool   `json:"verified"`
+	Message  string `json:"message"`
+}
+
 type PasswordResetOTPConfirmRequest struct {
 	OtpId    string `json:"otpId" form:"otpId"`
 	Password string `json:"password" form:"password"`

@@ -28,7 +28,8 @@ func (h *Handler) Register(router *router.Router[*core.RequestEvent]) {
 	{
 		auth := api.Group("/auth")
 		{
-			auth.GET("/", h.AuthHandler)
+			auth.POST("/send-otp", h.SendOTPHandler)
+			auth.POST("/verify-otp", h.VerifyOTPHandler)
 		}
 
 	}
