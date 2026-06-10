@@ -11,10 +11,12 @@ import (
 )
 
 type Config struct {
-	ResendAPIKey string `env:"RESEND_API_KEY"`
-	MailFrom     string `env:"MAIL_FROM" env-default:"GoPort <noreply@contact.goport.uz>"`
-	AppName      string `env:"APP_NAME" env-default:"GoPort"`
-	AppURL       string `env:"APP_URL" env-default:"https://goport.uz"`
+	ResendAPIKey      string `env:"RESEND_API_KEY"`
+	MailFrom          string `env:"MAIL_FROM" env-default:"GoPort <noreply@contact.goport.uz>"`
+	AppName           string `env:"APP_NAME" env-default:"GoPort"`
+	AppURL            string `env:"APP_URL" env-default:"https://goport.uz"`
+	GoogleOAuthID     string `env:"GOOGLE_OAUTH_ID"`
+	GoogleOAuthSecret string `env:"GOOGLE_OAUTH_SECRET"`
 }
 
 var instance *Config
@@ -62,6 +64,7 @@ func findEnvFile(rootPath string) (string, bool) {
 		".env",            // current working directory
 		"../.env",         // app/cmd -> app/.env (Makefile case)
 		"../../.env",
+		"../../../.env",
 		"app/.env",
 	}
 

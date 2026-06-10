@@ -17,6 +17,10 @@ func NewApp(config *config.Config) *pocketbase.PocketBase {
 	app.OnServe().BindFunc(func(e *core.ServeEvent) error {
 		logger := app.Logger()
 
+		if err := configureGoogleOAuth(app, config); err != nil {
+			logger.Error("failed to configure Google OAuth", "error", err)
+		}
+
 		services := service.NewService(app, config)
 
 		// Start TCP tunnel listener on port 7000
