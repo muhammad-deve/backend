@@ -2,8 +2,8 @@ package config
 
 import (
 	"flag"
-	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 	"sync"
 
@@ -29,17 +29,50 @@ func GetConfig() *Config {
 		rootPath := flag.String("root_path", "", "Root path")
 		flag.Parse()
 
-		envFilePath, err := filepath.Abs(*rootPath + ".env")
-		if err != nil {
-			fmt.Println("Env file path error: ", err)
+		// Resolve the .env file. The app may be launched from different working
+		// directories (e.g. the Makefile runs from app/cmd), so probe a few
+		// candidate locations rather than assuming the cwd.
+		if envFilePath, ok := findEnvFile(*rootPath); ok {
+			if err := cleanenv.ReadConfig(envFilePath, instance); err != nil {
+				log.Printf("failed to read env file %q: %v", envFilePath, err)
+			} else {
+				log.Printf("loaded config from %s", envFilePath)
+			}
+		} else {
+			// No .env file found; fall back to OS environment + defaults.
+			if err := cleanenv.ReadEnv(instance); err != nil {
+				log.Printf("failed to read environment config: %v", err)
+			}
+			log.Print("no .env file found, using OS environment and defaults")
 		}
 
-		if err := cleanenv.ReadConfig(envFilePath, instance); err != nil {
-			helpText := "Yurtal - Pocketbase template project!"
-			help, _ := cleanenv.GetDescription(instance, &helpText)
-			log.Print(help)
-			fmt.Println("Application is starting with default config")
+		if instance.ResendAPIKey == "" {
+			log.Print("WARNING: RESEND_API_KEY is empty; OTP emails will not be sent")
 		}
 	})
 	return instance
+}
+
+// findEnvFile returns the first existing .env path among the candidate
+// locations, accounting for the various working directories the binary may run
+// from.
+func findEnvFile(rootPath string) (string, bool) {
+	candidates := []string{
+		rootPath + ".env", // explicit root_path flag (if provided)
+		".env",            // current working directory
+		"../.env",         // app/cmd -> app/.env (Makefile case)
+		"../../.env",
+		"app/.env",
+	}
+
+	for _, c := range candidates {
+		abs, err := filepath.Abs(c)
+		if err != nil {
+			continue
+		}
+		if info, err := os.Stat(abs); err == nil && !info.IsDir() {
+			return abs, true
+		}
+	}
+	return "", false
 }
