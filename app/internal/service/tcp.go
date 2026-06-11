@@ -15,10 +15,12 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/hashicorp/yamux"
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
+	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/model"
 )
 
 type TCPI interface {
@@ -32,6 +34,7 @@ type tunnelRegistrationRequest struct {
 	Port      string `json:"port"`
 	Subdomain string `json:"subdomain,omitempty"`
 	Reset     bool   `json:"reset,omitempty"`
+	Token     string `json:"token,omitempty"`
 }
 
 type tunnelRegistrationResponse struct {
@@ -41,14 +44,24 @@ type tunnelRegistrationResponse struct {
 }
 
 type tcpService struct {
-	listener net.Listener
-	addr     string
-	mu       sync.Mutex
-	conns    map[string]net.Conn
-	sessions map[string]*yamux.Session
-	owners   map[string]net.Conn
-	app      core.App
-	domain   string
+	listener  net.Listener
+	addr      string
+	mu        sync.Mutex
+	conns     map[string]net.Conn
+	sessions  map[string]*yamux.Session
+	owners    map[string]net.Conn
+	app       core.App
+	domain    string
+	statsMu   sync.Mutex
+	stats     map[string]*tunnelStat
+	stopFlush chan struct{}
+}
+
+// tunnelStat accumulates traffic for a subdomain in memory between flushes to
+// the tunnel_logs collection.
+type tunnelStat struct {
+	requests int64
+	bytes    int64
 }
 
 func NewTCPService(app core.App) TCPI {
@@ -63,12 +76,14 @@ func NewTCPService(app core.App) TCPI {
 	}
 
 	return &tcpService{
-		addr:     ":" + port,
-		conns:    make(map[string]net.Conn),
-		sessions: make(map[string]*yamux.Session),
-		owners:   make(map[string]net.Conn),
-		app:      app,
-		domain:   domain,
+		addr:      ":" + port,
+		conns:     make(map[string]net.Conn),
+		sessions:  make(map[string]*yamux.Session),
+		owners:    make(map[string]net.Conn),
+		app:       app,
+		domain:    domain,
+		stats:     make(map[string]*tunnelStat),
+		stopFlush: make(chan struct{}),
 	}
 }
 
@@ -82,12 +97,20 @@ func (t *tcpService) Start() error {
 	log.Printf("TCP tunnel listener started on %s", t.addr)
 
 	go t.acceptLoop()
+	go t.flushLoop()
 	return nil
 }
 
 func (t *tcpService) Stop() {
 	if t.listener != nil {
 		t.listener.Close()
+	}
+
+	select {
+	case <-t.stopFlush:
+		// already closed
+	default:
+		close(t.stopFlush)
 	}
 
 	t.mu.Lock()
@@ -103,6 +126,9 @@ func (t *tcpService) Stop() {
 		delete(t.owners, subdomain)
 	}
 	t.mu.Unlock()
+
+	// Persist any traffic accumulated since the last flush.
+	t.flushStats()
 
 	log.Printf("TCP tunnel listener stopped")
 }
@@ -202,21 +228,40 @@ func (t *tcpService) sendRegistrationError(conn net.Conn, msg string) {
 
 const tunnelUserID = "5743847505m28jb"
 
+// resolveUserID maps a CLI token to the owning user. Tunnels started without a
+// token (anonymous) fall back to the shared default account so the public
+// service keeps working without authentication.
+func (t *tcpService) resolveUserID(token string) string {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return tunnelUserID
+	}
+	rec, err := t.app.FindFirstRecordByFilter(model.UsersCollection, "api_token = {:token}", dbx.Params{
+		"token": token,
+	})
+	if err != nil || rec == nil {
+		return tunnelUserID
+	}
+	return rec.Id
+}
+
 func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (string, error) {
 	if req.Reset && strings.TrimSpace(req.Subdomain) != "" {
 		return "", fmt.Errorf("reset and custom subdomain cannot be used together")
 	}
+
+	userID := t.resolveUserID(req.Token)
 
 	if strings.TrimSpace(req.Subdomain) != "" {
 		subdomain, err := normalizeRequestedSubdomain(req.Subdomain, t.domain)
 		if err != nil {
 			return "", err
 		}
-		return t.saveTunnel(subdomain, true)
+		return t.saveTunnel(subdomain, true, userID)
 	}
 
 	if !req.Reset {
-		record, err := t.findCurrentTunnel()
+		record, err := t.findCurrentTunnel(userID)
 		if err == nil {
 			subdomain := record.GetString("subdomain")
 			if subdomain != "" {
@@ -231,20 +276,20 @@ func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (string, error
 	if err != nil {
 		return "", err
 	}
-	return t.saveTunnel(subdomain, false)
+	return t.saveTunnel(subdomain, false, userID)
 }
 
-func (t *tcpService) saveTunnel(subdomain string, isCustom bool) (string, error) {
-	collection, err := t.app.FindCollectionByNameOrId("tunnels")
+func (t *tcpService) saveTunnel(subdomain string, isCustom bool, userID string) (string, error) {
+	collection, err := t.app.FindCollectionByNameOrId(model.TunnelsCollection)
 	if err != nil {
 		return "", err
 	}
 
 	if existing, err := t.findTunnelBySubdomain(subdomain); err == nil {
-		if userID := existing.GetString("user"); userID != "" && userID != tunnelUserID {
+		if owner := existing.GetString("user"); owner != "" && owner != userID {
 			return "", fmt.Errorf("subdomain %q is already taken", subdomain)
 		}
-		existing.Set("user", tunnelUserID)
+		existing.Set("user", userID)
 		existing.Set("is_custom", isCustom)
 		if err := t.app.Save(existing); err != nil {
 			return "", err
@@ -254,14 +299,8 @@ func (t *tcpService) saveTunnel(subdomain string, isCustom bool) (string, error)
 		return "", err
 	}
 
-	record, err := t.findCurrentTunnel()
-	if errors.Is(err, sql.ErrNoRows) {
-		record = core.NewRecord(collection)
-	} else if err != nil {
-		return "", err
-	}
-
-	record.Set("user", tunnelUserID)
+	record := core.NewRecord(collection)
+	record.Set("user", userID)
 	record.Set("subdomain", subdomain)
 	record.Set("is_custom", isCustom)
 
@@ -272,9 +311,9 @@ func (t *tcpService) saveTunnel(subdomain string, isCustom bool) (string, error)
 	return subdomain, nil
 }
 
-func (t *tcpService) findCurrentTunnel() (*core.Record, error) {
+func (t *tcpService) findCurrentTunnel(userID string) (*core.Record, error) {
 	records, err := t.app.FindRecordsByFilter("tunnels", "user = {:user}", "-updated", 1, 0, dbx.Params{
-		"user": tunnelUserID,
+		"user": userID,
 	})
 	if err != nil {
 		return nil, err
@@ -460,11 +499,114 @@ func (t *tcpService) HandleTunnelRequest(e *core.RequestEvent) (bool, error) {
 
 	copyHeaders(e.Response.Header(), resp.Header)
 	e.Response.WriteHeader(resp.StatusCode)
-	if _, err := io.Copy(e.Response, resp.Body); err != nil && !isClosedErr(err) {
+	written, err := io.Copy(e.Response, resp.Body)
+	if err != nil && !isClosedErr(err) {
 		log.Printf("tunnel %s: error copying response body: %v", subdomain, err)
+		t.recordTraffic(subdomain, written+maxInt64(outReq.ContentLength, 0))
 		return true, nil
 	}
+	t.recordTraffic(subdomain, written+maxInt64(outReq.ContentLength, 0))
 	return true, nil
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// recordTraffic accumulates a single request and its byte count for a
+// subdomain. Counters are flushed to tunnel_logs by flushLoop.
+func (t *tcpService) recordTraffic(subdomain string, bytesTransferred int64) {
+	if subdomain == "" {
+		return
+	}
+	t.statsMu.Lock()
+	st := t.stats[subdomain]
+	if st == nil {
+		st = &tunnelStat{}
+		t.stats[subdomain] = st
+	}
+	st.requests++
+	if bytesTransferred > 0 {
+		st.bytes += bytesTransferred
+	}
+	t.statsMu.Unlock()
+}
+
+func (t *tcpService) flushLoop() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-t.stopFlush:
+			return
+		case <-ticker.C:
+			t.flushStats()
+		}
+	}
+}
+
+// flushStats drains the in-memory counters and persists them to tunnel_logs.
+// On a persistence failure the delta is added back so it is retried next tick.
+func (t *tcpService) flushStats() {
+	t.statsMu.Lock()
+	pending := make(map[string]tunnelStat, len(t.stats))
+	for sub, st := range t.stats {
+		if st.requests == 0 && st.bytes == 0 {
+			continue
+		}
+		pending[sub] = *st
+		st.requests = 0
+		st.bytes = 0
+	}
+	t.statsMu.Unlock()
+
+	for sub, delta := range pending {
+		if err := t.persistStat(sub, delta); err != nil {
+			log.Printf("failed to persist tunnel stats for %s: %v", sub, err)
+			t.statsMu.Lock()
+			st := t.stats[sub]
+			if st == nil {
+				st = &tunnelStat{}
+				t.stats[sub] = st
+			}
+			st.requests += delta.requests
+			st.bytes += delta.bytes
+			t.statsMu.Unlock()
+		}
+	}
+}
+
+// persistStat increments (or creates) the tunnel_logs row for a subdomain's
+// tunnel by the accumulated delta.
+func (t *tcpService) persistStat(subdomain string, delta tunnelStat) error {
+	tunnel, err := t.findTunnelBySubdomain(subdomain)
+	if err != nil {
+		return err
+	}
+
+	collection, err := t.app.FindCollectionByNameOrId(model.TunnelLogsCollection)
+	if err != nil {
+		return err
+	}
+
+	row, err := t.app.FindFirstRecordByFilter(model.TunnelLogsCollection, "tunnel_id = {:tunnel}", dbx.Params{
+		"tunnel": tunnel.Id,
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		row = core.NewRecord(collection)
+		row.Set("tunnel_id", tunnel.Id)
+	} else if err != nil {
+		return err
+	}
+
+	row.Set("request_count", row.GetFloat("request_count")+float64(delta.requests))
+	row.Set("bytes_transferred", row.GetFloat("bytes_transferred")+float64(delta.bytes))
+	row.Set("last_active", time.Now().UTC())
+
+	return t.app.Save(row)
 }
 
 // buildForwardRequest reads the incoming request body and creates a fresh outbound

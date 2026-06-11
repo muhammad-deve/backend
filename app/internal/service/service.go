@@ -15,13 +15,15 @@ type I interface {
 	TCP() TCPI
 	OTP() OTPI
 	Email() EmailI
+	Dashboard() DashboardI
 }
 
 type service struct {
 	AuthorizationI
-	tcpService   TCPI
-	otpService   OTPI
-	emailService EmailI
+	tcpService       TCPI
+	otpService       OTPI
+	emailService     EmailI
+	dashboardService DashboardI
 }
 
 func (s *service) Authorization() AuthorizationI {
@@ -40,12 +42,17 @@ func (s *service) Email() EmailI {
 	return s.emailService
 }
 
+func (s *service) Dashboard() DashboardI {
+	return s.dashboardService
+}
+
 func NewService(app *pocketbase.PocketBase, cfg *config.Config) I {
 	emailService := NewEmailService(cfg)
 	return &service{
-		AuthorizationI: NewAuthorizationS(app),
-		tcpService:     NewTCPService(app),
-		otpService:     NewOTPService(app, emailService),
-		emailService:   emailService,
+		AuthorizationI:   NewAuthorizationS(app),
+		tcpService:       NewTCPService(app),
+		otpService:       NewOTPService(app, emailService),
+		emailService:     emailService,
+		dashboardService: NewDashboardService(app),
 	}
 }

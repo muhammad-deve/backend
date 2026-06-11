@@ -3,6 +3,7 @@ package handler
 import (
 	"log/slog"
 
+	"github.com/pocketbase/pocketbase/apis"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/router"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/config"
@@ -35,6 +36,12 @@ func (h *Handler) Register(router *router.Router[*core.RequestEvent]) {
 			auth.POST("/reset-password", h.ResetPasswordHandler)
 		}
 
+		dashboard := api.Group("/dashboard")
+		{
+			// Only authenticated "users" records may read their dashboard.
+			dashboard.Bind(apis.RequireAuth("users"))
+			dashboard.GET("", h.DashboardHandler)
+		}
 	}
 }
 

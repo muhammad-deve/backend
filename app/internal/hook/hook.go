@@ -13,6 +13,7 @@ type Hook struct {
 }
 
 func (h *Hook) Register(app *pocketbase.PocketBase) {
+	h.registerAuthHooks(app)
 }
 
 func New(logger *slog.Logger, service service.I) *Hook {

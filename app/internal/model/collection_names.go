@@ -5,4 +5,6 @@ const (
 	UsersCollection          = "users"
 	CitiesCollection         = "cities"
 	AmoCredentialsCollection = "amoCredentials"
+	TunnelsCollection        = "tunnels"
+	TunnelLogsCollection     = "tunnel_logs"
 )
