@@ -7,4 +7,5 @@ const (
 	AmoCredentialsCollection = "amoCredentials"
 	TunnelsCollection        = "tunnels"
 	TunnelLogsCollection     = "tunnel_logs"
+	TokensCollection         = "tokens"
 )

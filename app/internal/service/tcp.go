@@ -236,13 +236,16 @@ func (t *tcpService) resolveUserID(token string) string {
 	if token == "" {
 		return tunnelUserID
 	}
-	rec, err := t.app.FindFirstRecordByFilter(model.UsersCollection, "api_token = {:token}", dbx.Params{
+	rec, err := t.app.FindFirstRecordByFilter(model.TokensCollection, "token = {:token}", dbx.Params{
 		"token": token,
 	})
 	if err != nil || rec == nil {
 		return tunnelUserID
 	}
-	return rec.Id
+	if owner := rec.GetString("user_id"); owner != "" {
+		return owner
+	}
+	return tunnelUserID
 }
 
 func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (string, error) {

@@ -8,7 +8,6 @@ import (
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase"
 	"github.com/pocketbase/pocketbase/core"
-	"github.com/pocketbase/pocketbase/tools/security"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/model"
 )
 
@@ -19,16 +18,18 @@ type DashboardI interface {
 
 type dashboardService struct {
 	app    *pocketbase.PocketBase
+	tokens TokensI
 	domain string
 }
 
-func NewDashboardService(app *pocketbase.PocketBase) DashboardI {
+func NewDashboardService(app *pocketbase.PocketBase, tokens TokensI) DashboardI {
 	domain := os.Getenv("GOPORT_DOMAIN")
 	if domain == "" {
 		domain = "goport.uz"
 	}
 	return &dashboardService{
 		app:    app,
+		tokens: tokens,
 		domain: domain,
 	}
 }
@@ -38,22 +39,22 @@ func (s *dashboardService) GetDashboard(user *core.Record) (*model.DashboardResp
 		return nil, fmt.Errorf("missing authenticated user")
 	}
 
-	// Ensure the user has a CLI token. Older accounts created before the
-	// api_token field existed get one minted lazily on first dashboard load.
-	token := user.GetString("api_token")
-	if token == "" {
-		token = "gp_" + security.RandomString(40)
-		user.Set("api_token", token)
-		if err := s.app.Save(user); err != nil {
-			return nil, fmt.Errorf("failed to issue api token: %w", err)
-		}
+	// Make sure the account always has at least its default token.
+	if err := s.tokens.EnsureDefault(user.Id); err != nil {
+		return nil, fmt.Errorf("failed to ensure default token: %w", err)
+	}
+
+	tokens, err := s.tokens.List(user.Id)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load tokens: %w", err)
 	}
 
 	resp := &model.DashboardResponse{
-		Token:   token,
 		Name:    user.GetString("name"),
 		Email:   user.Email(),
+		Avatar:  user.GetString("avatar_url"),
 		Domains: []model.DashboardDomain{},
+		Tokens:  tokens,
 	}
 
 	tunnels, err := s.app.FindRecordsByFilter(

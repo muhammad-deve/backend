@@ -4,12 +4,13 @@ package model
 // endpoint. It bundles everything the landing dashboard renders: the user's
 // CLI token, aggregate traffic stats, and the list of subdomains they own.
 type DashboardResponse struct {
-	Token         string            `json:"token"`
 	Name          string            `json:"name"`
 	Email         string            `json:"email"`
+	Avatar        string            `json:"avatar"`
 	TotalRequests int64             `json:"totalRequests"`
 	TotalBytes    int64             `json:"totalBytes"`
 	Domains       []DashboardDomain `json:"domains"`
+	Tokens        []TokenItem       `json:"tokens"`
 }
 
 // DashboardDomain describes a single tunnel/subdomain owned by the user along

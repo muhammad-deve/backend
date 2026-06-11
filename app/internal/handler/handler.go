@@ -42,6 +42,14 @@ func (h *Handler) Register(router *router.Router[*core.RequestEvent]) {
 			dashboard.Bind(apis.RequireAuth("users"))
 			dashboard.GET("", h.DashboardHandler)
 		}
+
+		tokens := api.Group("/tokens")
+		{
+			tokens.Bind(apis.RequireAuth("users"))
+			tokens.GET("", h.ListTokensHandler)
+			tokens.POST("", h.CreateTokenHandler)
+			tokens.DELETE("/{id}", h.DeleteTokenHandler)
+		}
 	}
 }
 
