@@ -34,6 +34,9 @@ func (h *Handler) Register(router *router.Router[*core.RequestEvent]) {
 			auth.POST("/complete-registration", h.CompleteRegistrationHandler)
 			auth.POST("/forgot-password", h.ForgotPasswordHandler)
 			auth.POST("/reset-password", h.ResetPasswordHandler)
+			// Public: the token value itself is the credential. Used by the
+			// CLI `goport auth <token>` to validate before saving.
+			auth.POST("/verify-token", h.VerifyTokenHandler)
 		}
 
 		dashboard := api.Group("/dashboard")

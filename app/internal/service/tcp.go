@@ -228,24 +228,32 @@ func (t *tcpService) sendRegistrationError(conn net.Conn, msg string) {
 
 const tunnelUserID = "5743847505m28jb"
 
+// errInvalidToken signals that a CLI supplied a token that doesn't match any
+// account. The tunnel is refused rather than silently downgraded to the shared
+// anonymous account.
+var errInvalidToken = errors.New("invalid account token; run `goport auth <token>` with a valid token from your dashboard")
+
 // resolveUserID maps a CLI token to the owning user. Tunnels started without a
 // token (anonymous) fall back to the shared default account so the public
-// service keeps working without authentication.
-func (t *tcpService) resolveUserID(token string) string {
+// service keeps working without authentication. A token that is supplied but
+// doesn't resolve to an account is rejected with errInvalidToken instead of
+// being lumped onto the shared account.
+func (t *tcpService) resolveUserID(token string) (string, error) {
 	token = strings.TrimSpace(token)
 	if token == "" {
-		return tunnelUserID
+		return tunnelUserID, nil
 	}
 	rec, err := t.app.FindFirstRecordByFilter(model.TokensCollection, "token = {:token}", dbx.Params{
 		"token": token,
 	})
 	if err != nil || rec == nil {
-		return tunnelUserID
+		return "", errInvalidToken
 	}
-	if owner := rec.GetString("user_id"); owner != "" {
-		return owner
+	owner := rec.GetString("user_id")
+	if owner == "" {
+		return "", errInvalidToken
 	}
-	return tunnelUserID
+	return owner, nil
 }
 
 func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (string, error) {
@@ -253,7 +261,10 @@ func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (string, error
 		return "", fmt.Errorf("reset and custom subdomain cannot be used together")
 	}
 
-	userID := t.resolveUserID(req.Token)
+	userID, err := t.resolveUserID(req.Token)
+	if err != nil {
+		return "", err
+	}
 
 	if strings.TrimSpace(req.Subdomain) != "" {
 		subdomain, err := normalizeRequestedSubdomain(req.Subdomain, t.domain)

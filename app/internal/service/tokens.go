@@ -20,12 +20,18 @@ var ErrTokenNameTaken = errors.New("you already have a token with this name")
 // ErrTokenNotFound is returned when a token can't be found for the user.
 var ErrTokenNotFound = errors.New("token not found")
 
+// ErrInvalidToken is returned when a token value doesn't match any account.
+var ErrInvalidToken = errors.New("invalid token")
+
 type TokensI interface {
 	List(userID string) ([]model.TokenItem, error)
 	Create(userID, name string) (*model.TokenItem, error)
 	Delete(userID, tokenID string) error
 	// EnsureDefault creates the "default" token for a user if they have none.
 	EnsureDefault(userID string) error
+	// Verify resolves a token value to the account that owns it. It returns
+	// ErrInvalidToken when the token doesn't belong to any account.
+	Verify(token string) (*model.TokenOwner, error)
 }
 
 type tokensService struct {
@@ -143,6 +149,37 @@ func (s *tokensService) findByName(userID, name string) (*core.Record, error) {
 		"user_id = {:user} && name = {:name}",
 		dbx.Params{"user": userID, "name": name},
 	)
+}
+
+// Verify resolves a token value to its owning account. It is used by the CLI's
+// `goport auth <token>` flow to confirm a token is real before saving it.
+func (s *tokensService) Verify(token string) (*model.TokenOwner, error) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return nil, ErrInvalidToken
+	}
+
+	rec, err := s.app.FindFirstRecordByFilter(model.TokensCollection, "token = {:token}", dbx.Params{
+		"token": token,
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrInvalidToken
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	userID := rec.GetString("user_id")
+	if userID == "" {
+		return nil, ErrInvalidToken
+	}
+
+	owner := &model.TokenOwner{UserID: userID}
+	if user, err := s.app.FindRecordById(model.UsersCollection, userID); err == nil && user != nil {
+		owner.Email = user.Email()
+		owner.Name = user.GetString("name")
+	}
+	return owner, nil
 }
 
 // generateTokenValue mints a fresh, opaque token. It is prefixed so it's
