@@ -228,20 +228,19 @@ func (t *tcpService) sendRegistrationError(conn net.Conn, msg string) {
 
 const tunnelUserID = "5743847505m28jb"
 
-// errInvalidToken signals that a CLI supplied a token that doesn't match any
-// account. The tunnel is refused rather than silently downgraded to the shared
+// errInvalidToken signals that a CLI either supplied no token or a token that
+// doesn't match any account. Tunnels now require authentication, so the
+// connection is refused with this message instead of falling back to a shared
 // anonymous account.
-var errInvalidToken = errors.New("invalid account token; run `goport auth <token>` with a valid token from your dashboard")
+var errInvalidToken = errors.New("authentication required: run `goport auth <token>` with a valid token from your GoPort dashboard")
 
-// resolveUserID maps a CLI token to the owning user. Tunnels started without a
-// token (anonymous) fall back to the shared default account so the public
-// service keeps working without authentication. A token that is supplied but
-// doesn't resolve to an account is rejected with errInvalidToken instead of
-// being lumped onto the shared account.
+// resolveUserID maps a CLI token to the owning user. A token is now mandatory:
+// an empty token, or one that doesn't resolve to an account, is rejected with
+// errInvalidToken rather than being lumped onto a shared account.
 func (t *tcpService) resolveUserID(token string) (string, error) {
 	token = strings.TrimSpace(token)
 	if token == "" {
-		return tunnelUserID, nil
+		return "", errInvalidToken
 	}
 	rec, err := t.app.FindFirstRecordByFilter(model.TokensCollection, "token = {:token}", dbx.Params{
 		"token": token,
