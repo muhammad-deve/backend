@@ -96,6 +96,10 @@ func (t *tcpService) Start() error {
 
 	log.Printf("TCP tunnel listener started on %s", t.addr)
 
+	// On startup, clear any stale is_current flags left over from a previous
+	// crash or unclean shutdown so subdomains aren't permanently locked.
+	t.clearAllCurrentFlags()
+
 	go t.acceptLoop()
 	go t.flushLoop()
 	return nil
@@ -168,6 +172,11 @@ func (t *tcpService) handleConnection(conn net.Conn) {
 		}
 		t.mu.Unlock()
 
+		// Mark the tunnel as no longer in use so other users can claim the subdomain.
+		if subdomain != "" {
+			t.setTunnelCurrent(subdomain, false)
+		}
+
 		log.Printf("CLI disconnected: %s", remoteAddr)
 	}()
 
@@ -205,6 +214,9 @@ func (t *tcpService) handleConnection(conn net.Conn) {
 	}
 
 	log.Printf("registered %s tunnel %s -> localhost:%s", req.Type, resp.URL, req.Port)
+
+	// Mark the subdomain as actively in use.
+	t.setTunnelCurrent(subdomain, true)
 
 	session, err := yamux.Server(conn, nil)
 	if err != nil {
@@ -299,11 +311,17 @@ func (t *tcpService) saveTunnel(subdomain string, isCustom bool, userID string) 
 	}
 
 	if existing, err := t.findTunnelBySubdomain(subdomain); err == nil {
-		if owner := existing.GetString("user"); owner != "" && owner != userID {
-			return "", fmt.Errorf("subdomain %q is already taken", subdomain)
+		owner := existing.GetString("user")
+		isCurrent := existing.GetBool("is_current")
+
+		// If the subdomain belongs to another user and is actively in use, reject.
+		if owner != "" && owner != userID && isCurrent {
+			return "", fmt.Errorf("subdomain %q is currently in use", subdomain)
 		}
+		// Otherwise (same user, or different user but not in use), take it over.
 		existing.Set("user", userID)
 		existing.Set("is_custom", isCustom)
+		existing.Set("is_current", false) // will be set to true after session is established
 		if err := t.app.Save(existing); err != nil {
 			return "", err
 		}
@@ -316,6 +334,7 @@ func (t *tcpService) saveTunnel(subdomain string, isCustom bool, userID string) 
 	record.Set("user", userID)
 	record.Set("subdomain", subdomain)
 	record.Set("is_custom", isCustom)
+	record.Set("is_current", false)
 
 	if err := t.app.Save(record); err != nil {
 		return "", err
@@ -341,6 +360,39 @@ func (t *tcpService) findTunnelBySubdomain(subdomain string) (*core.Record, erro
 	return t.app.FindFirstRecordByFilter("tunnels", "subdomain = {:subdomain}", dbx.Params{
 		"subdomain": subdomain,
 	})
+}
+
+// setTunnelCurrent updates the is_current flag for a subdomain in the database.
+// This tracks whether a tunnel is actively connected so other users know if a
+// subdomain is available to claim.
+func (t *tcpService) setTunnelCurrent(subdomain string, current bool) {
+	rec, err := t.findTunnelBySubdomain(subdomain)
+	if err != nil {
+		return
+	}
+	rec.Set("is_current", current)
+	if err := t.app.Save(rec); err != nil {
+		log.Printf("failed to update is_current for %s: %v", subdomain, err)
+	}
+}
+
+// clearAllCurrentFlags resets is_current=false for all tunnels. Called on
+// startup to recover from crashes where flags were left stale.
+func (t *tcpService) clearAllCurrentFlags() {
+	records, err := t.app.FindRecordsByFilter(model.TunnelsCollection, "is_current = true", "", 0, 0)
+	if err != nil {
+		log.Printf("failed to query stale is_current tunnels: %v", err)
+		return
+	}
+	for _, rec := range records {
+		rec.Set("is_current", false)
+		if err := t.app.Save(rec); err != nil {
+			log.Printf("failed to clear is_current for tunnel %s: %v", rec.Id, err)
+		}
+	}
+	if len(records) > 0 {
+		log.Printf("cleared is_current flag on %d stale tunnel(s)", len(records))
+	}
 }
 
 func (t *tcpService) reserveSession(subdomain string, conn net.Conn) bool {
