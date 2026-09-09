@@ -539,9 +539,10 @@ func (t *tcpService) HandleTunnelRequest(e *core.RequestEvent) (bool, error) {
 	}
 	defer stream.Close()
 
-	// Build a clean outgoing request so Request.Write produces a valid wire-format request
-	// regardless of how the incoming request was processed by PocketBase's router.
-	outReq, err := buildForwardRequest(e.Request)
+	// Upgrade requests must keep their Connection and Upgrade headers all the
+	// way to the local application. Next.js uses this for the dev HMR socket.
+	upgradeRequest := isUpgradeRequest(e.Request)
+	outReq, err := buildForwardRequest(e.Request, upgradeRequest)
 	if err != nil {
 		log.Printf("tunnel %s: failed to build forward request: %v", subdomain, err)
 		http.Error(e.Response, "failed to prepare tunnel request", http.StatusBadGateway)
@@ -551,6 +552,19 @@ func (t *tcpService) HandleTunnelRequest(e *core.RequestEvent) (bool, error) {
 	if err := outReq.Write(stream); err != nil {
 		log.Printf("tunnel %s: failed to write request to stream: %v", subdomain, err)
 		http.Error(e.Response, "failed to send request to tunnel", http.StatusBadGateway)
+		return true, nil
+	}
+
+	if upgradeRequest {
+		clientConn, _, err := http.NewResponseController(e.Response).Hijack()
+		if err != nil {
+			log.Printf("tunnel %s: failed to hijack upgrade connection: %v", subdomain, err)
+			_ = stream.Close()
+			return true, err
+		}
+		defer clientConn.Close()
+
+		copyTunnelStream(clientConn, stream)
 		return true, nil
 	}
 
@@ -676,7 +690,7 @@ func (t *tcpService) persistStat(subdomain string, delta tunnelStat) error {
 
 // buildForwardRequest reads the incoming request body and creates a fresh outbound
 // http.Request suitable for serializing over the tunnel stream with Request.Write.
-func buildForwardRequest(in *http.Request) (*http.Request, error) {
+func buildForwardRequest(in *http.Request, preserveUpgradeHeaders bool) (*http.Request, error) {
 	var body io.Reader
 	var contentLength int64 = -1
 
@@ -695,9 +709,10 @@ func buildForwardRequest(in *http.Request) (*http.Request, error) {
 		return nil, err
 	}
 
-	// Copy non-hop headers; the local server should see the original headers.
+	// Copy request headers. Upgrade headers are only forwarded when this is an
+	// upgrade request; they are invalid on ordinary proxied requests.
 	for key, values := range in.Header {
-		if isHopByHopHeader(key) {
+		if isHopByHopHeader(key) && !preserveUpgradeHeaders {
 			continue
 		}
 		// http.NewRequest may have set Content-Length from the body; skip duplicate.
@@ -715,10 +730,39 @@ func buildForwardRequest(in *http.Request) (*http.Request, error) {
 	if contentLength >= 0 {
 		out.ContentLength = contentLength
 	}
-	out.Close = true
-	out.Header.Set("Connection", "close")
+	if !preserveUpgradeHeaders {
+		out.Close = true
+		out.Header.Set("Connection", "close")
+	}
 
 	return out, nil
+}
+
+func isUpgradeRequest(req *http.Request) bool {
+	return strings.EqualFold(req.Header.Get("Upgrade"), "websocket") &&
+		strings.Contains(strings.ToLower(req.Header.Get("Connection")), "upgrade")
+}
+
+func copyTunnelStream(a, b net.Conn) {
+	done := make(chan struct{}, 2)
+	go func() {
+		_, _ = io.Copy(a, b)
+		_ = closeWrite(a)
+		done <- struct{}{}
+	}()
+	go func() {
+		_, _ = io.Copy(b, a)
+		_ = closeWrite(b)
+		done <- struct{}{}
+	}()
+	<-done
+}
+
+func closeWrite(conn net.Conn) error {
+	if writer, ok := conn.(interface{ CloseWrite() error }); ok {
+		return writer.CloseWrite()
+	}
+	return nil
 }
 
 func isClosedErr(err error) bool {
