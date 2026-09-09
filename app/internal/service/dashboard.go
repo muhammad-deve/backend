@@ -2,8 +2,10 @@ package service
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"sort"
+	"strings"
 
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase"
@@ -52,7 +54,7 @@ func (s *dashboardService) GetDashboard(user *core.Record) (*model.DashboardResp
 	resp := &model.DashboardResponse{
 		Name:    user.GetString("name"),
 		Email:   user.Email(),
-		Avatar:  user.GetString("avatar_url"),
+		Avatar:  dashboardAvatarURL(user),
 		Domains: []model.DashboardDomain{},
 		Tokens:  tokens,
 	}
@@ -102,6 +104,19 @@ func (s *dashboardService) GetDashboard(user *core.Record) (*model.DashboardResp
 	})
 
 	return resp, nil
+}
+
+func dashboardAvatarURL(user *core.Record) string {
+	if filename := user.GetString("avatar"); filename != "" {
+		return fmt.Sprintf(
+			"/api/files/%s/%s/%s?thumb=256x256f",
+			user.Collection().Id,
+			user.Id,
+			url.PathEscape(filename),
+		)
+	}
+
+	return strings.TrimSpace(user.GetString("avatar_url"))
 }
 
 // tunnelStats sums the request count and bytes transferred across all log rows

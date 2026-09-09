@@ -46,6 +46,14 @@ func (h *Handler) Register(router *router.Router[*core.RequestEvent]) {
 			dashboard.GET("", h.DashboardHandler)
 		}
 
+		account := api.Group("/account")
+		{
+			account.Bind(apis.RequireAuth("users"))
+			account.POST("/email/request", h.RequestEmailChangeHandler)
+			account.POST("/email/confirm", h.ConfirmEmailChangeHandler)
+			account.POST("/password", h.ChangePasswordHandler)
+		}
+
 		tokens := api.Group("/tokens")
 		{
 			tokens.Bind(apis.RequireAuth("users"))
