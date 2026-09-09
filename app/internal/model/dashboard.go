@@ -19,6 +19,9 @@ type DashboardDomain struct {
 	Subdomain  string `json:"subdomain"`
 	URL        string `json:"url"`
 	IsCustom   bool   `json:"isCustom"`
+	IsCurrent  bool   `json:"isCurrent"`
+	LocalPort  string `json:"localPort,omitempty"`
+	Protocol   string `json:"protocol,omitempty"`
 	Requests   int64  `json:"requests"`
 	Bytes      int64  `json:"bytes"`
 	LastActive string `json:"lastActive,omitempty"`

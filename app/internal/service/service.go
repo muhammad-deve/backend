@@ -4,6 +4,7 @@ import (
 	"github.com/pocketbase/pocketbase"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/config"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/model"
+	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/repository"
 )
 
 type AuthorizationI interface {
@@ -55,9 +56,10 @@ func (s *service) Tokens() TokensI {
 func NewService(app *pocketbase.PocketBase, cfg *config.Config) I {
 	emailService := NewEmailService(cfg)
 	tokensService := NewTokensService(app)
+	repositories := repository.NewRepository(app)
 	return &service{
 		AuthorizationI:   NewAuthorizationS(app),
-		tcpService:       NewTCPService(app),
+		tcpService:       NewTCPService(app, repositories.Tunnels()),
 		otpService:       NewOTPService(app, emailService),
 		emailService:     emailService,
 		dashboardService: NewDashboardService(app, tokensService),

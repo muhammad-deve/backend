@@ -21,13 +21,22 @@ import (
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/model"
+	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/repository"
 )
 
 type TCPI interface {
 	Start() error
 	Stop()
 	HandleTunnelRequest(e *core.RequestEvent) (bool, error)
+	StopTunnel(userID, subdomain string) error
+	DeleteTunnel(userID, subdomain string) error
 }
+
+var (
+	ErrTunnelNotFound = errors.New("tunnel not found")
+	ErrTunnelInactive = errors.New("tunnel is not active")
+	ErrTunnelActive   = errors.New("stop the tunnel before deleting it")
+)
 
 type tunnelRegistrationRequest struct {
 	Type      string `json:"type"`
@@ -55,6 +64,7 @@ type tcpService struct {
 	statsMu   sync.Mutex
 	stats     map[string]*tunnelStat
 	stopFlush chan struct{}
+	tunnels   repository.TunnelsI
 }
 
 // tunnelStat accumulates traffic for a subdomain in memory between flushes to
@@ -64,7 +74,7 @@ type tunnelStat struct {
 	bytes    int64
 }
 
-func NewTCPService(app core.App) TCPI {
+func NewTCPService(app core.App, tunnels repository.TunnelsI) TCPI {
 	port := os.Getenv("TCP_PORT")
 	if port == "" {
 		port = "7000"
@@ -84,6 +94,7 @@ func NewTCPService(app core.App) TCPI {
 		domain:    domain,
 		stats:     make(map[string]*tunnelStat),
 		stopFlush: make(chan struct{}),
+		tunnels:   tunnels,
 	}
 }
 
@@ -282,7 +293,7 @@ func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (string, error
 		if err != nil {
 			return "", err
 		}
-		return t.saveTunnel(subdomain, true, userID)
+		return t.saveTunnel(subdomain, true, userID, req.Port, req.Type)
 	}
 
 	if !req.Reset {
@@ -290,7 +301,7 @@ func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (string, error
 		if err == nil {
 			subdomain := record.GetString("subdomain")
 			if subdomain != "" {
-				return subdomain, nil
+				return t.saveTunnel(subdomain, record.GetBool("is_custom"), userID, req.Port, req.Type)
 			}
 		} else if !errors.Is(err, sql.ErrNoRows) {
 			return "", err
@@ -301,10 +312,10 @@ func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (string, error
 	if err != nil {
 		return "", err
 	}
-	return t.saveTunnel(subdomain, false, userID)
+	return t.saveTunnel(subdomain, false, userID, req.Port, req.Type)
 }
 
-func (t *tcpService) saveTunnel(subdomain string, isCustom bool, userID string) (string, error) {
+func (t *tcpService) saveTunnel(subdomain string, isCustom bool, userID, localPort, protocol string) (string, error) {
 	collection, err := t.app.FindCollectionByNameOrId(model.TunnelsCollection)
 	if err != nil {
 		return "", err
@@ -322,6 +333,8 @@ func (t *tcpService) saveTunnel(subdomain string, isCustom bool, userID string) 
 		existing.Set("user", userID)
 		existing.Set("is_custom", isCustom)
 		existing.Set("is_current", false) // will be set to true after session is established
+		existing.Set("local_port", strings.TrimSpace(localPort))
+		existing.Set("protocol", normalizedProtocol(protocol))
 		if err := t.app.Save(existing); err != nil {
 			return "", err
 		}
@@ -335,12 +348,57 @@ func (t *tcpService) saveTunnel(subdomain string, isCustom bool, userID string) 
 	record.Set("subdomain", subdomain)
 	record.Set("is_custom", isCustom)
 	record.Set("is_current", false)
+	record.Set("local_port", strings.TrimSpace(localPort))
+	record.Set("protocol", normalizedProtocol(protocol))
 
 	if err := t.app.Save(record); err != nil {
 		return "", err
 	}
 
 	return subdomain, nil
+}
+
+func normalizedProtocol(protocol string) string {
+	protocol = strings.ToLower(strings.TrimSpace(protocol))
+	if protocol == "" {
+		return "http"
+	}
+	return protocol
+}
+
+func (t *tcpService) StopTunnel(userID, subdomain string) error {
+	if _, err := t.tunnels.GetOwned(userID, subdomain); err != nil {
+		return ErrTunnelNotFound
+	}
+
+	t.mu.Lock()
+	session := t.sessions[subdomain]
+	t.mu.Unlock()
+	if session == nil || session.IsClosed() {
+		return ErrTunnelInactive
+	}
+
+	if err := session.Close(); err != nil {
+		return err
+	}
+	t.setTunnelCurrent(subdomain, false)
+	return nil
+}
+
+func (t *tcpService) DeleteTunnel(userID, subdomain string) error {
+	record, err := t.tunnels.GetOwned(userID, subdomain)
+	if err != nil {
+		return ErrTunnelNotFound
+	}
+
+	t.mu.Lock()
+	session := t.sessions[subdomain]
+	t.mu.Unlock()
+	if record.IsCurrent || (session != nil && !session.IsClosed()) {
+		return ErrTunnelActive
+	}
+
+	return t.tunnels.DeleteWithLogs(record.ID)
 }
 
 func (t *tcpService) findCurrentTunnel(userID string) (*core.Record, error) {

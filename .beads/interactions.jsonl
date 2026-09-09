@@ -1,0 +1,1 @@
+{"id":"int-afe8627d","kind":"field_change","created_at":"2026-09-09T06:21:47.9937065Z","actor":"Muhammad","issue_id":"backend-8tk","extra":{"field":"status","new_value":"closed","old_value":"in_progress","reason":"Implemented responsive dashboard, real tunnel metadata/status/actions, API wiring, and verified production builds."}}

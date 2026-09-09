@@ -53,6 +53,13 @@ func (h *Handler) Register(router *router.Router[*core.RequestEvent]) {
 			tokens.POST("", h.CreateTokenHandler)
 			tokens.DELETE("/{id}", h.DeleteTokenHandler)
 		}
+
+		tunnels := api.Group("/tunnels")
+		{
+			tunnels.Bind(apis.RequireAuth("users"))
+			tunnels.POST("/{subdomain}/stop", h.StopTunnelHandler)
+			tunnels.DELETE("/{subdomain}", h.DeleteTunnelHandler)
+		}
 	}
 }
 
