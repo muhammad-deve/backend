@@ -15,6 +15,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/yamux"
@@ -187,15 +188,19 @@ func (t *tcpService) handleConnection(conn net.Conn) {
 
 		t.mu.Lock()
 		delete(t.conns, remoteAddr)
-		if sessionReserved && subdomain != "" && t.owners[subdomain] == conn {
+		ownedSession := sessionReserved && subdomain != "" && t.owners[subdomain] == conn
+		if ownedSession {
 			delete(t.sessions, subdomain)
 			delete(t.owners, subdomain)
 			delete(t.tunnelIDs, subdomain)
 		}
 		t.mu.Unlock()
 
-		// Mark the tunnel as no longer in use so other users can claim the subdomain.
-		if subdomain != "" {
+		// Only the connection that still holds the subdomain may mark it offline.
+		// A rejected duplicate registration, or a reconnect that already handed the
+		// subdomain to a newer connection, would otherwise flag a tunnel that is
+		// still serving traffic as offline in the dashboard.
+		if ownedSession {
 			t.setTunnelCurrent(subdomain, false)
 		}
 
@@ -333,12 +338,15 @@ func (t *tcpService) saveTunnel(subdomain string, isCustom bool, userID, localPo
 	}
 
 	if existing, err := t.findTunnelBySubdomain(subdomain); err == nil {
-		owner := existing.GetString("user")
-		isCurrent := existing.GetBool("is_current")
-
-		if owner != "" && owner != userID && isCurrent {
+		// The live session map decides whether a subdomain is in use, not the
+		// is_current column, which can be left stale by an unclean shutdown.
+		// Checking it before any write also stops a second CLI from rewriting the
+		// connection metadata of a tunnel that is still online.
+		if t.hasLiveSession(subdomain) {
 			return "", "", fmt.Errorf("subdomain %q is currently in use", subdomain)
 		}
+
+		owner := existing.GetString("user")
 		if owner != "" && owner != userID {
 			if err := t.tunnels.DeleteWithLogs(existing.Id); err != nil {
 				return "", "", err
@@ -466,6 +474,23 @@ func (t *tcpService) clearAllCurrentFlags() {
 	if len(records) > 0 {
 		log.Printf("cleared is_current flag on %d stale tunnel(s)", len(records))
 	}
+}
+
+// hasLiveSession reports whether a subdomain is currently claimed by a connected
+// CLI. A reserved-but-nil session is a registration that is still completing its
+// yamux handshake and counts as live.
+func (t *tcpService) hasLiveSession(subdomain string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if _, reserved := t.owners[subdomain]; !reserved {
+		return false
+	}
+	session, ok := t.sessions[subdomain]
+	if !ok {
+		return false
+	}
+	return session == nil || !session.IsClosed()
 }
 
 func (t *tcpService) reserveSession(subdomain, tunnelID string, conn net.Conn) bool {
@@ -640,7 +665,9 @@ func (t *tcpService) HandleTunnelRequest(e *core.RequestEvent) (bool, error) {
 		}
 		defer clientConn.Close()
 
-		copyTunnelStream(clientConn, stream)
+		// An upgraded connection is counted once, when it closes, together with
+		// everything relayed over it.
+		t.recordTraffic(tunnelID, subdomain, copyTunnelStream(clientConn, stream))
 		return true, nil
 	}
 
@@ -812,19 +839,29 @@ func isUpgradeRequest(req *http.Request) bool {
 		strings.Contains(strings.ToLower(req.Header.Get("Connection")), "upgrade")
 }
 
-func copyTunnelStream(a, b net.Conn) {
+// copyTunnelStream relays an upgraded connection in both directions and reports
+// how many bytes moved. It returns as soon as either direction ends, so bytes
+// still in flight the other way can be missed; the total only feeds aggregate
+// usage figures.
+func copyTunnelStream(a, b net.Conn) int64 {
+	var transferred atomic.Int64
+
 	done := make(chan struct{}, 2)
 	go func() {
-		_, _ = io.Copy(a, b)
+		n, _ := io.Copy(a, b)
+		transferred.Add(n)
 		_ = closeWrite(a)
 		done <- struct{}{}
 	}()
 	go func() {
-		_, _ = io.Copy(b, a)
+		n, _ := io.Copy(b, a)
+		transferred.Add(n)
 		_ = closeWrite(b)
 		done <- struct{}{}
 	}()
 	<-done
+
+	return transferred.Load()
 }
 
 func closeWrite(conn net.Conn) error {
