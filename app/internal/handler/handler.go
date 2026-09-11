@@ -34,16 +34,14 @@ func (h *Handler) Register(router *router.Router[*core.RequestEvent]) {
 			auth.POST("/complete-registration", h.CompleteRegistrationHandler)
 			auth.POST("/forgot-password", h.ForgotPasswordHandler)
 			auth.POST("/reset-password", h.ResetPasswordHandler)
-			// Public: the token value itself is the credential. Used by the
-			// CLI `goport auth <token>` to validate before saving.
 			auth.POST("/verify-token", h.VerifyTokenHandler)
 		}
 
 		dashboard := api.Group("/dashboard")
 		{
-			// Only authenticated "users" records may read their dashboard.
 			dashboard.Bind(apis.RequireAuth("users"))
 			dashboard.GET("", h.DashboardHandler)
+			dashboard.GET("/usage", h.UsageHandler)
 		}
 
 		account := api.Group("/account")
@@ -72,9 +70,5 @@ func (h *Handler) Register(router *router.Router[*core.RequestEvent]) {
 }
 
 func NewHandler(logger *slog.Logger, service service.I, cfg *config.Config) *Handler {
-	return &Handler{
-		logger:  logger,
-		service: service,
-		cfg:     cfg,
-	}
+	return &Handler{logger: logger, service: service, cfg: cfg}
 }

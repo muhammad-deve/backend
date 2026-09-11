@@ -59,22 +59,29 @@ type tcpService struct {
 	conns     map[string]net.Conn
 	sessions  map[string]*yamux.Session
 	owners    map[string]net.Conn
+	tunnelIDs map[string]string
 	app       core.App
 	domain    string
 	statsMu   sync.Mutex
-	stats     map[string]*tunnelStat
+	stats     map[tunnelStatKey]*tunnelStat
 	stopFlush chan struct{}
 	tunnels   repository.TunnelsI
+	usage     repository.UsageI
 }
 
-// tunnelStat accumulates traffic for a subdomain in memory between flushes to
-// the tunnel_logs collection.
+type tunnelStatKey struct {
+	tunnelID    string
+	subdomain   string
+	bucketStart time.Time
+}
+
 type tunnelStat struct {
-	requests int64
-	bytes    int64
+	requests   int64
+	bytes      int64
+	lastActive time.Time
 }
 
-func NewTCPService(app core.App, tunnels repository.TunnelsI) TCPI {
+func NewTCPService(app core.App, tunnels repository.TunnelsI, usage repository.UsageI) TCPI {
 	port := os.Getenv("TCP_PORT")
 	if port == "" {
 		port = "7000"
@@ -90,11 +97,13 @@ func NewTCPService(app core.App, tunnels repository.TunnelsI) TCPI {
 		conns:     make(map[string]net.Conn),
 		sessions:  make(map[string]*yamux.Session),
 		owners:    make(map[string]net.Conn),
+		tunnelIDs: make(map[string]string),
 		app:       app,
 		domain:    domain,
-		stats:     make(map[string]*tunnelStat),
+		stats:     make(map[tunnelStatKey]*tunnelStat),
 		stopFlush: make(chan struct{}),
 		tunnels:   tunnels,
+		usage:     usage,
 	}
 }
 
@@ -139,6 +148,7 @@ func (t *tcpService) Stop() {
 		}
 		delete(t.sessions, subdomain)
 		delete(t.owners, subdomain)
+		delete(t.tunnelIDs, subdomain)
 	}
 	t.mu.Unlock()
 
@@ -180,6 +190,7 @@ func (t *tcpService) handleConnection(conn net.Conn) {
 		if sessionReserved && subdomain != "" && t.owners[subdomain] == conn {
 			delete(t.sessions, subdomain)
 			delete(t.owners, subdomain)
+			delete(t.tunnelIDs, subdomain)
 		}
 		t.mu.Unlock()
 
@@ -202,14 +213,14 @@ func (t *tcpService) handleConnection(conn net.Conn) {
 		return
 	}
 
-	createdSubdomain, err := t.resolveTunnel(req)
+	createdSubdomain, tunnelID, err := t.resolveTunnel(req)
 	if err != nil {
 		log.Printf("failed to register tunnel: %v", err)
 		t.sendRegistrationError(conn, fmt.Sprintf("failed to register tunnel: %v", err))
 		return
 	}
 	subdomain = createdSubdomain
-	if !t.reserveSession(subdomain, conn) {
+	if !t.reserveSession(subdomain, tunnelID, conn) {
 		t.sendRegistrationError(conn, fmt.Sprintf("subdomain %q is already connected", subdomain))
 		return
 	}
@@ -278,20 +289,20 @@ func (t *tcpService) resolveUserID(token string) (string, error) {
 	return owner, nil
 }
 
-func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (string, error) {
+func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (string, string, error) {
 	if req.Reset && strings.TrimSpace(req.Subdomain) != "" {
-		return "", fmt.Errorf("reset and custom subdomain cannot be used together")
+		return "", "", fmt.Errorf("reset and custom subdomain cannot be used together")
 	}
 
 	userID, err := t.resolveUserID(req.Token)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	if strings.TrimSpace(req.Subdomain) != "" {
 		subdomain, err := normalizeRequestedSubdomain(req.Subdomain, t.domain)
 		if err != nil {
-			return "", err
+			return "", "", err
 		}
 		return t.saveTunnel(subdomain, true, userID, req.Port, req.Type)
 	}
@@ -304,43 +315,47 @@ func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (string, error
 				return t.saveTunnel(subdomain, record.GetBool("is_custom"), userID, req.Port, req.Type)
 			}
 		} else if !errors.Is(err, sql.ErrNoRows) {
-			return "", err
+			return "", "", err
 		}
 	}
 
 	subdomain, err := t.generateUniqueSubdomain()
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	return t.saveTunnel(subdomain, false, userID, req.Port, req.Type)
 }
 
-func (t *tcpService) saveTunnel(subdomain string, isCustom bool, userID, localPort, protocol string) (string, error) {
+func (t *tcpService) saveTunnel(subdomain string, isCustom bool, userID, localPort, protocol string) (string, string, error) {
 	collection, err := t.app.FindCollectionByNameOrId(model.TunnelsCollection)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	if existing, err := t.findTunnelBySubdomain(subdomain); err == nil {
 		owner := existing.GetString("user")
 		isCurrent := existing.GetBool("is_current")
 
-		// If the subdomain belongs to another user and is actively in use, reject.
 		if owner != "" && owner != userID && isCurrent {
-			return "", fmt.Errorf("subdomain %q is currently in use", subdomain)
+			return "", "", fmt.Errorf("subdomain %q is currently in use", subdomain)
 		}
-		// Otherwise (same user, or different user but not in use), take it over.
-		existing.Set("user", userID)
-		existing.Set("is_custom", isCustom)
-		existing.Set("is_current", false) // will be set to true after session is established
-		existing.Set("local_port", strings.TrimSpace(localPort))
-		existing.Set("protocol", normalizedProtocol(protocol))
-		if err := t.app.Save(existing); err != nil {
-			return "", err
+		if owner != "" && owner != userID {
+			if err := t.tunnels.DeleteWithLogs(existing.Id); err != nil {
+				return "", "", err
+			}
+		} else {
+			existing.Set("user", userID)
+			existing.Set("is_custom", isCustom)
+			existing.Set("is_current", false)
+			existing.Set("local_port", strings.TrimSpace(localPort))
+			existing.Set("protocol", normalizedProtocol(protocol))
+			if err := t.app.Save(existing); err != nil {
+				return "", "", err
+			}
+			return subdomain, existing.Id, nil
 		}
-		return subdomain, nil
 	} else if !errors.Is(err, sql.ErrNoRows) {
-		return "", err
+		return "", "", err
 	}
 
 	record := core.NewRecord(collection)
@@ -352,10 +367,10 @@ func (t *tcpService) saveTunnel(subdomain string, isCustom bool, userID, localPo
 	record.Set("protocol", normalizedProtocol(protocol))
 
 	if err := t.app.Save(record); err != nil {
-		return "", err
+		return "", "", err
 	}
 
-	return subdomain, nil
+	return subdomain, record.Id, nil
 }
 
 func normalizedProtocol(protocol string) string {
@@ -453,7 +468,7 @@ func (t *tcpService) clearAllCurrentFlags() {
 	}
 }
 
-func (t *tcpService) reserveSession(subdomain string, conn net.Conn) bool {
+func (t *tcpService) reserveSession(subdomain, tunnelID string, conn net.Conn) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -463,10 +478,12 @@ func (t *tcpService) reserveSession(subdomain string, conn net.Conn) bool {
 		}
 		delete(t.sessions, subdomain)
 		delete(t.owners, subdomain)
+		delete(t.tunnelIDs, subdomain)
 	}
 
 	t.sessions[subdomain] = nil
 	t.owners[subdomain] = conn
+	t.tunnelIDs[subdomain] = tunnelID
 	return true
 }
 
@@ -582,9 +599,10 @@ func (t *tcpService) HandleTunnelRequest(e *core.RequestEvent) (bool, error) {
 
 	t.mu.Lock()
 	session := t.sessions[subdomain]
+	tunnelID := t.tunnelIDs[subdomain]
 	t.mu.Unlock()
 
-	if session == nil || session.IsClosed() {
+	if session == nil || session.IsClosed() || tunnelID == "" {
 		http.Error(e.Response, "tunnel is not connected", http.StatusBadGateway)
 		return true, nil
 	}
@@ -639,10 +657,10 @@ func (t *tcpService) HandleTunnelRequest(e *core.RequestEvent) (bool, error) {
 	written, err := io.Copy(e.Response, resp.Body)
 	if err != nil && !isClosedErr(err) {
 		log.Printf("tunnel %s: error copying response body: %v", subdomain, err)
-		t.recordTraffic(subdomain, written+maxInt64(outReq.ContentLength, 0))
+		t.recordTraffic(tunnelID, subdomain, written+maxInt64(outReq.ContentLength, 0))
 		return true, nil
 	}
-	t.recordTraffic(subdomain, written+maxInt64(outReq.ContentLength, 0))
+	t.recordTraffic(tunnelID, subdomain, written+maxInt64(outReq.ContentLength, 0))
 	return true, nil
 }
 
@@ -653,21 +671,31 @@ func maxInt64(a, b int64) int64 {
 	return b
 }
 
-// recordTraffic accumulates a single request and its byte count for a
-// subdomain. Counters are flushed to tunnel_logs by flushLoop.
-func (t *tcpService) recordTraffic(subdomain string, bytesTransferred int64) {
-	if subdomain == "" {
+// recordTraffic keeps the completion timestamp with each delta so retries and
+// flushes around a bucket boundary cannot move traffic into the wrong period.
+func (t *tcpService) recordTraffic(tunnelID, subdomain string, bytesTransferred int64) {
+	if tunnelID == "" || subdomain == "" {
 		return
 	}
-	t.statsMu.Lock()
-	st := t.stats[subdomain]
-	if st == nil {
-		st = &tunnelStat{}
-		t.stats[subdomain] = st
+
+	completedAt := time.Now().UTC()
+	key := tunnelStatKey{
+		tunnelID:    tunnelID,
+		subdomain:   subdomain,
+		bucketStart: completedAt.Truncate(model.UsageBucketDuration),
 	}
-	st.requests++
+	t.statsMu.Lock()
+	stat := t.stats[key]
+	if stat == nil {
+		stat = &tunnelStat{}
+		t.stats[key] = stat
+	}
+	stat.requests++
 	if bytesTransferred > 0 {
-		st.bytes += bytesTransferred
+		stat.bytes += bytesTransferred
+	}
+	if completedAt.After(stat.lastActive) {
+		stat.lastActive = completedAt
 	}
 	t.statsMu.Unlock()
 }
@@ -685,65 +713,48 @@ func (t *tcpService) flushLoop() {
 	}
 }
 
-// flushStats drains the in-memory counters and persists them to tunnel_logs.
-// On a persistence failure the delta is added back so it is retried next tick.
+// flushStats drains the in-memory counters. Failed deltas retain their original
+// bucket and completion time when they are added back for the next flush.
 func (t *tcpService) flushStats() {
 	t.statsMu.Lock()
-	pending := make(map[string]tunnelStat, len(t.stats))
-	for sub, st := range t.stats {
-		if st.requests == 0 && st.bytes == 0 {
+	pending := make(map[tunnelStatKey]tunnelStat, len(t.stats))
+	for key, stat := range t.stats {
+		if stat.requests == 0 && stat.bytes == 0 {
 			continue
 		}
-		pending[sub] = *st
-		st.requests = 0
-		st.bytes = 0
+		pending[key] = *stat
+		delete(t.stats, key)
 	}
 	t.statsMu.Unlock()
 
-	for sub, delta := range pending {
-		if err := t.persistStat(sub, delta); err != nil {
-			log.Printf("failed to persist tunnel stats for %s: %v", sub, err)
-			t.statsMu.Lock()
-			st := t.stats[sub]
-			if st == nil {
-				st = &tunnelStat{}
-				t.stats[sub] = st
-			}
-			st.requests += delta.requests
-			st.bytes += delta.bytes
-			t.statsMu.Unlock()
+	for key, delta := range pending {
+		err := t.usage.AddTraffic(key.tunnelID, key.bucketStart, model.UsageDelta{
+			Requests:   delta.requests,
+			Bytes:      delta.bytes,
+			LastActive: delta.lastActive,
+		})
+		if err == nil {
+			continue
 		}
+		if errors.Is(err, sql.ErrNoRows) {
+			log.Printf("discarding stale tunnel stats for %s", key.subdomain)
+			continue
+		}
+
+		log.Printf("failed to persist tunnel stats for %s: %v", key.subdomain, err)
+		t.statsMu.Lock()
+		stat := t.stats[key]
+		if stat == nil {
+			stat = &tunnelStat{}
+			t.stats[key] = stat
+		}
+		stat.requests += delta.requests
+		stat.bytes += delta.bytes
+		if delta.lastActive.After(stat.lastActive) {
+			stat.lastActive = delta.lastActive
+		}
+		t.statsMu.Unlock()
 	}
-}
-
-// persistStat increments (or creates) the tunnel_logs row for a subdomain's
-// tunnel by the accumulated delta.
-func (t *tcpService) persistStat(subdomain string, delta tunnelStat) error {
-	tunnel, err := t.findTunnelBySubdomain(subdomain)
-	if err != nil {
-		return err
-	}
-
-	collection, err := t.app.FindCollectionByNameOrId(model.TunnelLogsCollection)
-	if err != nil {
-		return err
-	}
-
-	row, err := t.app.FindFirstRecordByFilter(model.TunnelLogsCollection, "tunnel_id = {:tunnel}", dbx.Params{
-		"tunnel": tunnel.Id,
-	})
-	if errors.Is(err, sql.ErrNoRows) {
-		row = core.NewRecord(collection)
-		row.Set("tunnel_id", tunnel.Id)
-	} else if err != nil {
-		return err
-	}
-
-	row.Set("request_count", row.GetFloat("request_count")+float64(delta.requests))
-	row.Set("bytes_transferred", row.GetFloat("bytes_transferred")+float64(delta.bytes))
-	row.Set("last_active", time.Now().UTC())
-
-	return t.app.Save(row)
 }
 
 // buildForwardRequest reads the incoming request body and creates a fresh outbound

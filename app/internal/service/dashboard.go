@@ -7,33 +7,28 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/pocketbase/dbx"
-	"github.com/pocketbase/pocketbase"
 	"github.com/pocketbase/pocketbase/core"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/model"
+	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/repository"
 )
 
 type DashboardI interface {
-	// GetDashboard builds the dashboard payload for an authenticated user.
 	GetDashboard(user *core.Record) (*model.DashboardResponse, error)
 }
 
 type dashboardService struct {
-	app    *pocketbase.PocketBase
-	tokens TokensI
-	domain string
+	tokens  TokensI
+	tunnels repository.TunnelsI
+	usage   repository.UsageI
+	domain  string
 }
 
-func NewDashboardService(app *pocketbase.PocketBase, tokens TokensI) DashboardI {
+func NewDashboardService(tokens TokensI, tunnels repository.TunnelsI, usage repository.UsageI) DashboardI {
 	domain := os.Getenv("GOPORT_DOMAIN")
 	if domain == "" {
 		domain = "goport.uz"
 	}
-	return &dashboardService{
-		app:    app,
-		tokens: tokens,
-		domain: domain,
-	}
+	return &dashboardService{tokens: tokens, tunnels: tunnels, usage: usage, domain: domain}
 }
 
 func (s *dashboardService) GetDashboard(user *core.Record) (*model.DashboardResponse, error) {
@@ -41,7 +36,6 @@ func (s *dashboardService) GetDashboard(user *core.Record) (*model.DashboardResp
 		return nil, fmt.Errorf("missing authenticated user")
 	}
 
-	// Make sure the account always has at least its default token.
 	if err := s.tokens.EnsureDefault(user.Id); err != nil {
 		return nil, fmt.Errorf("failed to ensure default token: %w", err)
 	}
@@ -59,43 +53,35 @@ func (s *dashboardService) GetDashboard(user *core.Record) (*model.DashboardResp
 		Tokens:  tokens,
 	}
 
-	tunnels, err := s.app.FindRecordsByFilter(
-		model.TunnelsCollection,
-		"user = {:user}",
-		"-updated",
-		200,
-		0,
-		dbx.Params{"user": user.Id},
-	)
+	tunnels, err := s.tunnels.ListOwned(user.Id)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load tunnels: %w", err)
 	}
 
 	for _, tunnel := range tunnels {
-		subdomain := tunnel.GetString("subdomain")
-		if subdomain == "" {
+		if tunnel.Subdomain == "" {
 			continue
 		}
-
-		requests, bytes, lastActive := s.tunnelStats(tunnel.Id)
-		resp.TotalRequests += requests
-		resp.TotalBytes += bytes
-
+		total, err := s.usage.Total(tunnel.ID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load usage for tunnel %s: %w", tunnel.ID, err)
+		}
+		resp.TotalRequests += total.Requests
+		resp.TotalBytes += total.Bytes
 		resp.Domains = append(resp.Domains, model.DashboardDomain{
-			Subdomain:  subdomain,
-			URL:        fmt.Sprintf("https://%s.%s", subdomain, s.domain),
-			IsCustom:   tunnel.GetBool("is_custom"),
-			IsCurrent:  tunnel.GetBool("is_current"),
-			LocalPort:  tunnel.GetString("local_port"),
-			Protocol:   tunnel.GetString("protocol"),
-			Requests:   requests,
-			Bytes:      bytes,
-			LastActive: lastActive,
-			Created:    tunnel.GetString("created"),
+			Subdomain:  tunnel.Subdomain,
+			URL:        fmt.Sprintf("https://%s.%s", tunnel.Subdomain, s.domain),
+			IsCustom:   tunnel.IsCustom,
+			IsCurrent:  tunnel.IsCurrent,
+			LocalPort:  tunnel.LocalPort,
+			Protocol:   tunnel.Protocol,
+			Requests:   total.Requests,
+			Bytes:      total.Bytes,
+			LastActive: total.LastActive,
+			Created:    tunnel.Created,
 		})
 	}
 
-	// Custom subdomains first, then most recently created.
 	sort.SliceStable(resp.Domains, func(i, j int) bool {
 		if resp.Domains[i].IsCustom != resp.Domains[j].IsCustom {
 			return resp.Domains[i].IsCustom
@@ -115,33 +101,5 @@ func dashboardAvatarURL(user *core.Record) string {
 			url.PathEscape(filename),
 		)
 	}
-
 	return strings.TrimSpace(user.GetString("avatar_url"))
-}
-
-// tunnelStats sums the request count and bytes transferred across all log rows
-// for a tunnel and returns the most recent activity timestamp.
-func (s *dashboardService) tunnelStats(tunnelID string) (requests int64, bytes int64, lastActive string) {
-	logs, err := s.app.FindRecordsByFilter(
-		model.TunnelLogsCollection,
-		"tunnel_id = {:tunnel}",
-		"-last_active",
-		500,
-		0,
-		dbx.Params{"tunnel": tunnelID},
-	)
-	if err != nil {
-		return 0, 0, ""
-	}
-
-	for _, l := range logs {
-		requests += int64(l.GetFloat("request_count"))
-		bytes += int64(l.GetFloat("bytes_transferred"))
-		if lastActive == "" {
-			if la := l.GetString("last_active"); la != "" {
-				lastActive = la
-			}
-		}
-	}
-	return requests, bytes, lastActive
 }
