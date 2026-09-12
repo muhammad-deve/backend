@@ -88,6 +88,28 @@ func (r *Usage) ListBuckets(userID string, from, to time.Time) ([]model.UsageBuc
 	return buckets, nil
 }
 
+func (r *Usage) BytesForPeriod(userID string, from, to time.Time) (int64, error) {
+	var result struct {
+		Bytes int64 `db:"bytes"`
+	}
+	err := r.app.DB().NewQuery(`
+		SELECT COALESCE(SUM(bucket.bytes_transferred), 0) AS bytes
+		FROM tunnel_usage_buckets AS bucket
+		INNER JOIN tunnels AS tunnel ON tunnel.id = bucket.tunnel_id
+		WHERE tunnel.user = {:user}
+			AND bucket.bucket_start >= {:from}
+			AND bucket.bucket_start < {:to}
+	`).Bind(dbx.Params{
+		"user": userID,
+		"from": from.UTC(),
+		"to":   to.UTC(),
+	}).One(&result)
+	if err != nil {
+		return 0, err
+	}
+	return result.Bytes, nil
+}
+
 func incrementLifetimeUsage(app core.App, tunnelID string, delta model.UsageDelta) error {
 	collection, err := app.FindCollectionByNameOrId(model.TunnelLogsCollection)
 	if err != nil {

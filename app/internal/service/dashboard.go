@@ -20,15 +20,16 @@ type dashboardService struct {
 	tokens  TokensI
 	tunnels repository.TunnelsI
 	usage   repository.UsageI
+	billing BillingI
 	domain  string
 }
 
-func NewDashboardService(tokens TokensI, tunnels repository.TunnelsI, usage repository.UsageI) DashboardI {
+func NewDashboardService(tokens TokensI, tunnels repository.TunnelsI, usage repository.UsageI, billing BillingI) DashboardI {
 	domain := os.Getenv("GOPORT_DOMAIN")
 	if domain == "" {
 		domain = "goport.uz"
 	}
-	return &dashboardService{tokens: tokens, tunnels: tunnels, usage: usage, domain: domain}
+	return &dashboardService{tokens: tokens, tunnels: tunnels, usage: usage, billing: billing, domain: domain}
 }
 
 func (s *dashboardService) GetDashboard(user *core.Record) (*model.DashboardResponse, error) {
@@ -52,6 +53,11 @@ func (s *dashboardService) GetDashboard(user *core.Record) (*model.DashboardResp
 		Domains: []model.DashboardDomain{},
 		Tokens:  tokens,
 	}
+	billing, err := s.billing.Get(user.Id)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load billing: %w", err)
+	}
+	resp.Billing = billing
 
 	tunnels, err := s.tunnels.ListOwned(user.Id)
 	if err != nil {

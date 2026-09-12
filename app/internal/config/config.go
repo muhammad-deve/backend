@@ -11,12 +11,21 @@ import (
 )
 
 type Config struct {
-	ResendAPIKey      string `env:"RESEND_API_KEY"`
-	MailFrom          string `env:"MAIL_FROM" env-default:"GoPort <noreply@contact.goport.uz>"`
-	AppName           string `env:"APP_NAME" env-default:"GoPort"`
-	AppURL            string `env:"APP_URL" env-default:"https://goport.uz"`
-	GoogleOAuthID     string `env:"GOOGLE_OAUTH_ID"`
-	GoogleOAuthSecret string `env:"GOOGLE_OAUTH_SECRET"`
+	ResendAPIKey                    string `env:"RESEND_API_KEY"`
+	MailFrom                        string `env:"MAIL_FROM" env-default:"GoPort <noreply@contact.goport.uz>"`
+	AppName                         string `env:"APP_NAME" env-default:"GoPort"`
+	AppURL                          string `env:"APP_URL" env-default:"https://goport.uz"`
+	GoogleOAuthID                   string `env:"GOOGLE_OAUTH_ID"`
+	GoogleOAuthSecret               string `env:"GOOGLE_OAUTH_SECRET"`
+	LemonSqueezyKey                 string `env:"LEMON_SQUEEZY_KEY"`
+	LemonSqueezyStoreID             string `env:"LEMON_SQUEEZY_STORE_ID"`
+	LemonSqueezyProMonthlyVariantID string `env:"LEMON_SQUEEZY_PRO_MONTHLY_VARIANT_ID"`
+	LemonSqueezyProYearlyVariantID  string `env:"LEMON_SQUEEZY_PRO_YEARLY_VARIANT_ID"`
+	LemonSqueezyWebhookSecret       string `env:"LEMON_SQUEEZY_WEBHOOK_SECRET"`
+	LemonSqueezyTestMode            bool   `env:"LEMON_SQUEEZY_TEST_MODE" env-default:"true"`
+	LemonSqueezyAPIURL              string `env:"LEMON_SQUEEZY_API_URL" env-default:"https://api.lemonsqueezy.com/v1"`
+	LemonSqueezyMonthlyAmountCents  int64  `env:"LEMON_SQUEEZY_MONTHLY_AMOUNT_CENTS" env-default:"299"`
+	LemonSqueezyYearlyAmountCents   int64  `env:"LEMON_SQUEEZY_YEARLY_AMOUNT_CENTS" env-default:"1999"`
 }
 
 var instance *Config
@@ -50,6 +59,9 @@ func GetConfig() *Config {
 
 		if instance.ResendAPIKey == "" {
 			log.Print("WARNING: RESEND_API_KEY is empty; OTP emails will not be sent")
+		}
+		if instance.LemonSqueezyKey == "" || instance.LemonSqueezyStoreID == "" || instance.LemonSqueezyWebhookSecret == "" {
+			log.Print("WARNING: Lemon Squeezy billing is not fully configured")
 		}
 	})
 	return instance

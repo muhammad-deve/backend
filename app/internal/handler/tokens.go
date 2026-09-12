@@ -42,6 +42,12 @@ func (h *Handler) CreateTokenHandler(e *core.RequestEvent) error {
 		if errors.Is(err, service.ErrTokenNameTaken) {
 			return h.NewErrorResponse(e, http.StatusConflict, err.Error())
 		}
+		if errors.Is(err, service.ErrProRequired) {
+			return h.NewErrorResponse(e, http.StatusPaymentRequired, err.Error())
+		}
+		if errors.Is(err, service.ErrPlanLimitReached) {
+			return h.NewErrorResponse(e, http.StatusConflict, err.Error())
+		}
 		return h.NewErrorResponse(e, http.StatusBadRequest, err.Error())
 	}
 
@@ -62,6 +68,9 @@ func (h *Handler) VerifyTokenHandler(e *core.RequestEvent) error {
 	if err != nil {
 		if errors.Is(err, service.ErrInvalidToken) {
 			return h.NewErrorResponse(e, http.StatusUnauthorized, "Invalid token. Check the token from your GoPort dashboard.")
+		}
+		if errors.Is(err, service.ErrProRequired) {
+			return h.NewErrorResponse(e, http.StatusPaymentRequired, err.Error())
 		}
 		h.logger.Error("failed to verify token", "error", err)
 		return h.NewErrorResponse(e, http.StatusInternalServerError, "Couldn't verify the token. Please try again.")

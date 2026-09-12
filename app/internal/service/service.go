@@ -20,6 +20,7 @@ type I interface {
 	Dashboard() DashboardI
 	Usage() UsageI
 	Tokens() TokensI
+	Billing() BillingI
 }
 
 type service struct {
@@ -31,6 +32,7 @@ type service struct {
 	dashboardService DashboardI
 	usageService     UsageI
 	tokensService    TokensI
+	billingService   BillingI
 }
 
 func (s *service) Authorization() AuthorizationI { return s.AuthorizationI }
@@ -41,20 +43,23 @@ func (s *service) Email() EmailI                 { return s.emailService }
 func (s *service) Dashboard() DashboardI         { return s.dashboardService }
 func (s *service) Usage() UsageI                 { return s.usageService }
 func (s *service) Tokens() TokensI               { return s.tokensService }
+func (s *service) Billing() BillingI             { return s.billingService }
 
 func NewService(app *pocketbase.PocketBase, cfg *config.Config) I {
 	emailService := NewEmailService(cfg)
-	tokensService := NewTokensService(app)
 	repositories := repository.NewRepository(app)
+	billingService := NewBillingService(cfg, repositories.Billing())
+	tokensService := NewTokensService(app, billingService)
 	usageService := NewUsageService(repositories.Tunnels(), repositories.Usage())
 	return &service{
 		AuthorizationI:   NewAuthorizationS(app),
-		tcpService:       NewTCPService(app, repositories.Tunnels(), repositories.Usage()),
+		tcpService:       NewTCPService(app, repositories.Tunnels(), repositories.Usage(), billingService, tokensService),
 		otpService:       NewOTPService(app, emailService),
 		accountService:   NewAccountService(app, emailService),
 		emailService:     emailService,
-		dashboardService: NewDashboardService(tokensService, repositories.Tunnels(), repositories.Usage()),
+		dashboardService: NewDashboardService(tokensService, repositories.Tunnels(), repositories.Usage(), billingService),
 		usageService:     usageService,
 		tokensService:    tokensService,
+		billingService:   billingService,
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/google/uuid"
 	"github.com/pocketbase/dbx"
@@ -23,6 +24,8 @@ var ErrTokenNotFound = errors.New("token not found")
 // ErrInvalidToken is returned when a token value doesn't match any account.
 var ErrInvalidToken = errors.New("invalid token")
 
+var ErrPlanLimitReached = errors.New("plan limit reached")
+
 type TokensI interface {
 	List(userID string) ([]model.TokenItem, error)
 	Create(userID, name string) (*model.TokenItem, error)
@@ -35,11 +38,13 @@ type TokensI interface {
 }
 
 type tokensService struct {
-	app *pocketbase.PocketBase
+	app      *pocketbase.PocketBase
+	billing  BillingI
+	createMu sync.Mutex
 }
 
-func NewTokensService(app *pocketbase.PocketBase) TokensI {
-	return &tokensService{app: app}
+func NewTokensService(app *pocketbase.PocketBase, billing BillingI) TokensI {
+	return &tokensService{app: app, billing: billing}
 }
 
 func (s *tokensService) List(userID string) ([]model.TokenItem, error) {
@@ -74,6 +79,24 @@ func (s *tokensService) Create(userID, name string) (*model.TokenItem, error) {
 	}
 	if len(name) > 50 {
 		return nil, fmt.Errorf("token name must be 50 characters or fewer")
+	}
+
+	s.createMu.Lock()
+	defer s.createMu.Unlock()
+
+	limits, err := s.billing.Plan(userID)
+	if err != nil {
+		return nil, err
+	}
+	existingTokens, err := s.List(userID)
+	if err != nil {
+		return nil, err
+	}
+	if len(existingTokens) >= limits.MaxTokens {
+		if !limits.IsPro {
+			return nil, fmt.Errorf("%w: the Free plan includes %d device token; upgrade to Pro for up to %d", ErrProRequired, limits.MaxTokens, model.ProMaxTokens)
+		}
+		return nil, fmt.Errorf("%w: Pro supports up to %d device tokens", ErrPlanLimitReached, limits.MaxTokens)
 	}
 
 	// Enforce per-user name uniqueness up front for a friendly error (the DB
@@ -172,6 +195,24 @@ func (s *tokensService) Verify(token string) (*model.TokenOwner, error) {
 	userID := rec.GetString("user_id")
 	if userID == "" {
 		return nil, ErrInvalidToken
+	}
+	limits, err := s.billing.Plan(userID)
+	if err != nil {
+		return nil, err
+	}
+	tokens, err := s.List(userID)
+	if err != nil {
+		return nil, err
+	}
+	allowed := false
+	for index, item := range tokens {
+		if item.ID == rec.Id {
+			allowed = index < limits.MaxTokens
+			break
+		}
+	}
+	if !allowed {
+		return nil, fmt.Errorf("%w: this device token is outside your plan allowance; manage tokens or upgrade at https://goport.uz/dashboard#billing", ErrProRequired)
 	}
 
 	owner := &model.TokenOwner{UserID: userID}

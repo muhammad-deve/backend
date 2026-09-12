@@ -66,6 +66,14 @@ func (h *Handler) Register(router *router.Router[*core.RequestEvent]) {
 			tunnels.POST("/{subdomain}/stop", h.StopTunnelHandler)
 			tunnels.DELETE("/{subdomain}", h.DeleteTunnelHandler)
 		}
+
+		api.POST("/billing/webhook", h.LemonSqueezyWebhookHandler)
+		billing := api.Group("/billing")
+		{
+			billing.Bind(apis.RequireAuth("users"))
+			billing.POST("/checkout", h.CreateCheckoutHandler)
+			billing.GET("/portal", h.BillingPortalHandler)
+		}
 	}
 }
 

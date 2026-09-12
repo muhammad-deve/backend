@@ -11,6 +11,7 @@ type DashboardResponse struct {
 	TotalBytes    int64             `json:"totalBytes"`
 	Domains       []DashboardDomain `json:"domains"`
 	Tokens        []TokenItem       `json:"tokens"`
+	Billing       *BillingData      `json:"billing"`
 }
 
 // DashboardDomain describes a single tunnel/subdomain owned by the user along

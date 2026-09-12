@@ -54,25 +54,34 @@ type tunnelRegistrationResponse struct {
 }
 
 type tcpService struct {
-	listener  net.Listener
-	addr      string
-	mu        sync.Mutex
-	conns     map[string]net.Conn
-	sessions  map[string]*yamux.Session
-	owners    map[string]net.Conn
-	tunnelIDs map[string]string
-	app       core.App
-	domain    string
-	statsMu   sync.Mutex
-	stats     map[tunnelStatKey]*tunnelStat
-	stopFlush chan struct{}
-	tunnels   repository.TunnelsI
-	usage     repository.UsageI
+	listener      net.Listener
+	addr          string
+	mu            sync.Mutex
+	conns         map[string]net.Conn
+	sessions      map[string]*yamux.Session
+	owners        map[string]net.Conn
+	tunnelIDs     map[string]string
+	sessionUsers  map[string]string
+	sessionCustom map[string]bool
+	sessionOrder  map[string]uint64
+	nextSession   uint64
+	app           core.App
+	domain        string
+	statsMu       sync.Mutex
+	stats         map[tunnelStatKey]*tunnelStat
+	stopFlush     chan struct{}
+	tunnels       repository.TunnelsI
+	usage         repository.UsageI
+	billing       BillingI
+	tokens        TokensI
+	quotaMu       sync.Mutex
+	quotaCache    map[string]trafficQuotaCacheEntry
 }
 
 type tunnelStatKey struct {
 	tunnelID    string
 	subdomain   string
+	userID      string
 	bucketStart time.Time
 }
 
@@ -82,7 +91,13 @@ type tunnelStat struct {
 	lastActive time.Time
 }
 
-func NewTCPService(app core.App, tunnels repository.TunnelsI, usage repository.UsageI) TCPI {
+type trafficQuotaCacheEntry struct {
+	limits    model.PlanLimits
+	usedBytes int64
+	expiresAt time.Time
+}
+
+func NewTCPService(app core.App, tunnels repository.TunnelsI, usage repository.UsageI, billing BillingI, tokens TokensI) TCPI {
 	port := os.Getenv("TCP_PORT")
 	if port == "" {
 		port = "7000"
@@ -94,17 +109,23 @@ func NewTCPService(app core.App, tunnels repository.TunnelsI, usage repository.U
 	}
 
 	return &tcpService{
-		addr:      ":" + port,
-		conns:     make(map[string]net.Conn),
-		sessions:  make(map[string]*yamux.Session),
-		owners:    make(map[string]net.Conn),
-		tunnelIDs: make(map[string]string),
-		app:       app,
-		domain:    domain,
-		stats:     make(map[tunnelStatKey]*tunnelStat),
-		stopFlush: make(chan struct{}),
-		tunnels:   tunnels,
-		usage:     usage,
+		addr:          ":" + port,
+		conns:         make(map[string]net.Conn),
+		sessions:      make(map[string]*yamux.Session),
+		owners:        make(map[string]net.Conn),
+		tunnelIDs:     make(map[string]string),
+		sessionUsers:  make(map[string]string),
+		sessionCustom: make(map[string]bool),
+		sessionOrder:  make(map[string]uint64),
+		app:           app,
+		domain:        domain,
+		stats:         make(map[tunnelStatKey]*tunnelStat),
+		stopFlush:     make(chan struct{}),
+		tunnels:       tunnels,
+		usage:         usage,
+		billing:       billing,
+		tokens:        tokens,
+		quotaCache:    make(map[string]trafficQuotaCacheEntry),
 	}
 }
 
@@ -150,6 +171,9 @@ func (t *tcpService) Stop() {
 		delete(t.sessions, subdomain)
 		delete(t.owners, subdomain)
 		delete(t.tunnelIDs, subdomain)
+		delete(t.sessionUsers, subdomain)
+		delete(t.sessionCustom, subdomain)
+		delete(t.sessionOrder, subdomain)
 	}
 	t.mu.Unlock()
 
@@ -193,6 +217,9 @@ func (t *tcpService) handleConnection(conn net.Conn) {
 			delete(t.sessions, subdomain)
 			delete(t.owners, subdomain)
 			delete(t.tunnelIDs, subdomain)
+			delete(t.sessionUsers, subdomain)
+			delete(t.sessionCustom, subdomain)
+			delete(t.sessionOrder, subdomain)
 		}
 		t.mu.Unlock()
 
@@ -218,15 +245,15 @@ func (t *tcpService) handleConnection(conn net.Conn) {
 		return
 	}
 
-	createdSubdomain, tunnelID, err := t.resolveTunnel(req)
+	createdSubdomain, tunnelID, userID, maxActiveTunnels, isCustom, err := t.resolveTunnel(req)
 	if err != nil {
 		log.Printf("failed to register tunnel: %v", err)
 		t.sendRegistrationError(conn, fmt.Sprintf("failed to register tunnel: %v", err))
 		return
 	}
 	subdomain = createdSubdomain
-	if !t.reserveSession(subdomain, tunnelID, conn) {
-		t.sendRegistrationError(conn, fmt.Sprintf("subdomain %q is already connected", subdomain))
+	if err := t.reserveSession(subdomain, tunnelID, userID, maxActiveTunnels, isCustom, conn); err != nil {
+		t.sendRegistrationError(conn, err.Error())
 		return
 	}
 	sessionReserved = true
@@ -281,54 +308,68 @@ func (t *tcpService) resolveUserID(token string) (string, error) {
 	if token == "" {
 		return "", errInvalidToken
 	}
-	rec, err := t.app.FindFirstRecordByFilter(model.TokensCollection, "token = {:token}", dbx.Params{
-		"token": token,
-	})
-	if err != nil || rec == nil {
+	owner, err := t.tokens.Verify(token)
+	if errors.Is(err, ErrInvalidToken) {
 		return "", errInvalidToken
 	}
-	owner := rec.GetString("user_id")
-	if owner == "" {
-		return "", errInvalidToken
+	if err != nil {
+		return "", err
 	}
-	return owner, nil
+	return owner.UserID, nil
 }
 
-func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (string, string, error) {
+func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (string, string, string, int, bool, error) {
 	if req.Reset && strings.TrimSpace(req.Subdomain) != "" {
-		return "", "", fmt.Errorf("reset and custom subdomain cannot be used together")
+		return "", "", "", 0, false, fmt.Errorf("reset and custom subdomain cannot be used together")
 	}
 
 	userID, err := t.resolveUserID(req.Token)
 	if err != nil {
-		return "", "", err
+		return "", "", "", 0, false, err
+	}
+	limits, usedBytes, err := t.trafficAllowance(userID)
+	if err != nil {
+		return "", "", "", 0, false, fmt.Errorf("could not verify your subscription or monthly usage")
+	}
+	if usedBytes >= limits.MonthlyBytes {
+		if limits.IsPro {
+			return "", "", "", 0, false, fmt.Errorf("monthly traffic limit reached for Pro (%d GB)", limits.MonthlyBytes/(1024*1024*1024))
+		}
+		return "", "", "", 0, false, fmt.Errorf("monthly traffic limit reached for Free (%d GB); upgrade to Pro for %d GB", limits.MonthlyBytes/(1024*1024*1024), model.ProMonthlyBytes/(1024*1024*1024))
 	}
 
 	if strings.TrimSpace(req.Subdomain) != "" {
+		if !limits.CustomSubdomains {
+			return "", "", "", 0, false, fmt.Errorf("%w: custom subdomains are available on Pro; upgrade at https://goport.uz/dashboard#billing", ErrProRequired)
+		}
 		subdomain, err := normalizeRequestedSubdomain(req.Subdomain, t.domain)
 		if err != nil {
-			return "", "", err
+			return "", "", "", 0, false, err
 		}
-		return t.saveTunnel(subdomain, true, userID, req.Port, req.Type)
+		subdomain, tunnelID, err := t.saveTunnel(subdomain, true, userID, req.Port, req.Type)
+		return subdomain, tunnelID, userID, limits.MaxActiveTunnels, true, err
 	}
 
 	if !req.Reset {
 		record, err := t.findCurrentTunnel(userID)
 		if err == nil {
 			subdomain := record.GetString("subdomain")
-			if subdomain != "" {
-				return t.saveTunnel(subdomain, record.GetBool("is_custom"), userID, req.Port, req.Type)
+			isCustom := record.GetBool("is_custom")
+			if subdomain != "" && (!isCustom || limits.CustomSubdomains) {
+				subdomain, tunnelID, err := t.saveTunnel(subdomain, isCustom, userID, req.Port, req.Type)
+				return subdomain, tunnelID, userID, limits.MaxActiveTunnels, isCustom, err
 			}
 		} else if !errors.Is(err, sql.ErrNoRows) {
-			return "", "", err
+			return "", "", "", 0, false, err
 		}
 	}
 
 	subdomain, err := t.generateUniqueSubdomain()
 	if err != nil {
-		return "", "", err
+		return "", "", "", 0, false, err
 	}
-	return t.saveTunnel(subdomain, false, userID, req.Port, req.Type)
+	subdomain, tunnelID, err := t.saveTunnel(subdomain, false, userID, req.Port, req.Type)
+	return subdomain, tunnelID, userID, limits.MaxActiveTunnels, false, err
 }
 
 func (t *tcpService) saveTunnel(subdomain string, isCustom bool, userID, localPort, protocol string) (string, string, error) {
@@ -493,23 +534,43 @@ func (t *tcpService) hasLiveSession(subdomain string) bool {
 	return session == nil || !session.IsClosed()
 }
 
-func (t *tcpService) reserveSession(subdomain, tunnelID string, conn net.Conn) bool {
+func (t *tcpService) reserveSession(subdomain, tunnelID, userID string, maxActive int, isCustom bool, conn net.Conn) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	if existing, ok := t.sessions[subdomain]; ok {
 		if existing == nil || !existing.IsClosed() {
-			return false
+			return fmt.Errorf("subdomain %q is already connected", subdomain)
 		}
 		delete(t.sessions, subdomain)
 		delete(t.owners, subdomain)
 		delete(t.tunnelIDs, subdomain)
+		delete(t.sessionUsers, subdomain)
+		delete(t.sessionCustom, subdomain)
+		delete(t.sessionOrder, subdomain)
+	}
+
+	active := 0
+	for activeSubdomain, activeUserID := range t.sessionUsers {
+		if activeUserID != userID {
+			continue
+		}
+		if session, ok := t.sessions[activeSubdomain]; ok && (session == nil || !session.IsClosed()) {
+			active++
+		}
+	}
+	if active >= maxActive {
+		return fmt.Errorf("your plan allows up to %d active tunnels; stop one or upgrade at https://goport.uz/dashboard#billing", maxActive)
 	}
 
 	t.sessions[subdomain] = nil
 	t.owners[subdomain] = conn
 	t.tunnelIDs[subdomain] = tunnelID
-	return true
+	t.sessionUsers[subdomain] = userID
+	t.sessionCustom[subdomain] = isCustom
+	t.nextSession++
+	t.sessionOrder[subdomain] = t.nextSession
+	return nil
 }
 
 func normalizeRequestedSubdomain(value, domain string) (string, error) {
@@ -625,10 +686,29 @@ func (t *tcpService) HandleTunnelRequest(e *core.RequestEvent) (bool, error) {
 	t.mu.Lock()
 	session := t.sessions[subdomain]
 	tunnelID := t.tunnelIDs[subdomain]
+	userID := t.sessionUsers[subdomain]
+	isCustom := t.sessionCustom[subdomain]
 	t.mu.Unlock()
 
 	if session == nil || session.IsClosed() || tunnelID == "" {
 		http.Error(e.Response, "tunnel is not connected", http.StatusBadGateway)
+		return true, nil
+	}
+	limits, usedBytes, err := t.trafficAllowance(userID)
+	if err != nil {
+		http.Error(e.Response, "could not verify tunnel allowance", http.StatusServiceUnavailable)
+		return true, nil
+	}
+	if isCustom && !limits.CustomSubdomains {
+		http.Error(e.Response, "this custom subdomain requires an active GoPort Pro subscription", http.StatusPaymentRequired)
+		return true, nil
+	}
+	if !t.sessionWithinPlanLimit(subdomain, userID, limits.MaxActiveTunnels) {
+		http.Error(e.Response, "this tunnel is outside your current plan allowance; stop extra tunnels or upgrade to Pro", http.StatusPaymentRequired)
+		return true, nil
+	}
+	if usedBytes >= limits.MonthlyBytes {
+		http.Error(e.Response, "monthly traffic allowance reached", http.StatusTooManyRequests)
 		return true, nil
 	}
 
@@ -667,7 +747,7 @@ func (t *tcpService) HandleTunnelRequest(e *core.RequestEvent) (bool, error) {
 
 		// An upgraded connection is counted once, when it closes, together with
 		// everything relayed over it.
-		t.recordTraffic(tunnelID, subdomain, copyTunnelStream(clientConn, stream))
+		t.recordTraffic(tunnelID, subdomain, userID, copyTunnelStream(clientConn, stream))
 		return true, nil
 	}
 
@@ -684,11 +764,77 @@ func (t *tcpService) HandleTunnelRequest(e *core.RequestEvent) (bool, error) {
 	written, err := io.Copy(e.Response, resp.Body)
 	if err != nil && !isClosedErr(err) {
 		log.Printf("tunnel %s: error copying response body: %v", subdomain, err)
-		t.recordTraffic(tunnelID, subdomain, written+maxInt64(outReq.ContentLength, 0))
+		t.recordTraffic(tunnelID, subdomain, userID, written+maxInt64(outReq.ContentLength, 0))
 		return true, nil
 	}
-	t.recordTraffic(tunnelID, subdomain, written+maxInt64(outReq.ContentLength, 0))
+	t.recordTraffic(tunnelID, subdomain, userID, written+maxInt64(outReq.ContentLength, 0))
 	return true, nil
+}
+
+func (t *tcpService) sessionWithinPlanLimit(subdomain, userID string, maxActive int) bool {
+	if maxActive <= 0 {
+		return false
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	targetOrder, ok := t.sessionOrder[subdomain]
+	if !ok || t.sessionUsers[subdomain] != userID {
+		return false
+	}
+
+	earlierActive := 0
+	for activeSubdomain, activeUserID := range t.sessionUsers {
+		if activeUserID != userID || t.sessionOrder[activeSubdomain] >= targetOrder {
+			continue
+		}
+		session, exists := t.sessions[activeSubdomain]
+		if exists && (session == nil || !session.IsClosed()) {
+			earlierActive++
+		}
+	}
+	return earlierActive < maxActive
+}
+
+func (t *tcpService) trafficAllowance(userID string) (model.PlanLimits, int64, error) {
+	now := time.Now().UTC()
+	t.quotaMu.Lock()
+	entry, ok := t.quotaCache[userID]
+	if ok && now.Before(entry.expiresAt) {
+		t.quotaMu.Unlock()
+		return entry.limits, entry.usedBytes, nil
+	}
+	t.quotaMu.Unlock()
+
+	limits, err := t.billing.Plan(userID)
+	if err != nil {
+		return model.PlanLimits{}, 0, err
+	}
+	periodStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	usedBytes, err := t.usage.BytesForPeriod(userID, periodStart, now.Add(time.Second))
+	if err != nil {
+		return model.PlanLimits{}, 0, err
+	}
+	usedBytes += t.pendingBytesForUser(userID, periodStart)
+
+	t.quotaMu.Lock()
+	t.quotaCache[userID] = trafficQuotaCacheEntry{
+		limits: limits, usedBytes: usedBytes, expiresAt: now.Add(5 * time.Second),
+	}
+	t.quotaMu.Unlock()
+	return limits, usedBytes, nil
+}
+
+func (t *tcpService) pendingBytesForUser(userID string, from time.Time) int64 {
+	t.statsMu.Lock()
+	defer t.statsMu.Unlock()
+	var total int64
+	for key, stat := range t.stats {
+		if key.userID == userID && !key.bucketStart.Before(from) {
+			total += stat.bytes
+		}
+	}
+	return total
 }
 
 func maxInt64(a, b int64) int64 {
@@ -700,8 +846,8 @@ func maxInt64(a, b int64) int64 {
 
 // recordTraffic keeps the completion timestamp with each delta so retries and
 // flushes around a bucket boundary cannot move traffic into the wrong period.
-func (t *tcpService) recordTraffic(tunnelID, subdomain string, bytesTransferred int64) {
-	if tunnelID == "" || subdomain == "" {
+func (t *tcpService) recordTraffic(tunnelID, subdomain, userID string, bytesTransferred int64) {
+	if tunnelID == "" || subdomain == "" || userID == "" {
 		return
 	}
 
@@ -709,6 +855,7 @@ func (t *tcpService) recordTraffic(tunnelID, subdomain string, bytesTransferred 
 	key := tunnelStatKey{
 		tunnelID:    tunnelID,
 		subdomain:   subdomain,
+		userID:      userID,
 		bucketStart: completedAt.Truncate(model.UsageBucketDuration),
 	}
 	t.statsMu.Lock()
@@ -725,6 +872,16 @@ func (t *tcpService) recordTraffic(tunnelID, subdomain string, bytesTransferred 
 		stat.lastActive = completedAt
 	}
 	t.statsMu.Unlock()
+
+	if bytesTransferred > 0 {
+		t.quotaMu.Lock()
+		entry, ok := t.quotaCache[userID]
+		if ok {
+			entry.usedBytes += bytesTransferred
+			t.quotaCache[userID] = entry
+		}
+		t.quotaMu.Unlock()
+	}
 }
 
 func (t *tcpService) flushLoop() {
