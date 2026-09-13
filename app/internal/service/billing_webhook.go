@@ -24,23 +24,21 @@ type lemonWebhook struct {
 }
 
 type lemonSubscriptionAttributes struct {
-	StoreID      json.Number `json:"store_id"`
-	CustomerID   json.Number `json:"customer_id"`
-	OrderID      json.Number `json:"order_id"`
-	ProductID    json.Number `json:"product_id"`
-	VariantID    json.Number `json:"variant_id"`
-	ProductName  string      `json:"product_name"`
-	VariantName  string      `json:"variant_name"`
-	UserEmail    string      `json:"user_email"`
-	Status       string      `json:"status"`
-	CardBrand    string      `json:"card_brand"`
-	CardLastFour string      `json:"card_last_four"`
-	RenewsAt     string      `json:"renews_at"`
-	EndsAt       string      `json:"ends_at"`
-	TrialEndsAt  string      `json:"trial_ends_at"`
-	CreatedAt    string      `json:"created_at"`
-	UpdatedAt    string      `json:"updated_at"`
-	TestMode     bool        `json:"test_mode"`
+	StoreID     json.Number `json:"store_id"`
+	CustomerID  json.Number `json:"customer_id"`
+	OrderID     json.Number `json:"order_id"`
+	ProductID   json.Number `json:"product_id"`
+	VariantID   json.Number `json:"variant_id"`
+	ProductName string      `json:"product_name"`
+	VariantName string      `json:"variant_name"`
+	UserEmail   string      `json:"user_email"`
+	Status      string      `json:"status"`
+	RenewsAt    string      `json:"renews_at"`
+	EndsAt      string      `json:"ends_at"`
+	TrialEndsAt string      `json:"trial_ends_at"`
+	CreatedAt   string      `json:"created_at"`
+	UpdatedAt   string      `json:"updated_at"`
+	TestMode    bool        `json:"test_mode"`
 }
 
 type lemonInvoiceAttributes struct {
@@ -48,8 +46,6 @@ type lemonInvoiceAttributes struct {
 	SubscriptionID json.Number `json:"subscription_id"`
 	UserEmail      string      `json:"user_email"`
 	BillingReason  string      `json:"billing_reason"`
-	CardBrand      string      `json:"card_brand"`
-	CardLastFour   string      `json:"card_last_four"`
 	Currency       string      `json:"currency"`
 	Status         string      `json:"status"`
 	Total          int64       `json:"total"`
@@ -150,8 +146,6 @@ func (s *billingService) processSubscriptionWebhook(externalID, customUserID str
 		ProductName:       attributes.ProductName,
 		VariantName:       attributes.VariantName,
 		Status:            strings.ToLower(strings.TrimSpace(attributes.Status)),
-		CardBrand:         strings.ToLower(strings.TrimSpace(attributes.CardBrand)),
-		CardLastFour:      strings.TrimSpace(attributes.CardLastFour),
 		RenewsAt:          parseLemonTime(attributes.RenewsAt),
 		EndsAt:            parseLemonTime(attributes.EndsAt),
 		TrialEndsAt:       parseLemonTime(attributes.TrialEndsAt),
@@ -192,8 +186,6 @@ func (s *billingService) processInvoiceWebhook(externalID, customUserID string, 
 		Currency:               attributes.Currency,
 		Status:                 normalizedTransactionStatus(attributes.Status),
 		ChargedAt:              parseLemonTime(attributes.CreatedAt),
-		CardBrand:              strings.ToLower(strings.TrimSpace(attributes.CardBrand)),
-		CardLastFour:           strings.TrimSpace(attributes.CardLastFour),
 		InvoiceURL:             attributes.URLs.InvoiceURL,
 		ProviderUpdatedAt:      firstNonZeroTime(parseLemonTime(attributes.UpdatedAt), parseLemonTime(attributes.CreatedAt)),
 		TestMode:               attributes.TestMode,

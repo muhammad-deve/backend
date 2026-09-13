@@ -105,7 +105,7 @@ func TestProcessInvoiceWebhookStoresTransaction(t *testing.T) {
 	if stored.UserID != "user_123" || stored.ExternalID != "invoice_42" || stored.ExternalSubscriptionID != "7001" {
 		t.Fatalf("unexpected transaction identity: %#v", stored)
 	}
-	if stored.AmountCents != 299 || stored.Status != "paid" || stored.CardLastFour != "4242" {
+	if stored.AmountCents != 299 || stored.Status != "paid" {
 		t.Fatalf("unexpected transaction details: %#v", stored)
 	}
 }
@@ -166,7 +166,7 @@ func TestProcessSubscriptionWebhook(t *testing.T) {
 	if stored.UserID != "user_123" || stored.ExternalID != "7001" || stored.PlanKey != model.PlanProMonthly {
 		t.Fatalf("unexpected stored subscription: %#v", stored)
 	}
-	if stored.CardLastFour != "4242" || stored.Status != "active" {
+	if stored.Status != "active" {
 		t.Fatalf("unexpected payment/status fields: %#v", stored)
 	}
 }

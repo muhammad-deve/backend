@@ -193,8 +193,6 @@ func setSubscriptionFields(record *core.Record, subscription model.BillingSubscr
 	record.Set("product_name", subscription.ProductName)
 	record.Set("variant_name", subscription.VariantName)
 	record.Set("status", subscription.Status)
-	record.Set("card_brand", subscription.CardBrand)
-	record.Set("card_last_four", subscription.CardLastFour)
 	setOptionalDate(record, "renews_at", subscription.RenewsAt)
 	setOptionalDate(record, "ends_at", subscription.EndsAt)
 	setOptionalDate(record, "trial_ends_at", subscription.TrialEndsAt)
@@ -214,8 +212,6 @@ func setTransactionFields(record *core.Record, transaction model.BillingTransact
 	record.Set("currency", strings.ToUpper(transaction.Currency))
 	record.Set("status", transaction.Status)
 	setOptionalDate(record, "charged_at", transaction.ChargedAt)
-	record.Set("card_brand", transaction.CardBrand)
-	record.Set("card_last_four", transaction.CardLastFour)
 	record.Set("invoice_url", transaction.InvoiceURL)
 	setOptionalDate(record, "provider_updated_at", transaction.ProviderUpdatedAt)
 	record.Set("test_mode", transaction.TestMode)
@@ -234,8 +230,6 @@ func subscriptionFromRecord(record *core.Record) model.BillingSubscriptionRecord
 		ProductName:       record.GetString("product_name"),
 		VariantName:       record.GetString("variant_name"),
 		Status:            record.GetString("status"),
-		CardBrand:         record.GetString("card_brand"),
-		CardLastFour:      record.GetString("card_last_four"),
 		RenewsAt:          record.GetDateTime("renews_at").Time(),
 		EndsAt:            record.GetDateTime("ends_at").Time(),
 		TrialEndsAt:       record.GetDateTime("trial_ends_at").Time(),
@@ -258,8 +252,6 @@ func transactionFromRecord(record *core.Record) model.BillingTransactionRecord {
 		Currency:               record.GetString("currency"),
 		Status:                 record.GetString("status"),
 		ChargedAt:              record.GetDateTime("charged_at").Time(),
-		CardBrand:              record.GetString("card_brand"),
-		CardLastFour:           record.GetString("card_last_four"),
 		InvoiceURL:             record.GetString("invoice_url"),
 		ProviderUpdatedAt:      record.GetDateTime("provider_updated_at").Time(),
 		TestMode:               record.GetBool("test_mode"),

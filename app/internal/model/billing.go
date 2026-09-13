@@ -69,8 +69,6 @@ type BillingSubscriptionRecord struct {
 	ProductName       string
 	VariantName       string
 	Status            string
-	CardBrand         string
-	CardLastFour      string
 	RenewsAt          time.Time
 	EndsAt            time.Time
 	TrialEndsAt       time.Time
@@ -91,8 +89,6 @@ type BillingTransactionRecord struct {
 	Currency               string
 	Status                 string
 	ChargedAt              time.Time
-	CardBrand              string
-	CardLastFour           string
 	InvoiceURL             string
 	ProviderUpdatedAt      time.Time
 	TestMode               bool
@@ -104,7 +100,6 @@ type BillingData struct {
 	AvailablePlans     []string             `json:"availablePlans"`
 	Plan               PlanLimits           `json:"plan"`
 	Subscription       *BillingSubscription `json:"subscription"`
-	Cards              []BillingCard        `json:"cards"`
 	Transactions       []BillingTransaction `json:"transactions"`
 }
 
@@ -120,21 +115,12 @@ type BillingSubscription struct {
 	PortalAvailable   bool   `json:"portalAvailable"`
 }
 
-type BillingCard struct {
-	ID        string `json:"id"`
-	Brand     string `json:"brand"`
-	LastFour  string `json:"last4"`
-	IsDefault bool   `json:"isDefault"`
-}
-
 type BillingTransaction struct {
-	ID           string `json:"id"`
-	AmountCents  int64  `json:"amountCents"`
-	Currency     string `json:"currency"`
-	Description  string `json:"description"`
-	Status       string `json:"status"`
-	ChargedAt    string `json:"chargedAt"`
-	CardBrand    string `json:"cardBrand"`
-	CardLastFour string `json:"cardLast4"`
-	InvoiceURL   string `json:"invoiceUrl,omitempty"`
+	ID          string `json:"id"`
+	AmountCents int64  `json:"amountCents"`
+	Currency    string `json:"currency"`
+	Description string `json:"description"`
+	Status      string `json:"status"`
+	ChargedAt   string `json:"chargedAt"`
+	InvoiceURL  string `json:"invoiceUrl,omitempty"`
 }

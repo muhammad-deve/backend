@@ -152,7 +152,6 @@ func (s *billingService) Get(userID string) (*model.BillingData, error) {
 		CheckoutConfigured: s.apiConfigured() && len(availablePlans) > 0 && strings.TrimSpace(s.cfg.LemonSqueezyWebhookSecret) != "",
 		AvailablePlans:     availablePlans,
 		Plan:               limits,
-		Cards:              []model.BillingCard{},
 		Transactions:       make([]model.BillingTransaction, 0, len(transactions)),
 	}
 
@@ -175,27 +174,17 @@ func (s *billingService) Get(userID string) (*model.BillingData, error) {
 			CancelAtPeriodEnd: selected.Status == "cancelled",
 			PortalAvailable:   s.apiConfigured(),
 		}
-		if selected.CardBrand != "" || selected.CardLastFour != "" {
-			data.Cards = append(data.Cards, model.BillingCard{
-				ID:        selected.ExternalID,
-				Brand:     selected.CardBrand,
-				LastFour:  selected.CardLastFour,
-				IsDefault: true,
-			})
-		}
 	}
 
 	for _, transaction := range deduplicateInitialTransactions(transactions, subscriptions) {
 		data.Transactions = append(data.Transactions, model.BillingTransaction{
-			ID:           transaction.ID,
-			AmountCents:  transaction.AmountCents,
-			Currency:     normalizedCurrency(transaction.Currency),
-			Description:  transaction.Description,
-			Status:       transaction.Status,
-			ChargedAt:    formatOptionalTime(transaction.ChargedAt),
-			CardBrand:    transaction.CardBrand,
-			CardLastFour: transaction.CardLastFour,
-			InvoiceURL:   transaction.InvoiceURL,
+			ID:          transaction.ID,
+			AmountCents: transaction.AmountCents,
+			Currency:    normalizedCurrency(transaction.Currency),
+			Description: transaction.Description,
+			Status:      transaction.Status,
+			ChargedAt:   formatOptionalTime(transaction.ChargedAt),
+			InvoiceURL:  transaction.InvoiceURL,
 		})
 	}
 	return data, nil
