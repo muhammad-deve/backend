@@ -8,7 +8,7 @@ const (
 	PlanProMonthly = "pro_monthly"
 	PlanProYearly  = "pro_yearly"
 
-	FreeMaxActiveTunnels int   = 2
+	FreeMaxActiveTunnels int   = 1
 	ProMaxActiveTunnels  int   = 10
 	FreeMaxTokens        int   = 1
 	ProMaxTokens         int   = 5
