@@ -72,7 +72,8 @@ func (h *Handler) Register(router *router.Router[*core.RequestEvent]) {
 		{
 			billing.Bind(apis.RequireAuth("users"))
 			billing.POST("/checkout", h.CreateCheckoutHandler)
-			billing.GET("/portal", h.BillingPortalHandler)
+			billing.PATCH("/subscription", h.ChangeSubscriptionPlanHandler)
+			billing.DELETE("/subscription", h.CancelSubscriptionHandler)
 		}
 	}
 }

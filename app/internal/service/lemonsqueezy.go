@@ -17,7 +17,8 @@ import (
 
 type lemonSqueezyClientI interface {
 	CreateCheckout(ctx context.Context, input lemonCheckoutInput) (string, error)
-	CustomerPortal(ctx context.Context, subscriptionID string) (string, error)
+	CancelSubscription(ctx context.Context, subscriptionID string) (lemonSubscriptionAttributes, error)
+	UpdateSubscriptionVariant(ctx context.Context, subscriptionID, variantID string) (lemonSubscriptionAttributes, error)
 }
 
 type lemonCheckoutInput struct {
@@ -93,24 +94,49 @@ func (c *lemonSqueezyClient) CreateCheckout(ctx context.Context, input lemonChec
 	return response.Data.Attributes.URL, nil
 }
 
-func (c *lemonSqueezyClient) CustomerPortal(ctx context.Context, subscriptionID string) (string, error) {
+func (c *lemonSqueezyClient) CancelSubscription(ctx context.Context, subscriptionID string) (lemonSubscriptionAttributes, error) {
 	var response struct {
 		Data struct {
-			Attributes struct {
-				URLs struct {
-					CustomerPortal string `json:"customer_portal"`
-				} `json:"urls"`
-			} `json:"attributes"`
+			Attributes lemonSubscriptionAttributes `json:"attributes"`
 		} `json:"data"`
 	}
 	path := "/subscriptions/" + url.PathEscape(subscriptionID)
-	if err := c.do(ctx, http.MethodGet, path, nil, &response); err != nil {
-		return "", err
+	if err := c.do(ctx, http.MethodDelete, path, nil, &response); err != nil {
+		return lemonSubscriptionAttributes{}, err
 	}
-	if !validHTTPSURL(response.Data.Attributes.URLs.CustomerPortal) {
-		return "", fmt.Errorf("Lemon Squeezy returned an invalid customer portal URL")
+	if strings.ToLower(strings.TrimSpace(response.Data.Attributes.Status)) != "cancelled" {
+		return lemonSubscriptionAttributes{}, fmt.Errorf("Lemon Squeezy did not confirm subscription cancellation")
 	}
-	return response.Data.Attributes.URLs.CustomerPortal, nil
+	return response.Data.Attributes, nil
+}
+
+func (c *lemonSqueezyClient) UpdateSubscriptionVariant(ctx context.Context, subscriptionID, variantID string) (lemonSubscriptionAttributes, error) {
+	variantNumber, err := strconv.ParseInt(variantID, 10, 64)
+	if err != nil {
+		return lemonSubscriptionAttributes{}, fmt.Errorf("invalid Lemon Squeezy variant id: %w", err)
+	}
+	payload := map[string]any{
+		"data": map[string]any{
+			"type": "subscriptions",
+			"id":   subscriptionID,
+			"attributes": map[string]any{
+				"variant_id": variantNumber,
+			},
+		},
+	}
+	var response struct {
+		Data struct {
+			Attributes lemonSubscriptionAttributes `json:"attributes"`
+		} `json:"data"`
+	}
+	path := "/subscriptions/" + url.PathEscape(subscriptionID)
+	if err := c.do(ctx, http.MethodPatch, path, payload, &response); err != nil {
+		return lemonSubscriptionAttributes{}, err
+	}
+	if response.Data.Attributes.VariantID.String() != variantID {
+		return lemonSubscriptionAttributes{}, fmt.Errorf("Lemon Squeezy did not confirm the requested subscription variant")
+	}
+	return response.Data.Attributes, nil
 }
 
 func (c *lemonSqueezyClient) do(ctx context.Context, method, path string, body any, target any) error {

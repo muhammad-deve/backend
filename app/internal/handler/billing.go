@@ -38,23 +38,48 @@ func (h *Handler) CreateCheckoutHandler(e *core.RequestEvent) error {
 	return h.NewSuccessResponse(e, http.StatusCreated, response)
 }
 
-func (h *Handler) BillingPortalHandler(e *core.RequestEvent) error {
+func (h *Handler) ChangeSubscriptionPlanHandler(e *core.RequestEvent) error {
 	if e.Auth == nil {
 		return h.NewErrorResponse(e, http.StatusUnauthorized, "authentication required")
 	}
-	response, err := h.service.Billing().CustomerPortal(e.Request.Context(), e.Auth.Id)
-	if err != nil {
+	request := &model.ChangePlanRequest{}
+	if err := e.BindBody(request); err != nil {
+		return h.NewErrorResponse(e, http.StatusBadRequest, "invalid request body")
+	}
+	if err := h.service.Billing().ChangeSubscriptionPlan(e.Request.Context(), e.Auth.Id, request.Plan); err != nil {
 		switch {
 		case errors.Is(err, service.ErrNoSubscription):
-			return h.NewErrorResponse(e, http.StatusNotFound, "No Lemon Squeezy subscription was found for this account.")
+			return h.NewErrorResponse(e, http.StatusNotFound, "No active Lemon Squeezy subscription was found for this account.")
+		case errors.Is(err, service.ErrPlanChangeUnavailable):
+			return h.NewErrorResponse(e, http.StatusConflict, "Only an active monthly subscription can switch to yearly billing.")
 		case errors.Is(err, service.ErrBillingNotConfigured):
-			return h.NewErrorResponse(e, http.StatusServiceUnavailable, "Billing management is not configured yet.")
+			return h.NewErrorResponse(e, http.StatusServiceUnavailable, "Billing changes are not configured yet.")
 		default:
-			h.logger.Error("failed to open Lemon Squeezy portal", "error", err, "userId", e.Auth.Id)
-			return h.NewErrorResponse(e, http.StatusBadGateway, "Couldn't open billing management. Please try again.")
+			h.logger.Error("failed to change Lemon Squeezy subscription", "error", err, "userId", e.Auth.Id)
+			return h.NewErrorResponse(e, http.StatusBadGateway, "Couldn't change your billing cycle. Please try again.")
 		}
 	}
-	return h.NewSuccessResponse(e, http.StatusOK, response)
+	return h.NewSuccessResponse(e, http.StatusOK, map[string]string{"message": "Subscription changed to yearly billing."})
+}
+
+func (h *Handler) CancelSubscriptionHandler(e *core.RequestEvent) error {
+	if e.Auth == nil {
+		return h.NewErrorResponse(e, http.StatusUnauthorized, "authentication required")
+	}
+	if err := h.service.Billing().CancelSubscription(e.Request.Context(), e.Auth.Id); err != nil {
+		switch {
+		case errors.Is(err, service.ErrNoSubscription):
+			return h.NewErrorResponse(e, http.StatusNotFound, "No active Lemon Squeezy subscription was found for this account.")
+		case errors.Is(err, service.ErrSubscriptionCancelled):
+			return h.NewErrorResponse(e, http.StatusConflict, "This subscription is already scheduled to end.")
+		case errors.Is(err, service.ErrBillingNotConfigured):
+			return h.NewErrorResponse(e, http.StatusServiceUnavailable, "Subscription cancellation is not configured yet.")
+		default:
+			h.logger.Error("failed to cancel Lemon Squeezy subscription", "error", err, "userId", e.Auth.Id)
+			return h.NewErrorResponse(e, http.StatusBadGateway, "Couldn't cancel your subscription. Please try again.")
+		}
+	}
+	return h.NewSuccessResponse(e, http.StatusOK, map[string]string{"message": "Subscription cancellation scheduled."})
 }
 
 func (h *Handler) LemonSqueezyWebhookHandler(e *core.RequestEvent) error {

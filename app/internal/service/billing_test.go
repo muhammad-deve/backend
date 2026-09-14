@@ -237,6 +237,105 @@ func TestLemonSqueezyCreateCheckout(t *testing.T) {
 	}
 }
 
+func TestLemonSqueezySubscriptionMutations(t *testing.T) {
+	var updatePayload map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/subscriptions/7001" || request.Header.Get("Authorization") != "Bearer api-key" {
+			http.Error(response, "not found", http.StatusNotFound)
+			return
+		}
+		response.Header().Set("Content-Type", "application/vnd.api+json")
+		switch request.Method {
+		case http.MethodDelete:
+			_, _ = response.Write([]byte(`{"data":{"attributes":{"status":"cancelled","ends_at":"2026-10-14T00:00:00Z","test_mode":true}}}`))
+		case http.MethodPatch:
+			if err := json.NewDecoder(request.Body).Decode(&updatePayload); err != nil {
+				http.Error(response, err.Error(), http.StatusBadRequest)
+				return
+			}
+			_, _ = response.Write([]byte(`{"data":{"attributes":{"variant_id":1999,"status":"active","test_mode":true}}}`))
+		default:
+			http.Error(response, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	client := &lemonSqueezyClient{apiKey: "api-key", baseURL: server.URL, http: server.Client()}
+	cancelled, err := client.CancelSubscription(context.Background(), "7001")
+	if err != nil {
+		t.Fatalf("CancelSubscription() error = %v", err)
+	}
+	if cancelled.Status != "cancelled" || cancelled.EndsAt != "2026-10-14T00:00:00Z" {
+		t.Fatalf("unexpected cancellation response: %#v", cancelled)
+	}
+
+	updated, err := client.UpdateSubscriptionVariant(context.Background(), "7001", "1999")
+	if err != nil {
+		t.Fatalf("UpdateSubscriptionVariant() error = %v", err)
+	}
+	if updated.VariantID.String() != "1999" || updated.Status != "active" {
+		t.Fatalf("unexpected update response: %#v", updated)
+	}
+	attributes := updatePayload["data"].(map[string]any)["attributes"].(map[string]any)
+	if attributes["variant_id"] != float64(1999) {
+		t.Fatalf("variant update payload = %#v", updatePayload)
+	}
+}
+
+func TestBillingServiceChangesMonthlyToYearly(t *testing.T) {
+	now := time.Date(2026, time.September, 14, 12, 0, 0, 0, time.UTC)
+	repo := &fakeBillingRepository{subscriptions: []model.BillingSubscriptionRecord{{
+		UserID: "user_123", ExternalID: "7001", VariantID: "991", PlanKey: model.PlanProMonthly, Status: "active", TestMode: true,
+	}}}
+	client := &fakeLemonSqueezyClient{updateAttributes: lemonSubscriptionAttributes{
+		VariantID: json.Number("1999"), Status: "active", RenewsAt: "2027-09-14T00:00:00Z", UpdatedAt: "2026-09-14T12:00:00Z", TestMode: true,
+	}}
+	service := &billingService{
+		cfg:  &config.Config{LemonSqueezyKey: "api-key", LemonSqueezyStoreID: "470781", LemonSqueezyAPIURL: "https://api.lemonsqueezy.test", LemonSqueezyProMonthlyVariantID: "991", LemonSqueezyProYearlyVariantID: "1999"},
+		repo: repo, client: client, now: func() time.Time { return now },
+	}
+
+	if err := service.ChangeSubscriptionPlan(context.Background(), "user_123", "yearly"); err != nil {
+		t.Fatalf("ChangeSubscriptionPlan() error = %v", err)
+	}
+	if client.updatedSubscriptionID != "7001" || client.updatedVariantID != "1999" {
+		t.Fatalf("unexpected Lemon Squeezy plan update: %#v", client)
+	}
+	updated := repo.subscriptions[len(repo.subscriptions)-1]
+	if updated.PlanKey != model.PlanProYearly || updated.Status != "active" || updated.VariantID != "1999" {
+		t.Fatalf("unexpected updated subscription: %#v", updated)
+	}
+}
+
+func TestBillingServiceSchedulesCancellation(t *testing.T) {
+	now := time.Date(2026, time.September, 14, 12, 0, 0, 0, time.UTC)
+	endsAt := now.Add(30 * 24 * time.Hour)
+	repo := &fakeBillingRepository{subscriptions: []model.BillingSubscriptionRecord{{
+		UserID: "user_123", ExternalID: "7001", PlanKey: model.PlanProMonthly, Status: "active", TestMode: true,
+	}}}
+	client := &fakeLemonSqueezyClient{cancelAttributes: lemonSubscriptionAttributes{
+		Status: "cancelled", EndsAt: endsAt.Format(time.RFC3339), UpdatedAt: now.Format(time.RFC3339), TestMode: true,
+	}}
+	service := &billingService{
+		cfg:  &config.Config{LemonSqueezyKey: "api-key", LemonSqueezyStoreID: "470781", LemonSqueezyAPIURL: "https://api.lemonsqueezy.test"},
+		repo: repo, client: client, now: func() time.Time { return now },
+	}
+
+	if err := service.CancelSubscription(context.Background(), "user_123"); err != nil {
+		t.Fatalf("CancelSubscription() error = %v", err)
+	}
+	if client.cancelledSubscriptionID != "7001" {
+		t.Fatalf("cancelled subscription = %q, want 7001", client.cancelledSubscriptionID)
+	}
+	updated := repo.subscriptions[len(repo.subscriptions)-1]
+	if updated.Status != "cancelled" || !updated.EndsAt.Equal(endsAt) {
+		t.Fatalf("unexpected cancelled subscription: %#v", updated)
+	}
+	if !service.subscriptionGrantsPro(updated, now) {
+		t.Fatal("cancelled subscription should retain Pro access through its end date")
+	}
+}
+
 func TestDeduplicateInitialOrderAndInvoice(t *testing.T) {
 	subscriptions := []model.BillingSubscriptionRecord{{ExternalID: "sub_1", OrderID: "order_1"}}
 	transactions := []model.BillingTransactionRecord{
@@ -261,6 +360,29 @@ type fakeBillingRepository struct {
 	users         map[string]bool
 	subscriptions []model.BillingSubscriptionRecord
 	transactions  []model.BillingTransactionRecord
+}
+
+type fakeLemonSqueezyClient struct {
+	cancelAttributes        lemonSubscriptionAttributes
+	updateAttributes        lemonSubscriptionAttributes
+	cancelledSubscriptionID string
+	updatedSubscriptionID   string
+	updatedVariantID        string
+}
+
+func (c *fakeLemonSqueezyClient) CreateCheckout(context.Context, lemonCheckoutInput) (string, error) {
+	return "", errors.New("unexpected checkout call")
+}
+
+func (c *fakeLemonSqueezyClient) CancelSubscription(_ context.Context, subscriptionID string) (lemonSubscriptionAttributes, error) {
+	c.cancelledSubscriptionID = subscriptionID
+	return c.cancelAttributes, nil
+}
+
+func (c *fakeLemonSqueezyClient) UpdateSubscriptionVariant(_ context.Context, subscriptionID, variantID string) (lemonSubscriptionAttributes, error) {
+	c.updatedSubscriptionID = subscriptionID
+	c.updatedVariantID = variantID
+	return c.updateAttributes, nil
 }
 
 func (r *fakeBillingRepository) UpsertSubscription(subscription model.BillingSubscriptionRecord) error {

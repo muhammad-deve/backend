@@ -22,6 +22,8 @@ var (
 	ErrAlreadySubscribed       = errors.New("an active Pro subscription already exists")
 	ErrInvalidBillingPlan      = errors.New("invalid billing plan")
 	ErrNoSubscription          = errors.New("no subscription found")
+	ErrPlanChangeUnavailable   = errors.New("this subscription cannot change to that billing cycle")
+	ErrSubscriptionCancelled   = errors.New("this subscription is already scheduled to end")
 	ErrInvalidWebhookSignature = errors.New("invalid webhook signature")
 	ErrWebhookModeMismatch     = errors.New("webhook mode does not match the configured Lemon Squeezy mode")
 	ErrWebhookStoreMismatch    = errors.New("webhook belongs to a different Lemon Squeezy store")
@@ -33,7 +35,8 @@ type BillingI interface {
 	Get(userID string) (*model.BillingData, error)
 	Plan(userID string) (model.PlanLimits, error)
 	CreateCheckout(ctx context.Context, user *core.Record, plan string) (*model.CheckoutResponse, error)
-	CustomerPortal(ctx context.Context, userID string) (*model.PortalResponse, error)
+	ChangeSubscriptionPlan(ctx context.Context, userID, plan string) error
+	CancelSubscription(ctx context.Context, userID string) error
 	ProcessWebhook(ctx context.Context, body []byte, signature string) error
 }
 
@@ -102,24 +105,55 @@ func (s *billingService) CreateCheckout(ctx context.Context, user *core.Record, 
 	return &model.CheckoutResponse{URL: checkoutURL}, nil
 }
 
-func (s *billingService) CustomerPortal(ctx context.Context, userID string) (*model.PortalResponse, error) {
+func (s *billingService) ChangeSubscriptionPlan(ctx context.Context, userID, plan string) error {
 	if !s.apiConfigured() {
-		return nil, ErrBillingNotConfigured
+		return ErrBillingNotConfigured
 	}
 	subscriptions, err := s.repo.ListSubscriptions(userID)
 	if err != nil {
-		return nil, err
+		return err
+	}
+	subscription := s.preferredSubscription(subscriptions)
+	if subscription == nil || !s.subscriptionGrantsPro(*subscription, s.now().UTC()) {
+		return ErrNoSubscription
+	}
+	if strings.ToLower(strings.TrimSpace(plan)) != "yearly" || subscription.PlanKey != model.PlanProMonthly {
+		return ErrPlanChangeUnavailable
+	}
+	variantID, ok := s.variantForPlan(plan)
+	if !ok || variantID == "" {
+		return ErrBillingNotConfigured
+	}
+	attributes, err := s.client.UpdateSubscriptionVariant(ctx, subscription.ExternalID, variantID)
+	if err != nil {
+		return err
+	}
+	return s.applySubscriptionUpdate(*subscription, attributes)
+}
+
+func (s *billingService) CancelSubscription(ctx context.Context, userID string) error {
+	if !s.apiConfigured() {
+		return ErrBillingNotConfigured
+	}
+	subscriptions, err := s.repo.ListSubscriptions(userID)
+	if err != nil {
+		return err
 	}
 	subscription := s.preferredSubscription(subscriptions)
 	if subscription == nil {
-		return nil, ErrNoSubscription
+		return ErrNoSubscription
 	}
-
-	portalURL, err := s.client.CustomerPortal(ctx, subscription.ExternalID)
+	if subscription.Status == "cancelled" || subscription.Status == "expired" {
+		return ErrSubscriptionCancelled
+	}
+	if !s.subscriptionGrantsPro(*subscription, s.now().UTC()) {
+		return ErrNoSubscription
+	}
+	attributes, err := s.client.CancelSubscription(ctx, subscription.ExternalID)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return &model.PortalResponse{URL: portalURL}, nil
+	return s.applySubscriptionUpdate(*subscription, attributes)
 }
 
 func (s *billingService) Get(userID string) (*model.BillingData, error) {
@@ -172,7 +206,6 @@ func (s *billingService) Get(userID string) (*model.BillingData, error) {
 			Interval:          interval,
 			CurrentPeriodEnd:  formatOptionalTime(periodEnd),
 			CancelAtPeriodEnd: selected.Status == "cancelled",
-			PortalAvailable:   s.apiConfigured(),
 		}
 	}
 
@@ -188,6 +221,31 @@ func (s *billingService) Get(userID string) (*model.BillingData, error) {
 		})
 	}
 	return data, nil
+}
+
+// applySubscriptionUpdate keeps the dashboard state current while the matching webhook is in flight.
+func (s *billingService) applySubscriptionUpdate(subscription model.BillingSubscriptionRecord, attributes lemonSubscriptionAttributes) error {
+	if variantID := attributes.VariantID.String(); variantID != "" {
+		subscription.VariantID = variantID
+		if plan := s.planForVariant(variantID); plan != "" {
+			subscription.PlanKey = plan
+		}
+	}
+	if productName := strings.TrimSpace(attributes.ProductName); productName != "" {
+		subscription.ProductName = productName
+	}
+	if variantName := strings.TrimSpace(attributes.VariantName); variantName != "" {
+		subscription.VariantName = variantName
+	}
+	if status := strings.ToLower(strings.TrimSpace(attributes.Status)); status != "" {
+		subscription.Status = status
+	}
+	subscription.RenewsAt = parseLemonTime(attributes.RenewsAt)
+	subscription.EndsAt = parseLemonTime(attributes.EndsAt)
+	subscription.TrialEndsAt = parseLemonTime(attributes.TrialEndsAt)
+	subscription.ProviderUpdatedAt = firstNonZeroTime(parseLemonTime(attributes.UpdatedAt), s.now().UTC())
+	subscription.TestMode = attributes.TestMode
+	return s.repo.UpsertSubscription(subscription)
 }
 
 func (s *billingService) variantForPlan(plan string) (string, bool) {

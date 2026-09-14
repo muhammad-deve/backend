@@ -53,8 +53,8 @@ type CheckoutResponse struct {
 	URL string `json:"url"`
 }
 
-type PortalResponse struct {
-	URL string `json:"url"`
+type ChangePlanRequest struct {
+	Plan string `json:"plan" form:"plan"`
 }
 
 type BillingSubscriptionRecord struct {
@@ -112,7 +112,6 @@ type BillingSubscription struct {
 	Interval          string `json:"interval"`
 	CurrentPeriodEnd  string `json:"currentPeriodEnd,omitempty"`
 	CancelAtPeriodEnd bool   `json:"cancelAtPeriodEnd"`
-	PortalAvailable   bool   `json:"portalAvailable"`
 }
 
 type BillingTransaction struct {
