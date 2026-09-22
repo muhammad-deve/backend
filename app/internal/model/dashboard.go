@@ -34,3 +34,20 @@ type DashboardDomain struct {
 	LastActive string `json:"lastActive,omitempty"`
 	Created    string `json:"created,omitempty"`
 }
+
+// CLIPlanRequest carries a raw CLI token. The token is the credential, so the
+// endpoint is public, matching the existing verify-token route.
+type CLIPlanRequest struct {
+	Token string `json:"token" form:"token"`
+}
+
+// CLIPlanResponse is the allowance the local inspector displays: which plan is
+// active, what it includes per month, and how much has been used. MonthBytes
+// comes from the same query the tunnel server enforces the limit with, so the
+// CLI cannot disagree with the server about how much room is left.
+type CLIPlanResponse struct {
+	Plan         string `json:"plan"`
+	IsPro        bool   `json:"isPro"`
+	MonthlyBytes int64  `json:"monthlyBytes"`
+	MonthBytes   int64  `json:"monthBytes"`
+}

@@ -15,6 +15,7 @@ import (
 
 type DashboardI interface {
 	GetDashboard(user *core.Record) (*model.DashboardResponse, error)
+	PlanForToken(token string) (*model.CLIPlanResponse, error)
 }
 
 type dashboardService struct {
@@ -31,6 +32,35 @@ func NewDashboardService(tokens TokensI, tunnels repository.TunnelsI, usage repo
 		domain = "goport.uz"
 	}
 	return &dashboardService{tokens: tokens, tunnels: tunnels, usage: usage, billing: billing, domain: domain}
+}
+
+// PlanForToken resolves a CLI token to its account's allowance. The CLI has no
+// PocketBase session, so it cannot use the authenticated dashboard route; the
+// token it already holds is the credential here.
+func (s *dashboardService) PlanForToken(token string) (*model.CLIPlanResponse, error) {
+	owner, err := s.tokens.Verify(token)
+	if err != nil {
+		return nil, err
+	}
+
+	limits, err := s.billing.Plan(owner.UserID)
+	if err != nil {
+		return nil, err
+	}
+
+	now := time.Now().UTC()
+	periodStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	monthBytes, err := s.usage.BytesForPeriod(owner.UserID, periodStart, now.Add(time.Second))
+	if err != nil {
+		return nil, err
+	}
+
+	return &model.CLIPlanResponse{
+		Plan:         limits.Key,
+		IsPro:        limits.IsPro,
+		MonthlyBytes: limits.MonthlyBytes,
+		MonthBytes:   monthBytes,
+	}, nil
 }
 
 func (s *dashboardService) GetDashboard(user *core.Record) (*model.DashboardResponse, error) {

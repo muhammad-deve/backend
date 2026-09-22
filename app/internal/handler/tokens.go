@@ -105,3 +105,25 @@ func (h *Handler) DeleteTokenHandler(e *core.RequestEvent) error {
 
 	return h.NewSuccessResponse(e, http.StatusOK, map[string]string{"message": "Token deleted"})
 }
+
+// CLIPlanHandler returns the plan allowance for a CLI token so the local
+// inspector can show how much of the monthly quota is left. Public for the same
+// reason as VerifyTokenHandler: the token is itself the credential, and the CLI
+// holds no PocketBase session to use the authenticated dashboard route with.
+func (h *Handler) CLIPlanHandler(e *core.RequestEvent) error {
+	req := &model.CLIPlanRequest{}
+	if err := e.BindBody(req); err != nil {
+		return h.NewErrorResponse(e, http.StatusBadRequest, "invalid request body")
+	}
+
+	plan, err := h.service.Dashboard().PlanForToken(req.Token)
+	if err != nil {
+		if errors.Is(err, service.ErrInvalidToken) {
+			return h.NewErrorResponse(e, http.StatusUnauthorized, "Invalid token.")
+		}
+		h.logger.Error("failed to resolve plan for CLI token", "error", err)
+		return h.NewErrorResponse(e, http.StatusInternalServerError, "Couldn't load the plan.")
+	}
+
+	return h.NewSuccessResponse(e, http.StatusOK, plan)
+}

@@ -35,6 +35,7 @@ func (h *Handler) Register(router *router.Router[*core.RequestEvent]) {
 			auth.POST("/forgot-password", h.ForgotPasswordHandler)
 			auth.POST("/reset-password", h.ResetPasswordHandler)
 			auth.POST("/verify-token", h.VerifyTokenHandler)
+			auth.POST("/cli-plan", h.CLIPlanHandler)
 		}
 
 		dashboard := api.Group("/dashboard")
