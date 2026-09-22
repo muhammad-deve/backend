@@ -39,6 +39,10 @@ type lemonSubscriptionAttributes struct {
 	CreatedAt   string      `json:"created_at"`
 	UpdatedAt   string      `json:"updated_at"`
 	TestMode    bool        `json:"test_mode"`
+	URLs        struct {
+		UpdatePaymentMethod string `json:"update_payment_method"`
+		CustomerPortal      string `json:"customer_portal"`
+	} `json:"urls"`
 }
 
 type lemonInvoiceAttributes struct {

@@ -37,6 +37,7 @@ type BillingI interface {
 	CreateCheckout(ctx context.Context, user *core.Record, plan string) (*model.CheckoutResponse, error)
 	ChangeSubscriptionPlan(ctx context.Context, userID, plan string) error
 	CancelSubscription(ctx context.Context, userID string) error
+	PortalURL(ctx context.Context, userID string) (*model.BillingPortal, error)
 	ProcessWebhook(ctx context.Context, body []byte, signature string) error
 }
 
@@ -156,6 +157,53 @@ func (s *billingService) CancelSubscription(ctx context.Context, userID string) 
 	return s.applySubscriptionUpdate(*subscription, attributes)
 }
 
+// PortalURL returns a short-lived Lemon Squeezy customer portal link for the
+// user's current subscription. The portal is where a customer updates their
+// card, downloads invoices, or cancels outside of our own flow, so the
+// dashboard always has somewhere concrete to point at.
+func (s *billingService) PortalURL(ctx context.Context, userID string) (*model.BillingPortal, error) {
+	if !s.apiConfigured() {
+		return nil, ErrBillingNotConfigured
+	}
+	subscriptions, err := s.repo.ListSubscriptions(userID)
+	if err != nil {
+		return nil, err
+	}
+	subscription := s.preferredSubscription(subscriptions)
+	if subscription == nil {
+		return nil, ErrNoSubscription
+	}
+
+	attributes, err := s.client.GetSubscription(ctx, subscription.ExternalID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Prefer the full portal; fall back to the card-update link, which is the
+	// one Lemon Squeezy always returns for a live subscription.
+	target := strings.TrimSpace(attributes.URLs.CustomerPortal)
+	if !validHTTPSURL(target) {
+		target = strings.TrimSpace(attributes.URLs.UpdatePaymentMethod)
+	}
+	if !validHTTPSURL(target) {
+		return nil, ErrNoSubscription
+	}
+	return &model.BillingPortal{URL: target}, nil
+}
+
+// trialConsumed reports whether any subscription this account has ever held
+// carried a trial period. Lemon Squeezy applies the variant's trial to each new
+// subscription, so without this check a returning customer would be offered
+// (and granted) a second free trial.
+func (s *billingService) trialConsumed(subscriptions []model.BillingSubscriptionRecord) bool {
+	for _, subscription := range subscriptions {
+		if !subscription.TrialEndsAt.IsZero() {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *billingService) Get(userID string) (*model.BillingData, error) {
 	subscriptions, err := s.repo.ListSubscriptions(userID)
 	if err != nil {
@@ -187,9 +235,11 @@ func (s *billingService) Get(userID string) (*model.BillingData, error) {
 		AvailablePlans:     availablePlans,
 		Plan:               limits,
 		Transactions:       make([]model.BillingTransaction, 0, len(transactions)),
+		TrialUsed:          s.trialConsumed(subscriptions),
 	}
 
 	selected := s.preferredSubscription(subscriptions)
+	data.PortalAvailable = s.apiConfigured() && selected != nil
 	if selected != nil {
 		amount, interval := s.priceForPlan(selected.PlanKey)
 		currency := transactionCurrency(transactions, selected.ExternalID)
@@ -210,6 +260,10 @@ func (s *billingService) Get(userID string) (*model.BillingData, error) {
 	}
 
 	for _, transaction := range deduplicateInitialTransactions(transactions, subscriptions) {
+		kind := model.BillingTransactionKindCharge
+		if transaction.AmountCents <= 0 {
+			kind = model.BillingTransactionKindTrial
+		}
 		data.Transactions = append(data.Transactions, model.BillingTransaction{
 			ID:          transaction.ID,
 			AmountCents: transaction.AmountCents,
@@ -218,6 +272,7 @@ func (s *billingService) Get(userID string) (*model.BillingData, error) {
 			Status:      transaction.Status,
 			ChargedAt:   formatOptionalTime(transaction.ChargedAt),
 			InvoiceURL:  transaction.InvoiceURL,
+			Kind:        kind,
 		})
 	}
 	return data, nil

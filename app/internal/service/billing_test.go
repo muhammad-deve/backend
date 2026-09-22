@@ -365,9 +365,16 @@ type fakeBillingRepository struct {
 type fakeLemonSqueezyClient struct {
 	cancelAttributes        lemonSubscriptionAttributes
 	updateAttributes        lemonSubscriptionAttributes
+	getAttributes           lemonSubscriptionAttributes
 	cancelledSubscriptionID string
 	updatedSubscriptionID   string
 	updatedVariantID        string
+	fetchedSubscriptionID   string
+}
+
+func (c *fakeLemonSqueezyClient) GetSubscription(_ context.Context, subscriptionID string) (lemonSubscriptionAttributes, error) {
+	c.fetchedSubscriptionID = subscriptionID
+	return c.getAttributes, nil
 }
 
 func (c *fakeLemonSqueezyClient) CreateCheckout(context.Context, lemonCheckoutInput) (string, error) {
@@ -418,4 +425,110 @@ func (r *fakeBillingRepository) UserExists(userID string) (bool, error) {
 
 func (r *fakeBillingRepository) FindUserIDByEmail(email string) (string, error) {
 	return "", sql.ErrNoRows
+}
+
+
+func TestBillingServiceReportsTrialAlreadyUsed(t *testing.T) {
+	now := time.Date(2026, time.September, 22, 12, 0, 0, 0, time.UTC)
+	repo := &fakeBillingRepository{subscriptions: []model.BillingSubscriptionRecord{{
+		UserID:      "user_123",
+		ExternalID:  "7001",
+		PlanKey:     model.PlanProMonthly,
+		Status:      "expired",
+		TrialEndsAt: now.Add(-60 * 24 * time.Hour),
+		EndsAt:      now.Add(-30 * 24 * time.Hour),
+	}}}
+	service := &billingService{cfg: &config.Config{}, repo: repo, now: func() time.Time { return now }}
+
+	data, err := service.Get("user_123")
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if !data.TrialUsed {
+		t.Fatal("TrialUsed = false, want true for an account whose subscription carried a trial")
+	}
+	if data.IsPro {
+		t.Fatal("IsPro = true, want false for an expired subscription")
+	}
+}
+
+func TestBillingServiceMarksZeroAmountRowsAsTrial(t *testing.T) {
+	now := time.Date(2026, time.September, 22, 12, 0, 0, 0, time.UTC)
+	repo := &fakeBillingRepository{transactions: []model.BillingTransactionRecord{
+		{UserID: "user_123", ExternalID: "t1", AmountCents: 0, Currency: "USD", Status: "paid", ChargedAt: now},
+		{UserID: "user_123", ExternalID: "t2", AmountCents: 299, Currency: "USD", Status: "paid", ChargedAt: now},
+	}}
+	service := &billingService{cfg: &config.Config{}, repo: repo, now: func() time.Time { return now }}
+
+	data, err := service.Get("user_123")
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if len(data.Transactions) != 2 {
+		t.Fatalf("transactions = %d, want 2", len(data.Transactions))
+	}
+	if data.Transactions[0].Kind != model.BillingTransactionKindTrial {
+		t.Fatalf("zero-amount row kind = %q, want %q", data.Transactions[0].Kind, model.BillingTransactionKindTrial)
+	}
+	if data.Transactions[1].Kind != model.BillingTransactionKindCharge {
+		t.Fatalf("paid row kind = %q, want %q", data.Transactions[1].Kind, model.BillingTransactionKindCharge)
+	}
+}
+
+func TestBillingServicePortalPrefersCustomerPortalURL(t *testing.T) {
+	now := time.Date(2026, time.September, 22, 12, 0, 0, 0, time.UTC)
+	repo := &fakeBillingRepository{subscriptions: []model.BillingSubscriptionRecord{{
+		UserID: "user_123", ExternalID: "7001", PlanKey: model.PlanProMonthly, Status: "active",
+	}}}
+	client := &fakeLemonSqueezyClient{}
+	client.getAttributes.URLs.CustomerPortal = "https://goport.lemonsqueezy.com/billing?s=1"
+	client.getAttributes.URLs.UpdatePaymentMethod = "https://goport.lemonsqueezy.com/card?s=2"
+	service := &billingService{
+		cfg:  &config.Config{LemonSqueezyKey: "api-key", LemonSqueezyStoreID: "470781", LemonSqueezyAPIURL: "https://api.lemonsqueezy.test"},
+		repo: repo, client: client, now: func() time.Time { return now },
+	}
+
+	portal, err := service.PortalURL(context.Background(), "user_123")
+	if err != nil {
+		t.Fatalf("PortalURL() error = %v", err)
+	}
+	if client.fetchedSubscriptionID != "7001" {
+		t.Fatalf("fetched subscription = %q, want 7001", client.fetchedSubscriptionID)
+	}
+	if portal.URL != "https://goport.lemonsqueezy.com/billing?s=1" {
+		t.Fatalf("portal URL = %q, want the customer portal link", portal.URL)
+	}
+}
+
+func TestBillingServicePortalFallsBackToPaymentMethodURL(t *testing.T) {
+	now := time.Date(2026, time.September, 22, 12, 0, 0, 0, time.UTC)
+	repo := &fakeBillingRepository{subscriptions: []model.BillingSubscriptionRecord{{
+		UserID: "user_123", ExternalID: "7001", PlanKey: model.PlanProMonthly, Status: "active",
+	}}}
+	client := &fakeLemonSqueezyClient{}
+	client.getAttributes.URLs.UpdatePaymentMethod = "https://goport.lemonsqueezy.com/card?s=2"
+	service := &billingService{
+		cfg:  &config.Config{LemonSqueezyKey: "api-key", LemonSqueezyStoreID: "470781", LemonSqueezyAPIURL: "https://api.lemonsqueezy.test"},
+		repo: repo, client: client, now: func() time.Time { return now },
+	}
+
+	portal, err := service.PortalURL(context.Background(), "user_123")
+	if err != nil {
+		t.Fatalf("PortalURL() error = %v", err)
+	}
+	if portal.URL != "https://goport.lemonsqueezy.com/card?s=2" {
+		t.Fatalf("portal URL = %q, want the payment-method link", portal.URL)
+	}
+}
+
+func TestBillingServicePortalRequiresSubscription(t *testing.T) {
+	now := time.Date(2026, time.September, 22, 12, 0, 0, 0, time.UTC)
+	service := &billingService{
+		cfg:  &config.Config{LemonSqueezyKey: "api-key", LemonSqueezyStoreID: "470781", LemonSqueezyAPIURL: "https://api.lemonsqueezy.test"},
+		repo: &fakeBillingRepository{}, client: &fakeLemonSqueezyClient{}, now: func() time.Time { return now },
+	}
+
+	if _, err := service.PortalURL(context.Background(), "user_123"); !errors.Is(err, ErrNoSubscription) {
+		t.Fatalf("PortalURL() error = %v, want ErrNoSubscription", err)
+	}
 }

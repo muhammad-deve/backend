@@ -6,6 +6,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/pocketbase/pocketbase/core"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/model"
@@ -58,6 +59,18 @@ func (s *dashboardService) GetDashboard(user *core.Record) (*model.DashboardResp
 		return nil, fmt.Errorf("failed to load billing: %w", err)
 	}
 	resp.Billing = billing
+
+	// Month-to-date traffic, measured the same way the tunnel server measures it
+	// when it enforces the plan limit, so the dashboard and the CLI never
+	// disagree about how much allowance is left.
+	now := time.Now().UTC()
+	periodStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	monthBytes, err := s.usage.BytesForPeriod(user.Id, periodStart, now.Add(time.Second))
+	if err != nil {
+		return nil, fmt.Errorf("failed to load monthly usage: %w", err)
+	}
+	resp.MonthBytes = monthBytes
+	resp.MonthResetsAt = periodStart.AddDate(0, 1, 0).Format(time.RFC3339)
 
 	tunnels, err := s.tunnels.ListOwned(user.Id)
 	if err != nil {

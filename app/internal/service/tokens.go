@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase"
 	"github.com/pocketbase/pocketbase/core"
+	"github.com/pocketbase/pocketbase/tools/types"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/model"
 )
 
@@ -63,10 +65,11 @@ func (s *tokensService) List(userID string) ([]model.TokenItem, error) {
 	items := make([]model.TokenItem, 0, len(records))
 	for _, r := range records {
 		items = append(items, model.TokenItem{
-			ID:      r.Id,
-			Name:    r.GetString("name"),
-			Token:   r.GetString("token"),
-			Created: r.GetString("created"),
+			ID:       r.Id,
+			Name:     r.GetString("name"),
+			Token:    r.GetString("token"),
+			Created:  r.GetString("created"),
+			LastUsed: r.GetString("last_used"),
 		})
 	}
 	return items, nil
@@ -196,6 +199,7 @@ func (s *tokensService) Verify(token string) (*model.TokenOwner, error) {
 	if userID == "" {
 		return nil, ErrInvalidToken
 	}
+	s.touchLastUsed(rec)
 	limits, err := s.billing.Plan(userID)
 	if err != nil {
 		return nil, err
@@ -235,4 +239,23 @@ func isUniqueViolation(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "unique") || strings.Contains(msg, "constraint")
+}
+
+// touchLastUsed records that this token just authenticated a tunnel.
+//
+// It is deliberately best-effort and rate limited to one write per minute per
+// token: a tunnel that reconnects in a loop must not turn every retry into a
+// database write, and a bookkeeping failure must never stop a paying customer
+// from connecting.
+func (s *tokensService) touchLastUsed(rec *core.Record) {
+	now := types.NowDateTime()
+	if previous := rec.GetDateTime("last_used"); !previous.IsZero() {
+		if now.Time().Sub(previous.Time()) < time.Minute {
+			return
+		}
+	}
+	rec.Set("last_used", now)
+	if err := s.app.Save(rec); err != nil {
+		s.app.Logger().Warn("could not record token last_used", "error", err, "tokenId", rec.Id)
+	}
 }

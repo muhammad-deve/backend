@@ -101,6 +101,20 @@ type BillingData struct {
 	Plan               PlanLimits           `json:"plan"`
 	Subscription       *BillingSubscription `json:"subscription"`
 	Transactions       []BillingTransaction `json:"transactions"`
+	// TrialUsed reports whether this account has already consumed a free
+	// trial. Lemon Squeezy will happily start a second trial on a new
+	// subscription, so the dashboard must not advertise one twice.
+	TrialUsed bool `json:"trialUsed"`
+	// PortalAvailable reports whether a Lemon Squeezy customer portal link can
+	// be minted for this account (it needs an API key and a live subscription).
+	PortalAvailable bool `json:"portalAvailable"`
+}
+
+// BillingPortal carries a freshly minted, short-lived Lemon Squeezy portal URL.
+// These links are signed and expire, so they are fetched on demand rather than
+// stored alongside the subscription.
+type BillingPortal struct {
+	URL string `json:"url"`
 }
 
 type BillingSubscription struct {
@@ -122,4 +136,12 @@ type BillingTransaction struct {
 	Status      string `json:"status"`
 	ChargedAt   string `json:"chargedAt"`
 	InvoiceURL  string `json:"invoiceUrl,omitempty"`
+	// Kind distinguishes a real charge from a zero-amount bookkeeping row so
+	// the dashboard never renders a trial start as "Paid $0.00".
+	Kind string `json:"kind"`
 }
+
+const (
+	BillingTransactionKindCharge = "charge"
+	BillingTransactionKindTrial  = "trial"
+)

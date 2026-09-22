@@ -19,6 +19,7 @@ type lemonSqueezyClientI interface {
 	CreateCheckout(ctx context.Context, input lemonCheckoutInput) (string, error)
 	CancelSubscription(ctx context.Context, subscriptionID string) (lemonSubscriptionAttributes, error)
 	UpdateSubscriptionVariant(ctx context.Context, subscriptionID, variantID string) (lemonSubscriptionAttributes, error)
+	GetSubscription(ctx context.Context, subscriptionID string) (lemonSubscriptionAttributes, error)
 }
 
 type lemonCheckoutInput struct {
@@ -92,6 +93,22 @@ func (c *lemonSqueezyClient) CreateCheckout(ctx context.Context, input lemonChec
 		return "", fmt.Errorf("Lemon Squeezy returned an invalid checkout URL")
 	}
 	return response.Data.Attributes.URL, nil
+}
+
+// GetSubscription reads a subscription back from Lemon Squeezy. The portal and
+// payment-method URLs it returns are signed and short-lived, so they are
+// fetched at the moment the user asks for them rather than cached.
+func (c *lemonSqueezyClient) GetSubscription(ctx context.Context, subscriptionID string) (lemonSubscriptionAttributes, error) {
+	var response struct {
+		Data struct {
+			Attributes lemonSubscriptionAttributes `json:"attributes"`
+		} `json:"data"`
+	}
+	path := "/subscriptions/" + url.PathEscape(subscriptionID)
+	if err := c.do(ctx, http.MethodGet, path, nil, &response); err != nil {
+		return lemonSubscriptionAttributes{}, err
+	}
+	return response.Data.Attributes, nil
 }
 
 func (c *lemonSqueezyClient) CancelSubscription(ctx context.Context, subscriptionID string) (lemonSubscriptionAttributes, error) {

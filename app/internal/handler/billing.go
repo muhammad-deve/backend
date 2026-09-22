@@ -62,6 +62,28 @@ func (h *Handler) ChangeSubscriptionPlanHandler(e *core.RequestEvent) error {
 	return h.NewSuccessResponse(e, http.StatusOK, map[string]string{"message": "Subscription changed to yearly billing."})
 }
 
+// BillingPortalHandler hands back a short-lived Lemon Squeezy customer portal
+// link so the dashboard can offer "manage subscription" without storing an URL
+// that would have expired by the time anyone clicked it.
+func (h *Handler) BillingPortalHandler(e *core.RequestEvent) error {
+	if e.Auth == nil {
+		return h.NewErrorResponse(e, http.StatusUnauthorized, "authentication required")
+	}
+	portal, err := h.service.Billing().PortalURL(e.Request.Context(), e.Auth.Id)
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrNoSubscription):
+			return h.NewErrorResponse(e, http.StatusNotFound, "No Lemon Squeezy subscription was found for this account.")
+		case errors.Is(err, service.ErrBillingNotConfigured):
+			return h.NewErrorResponse(e, http.StatusServiceUnavailable, "The billing portal is not configured yet.")
+		default:
+			h.logger.Error("failed to build Lemon Squeezy portal link", "error", err, "userId", e.Auth.Id)
+			return h.NewErrorResponse(e, http.StatusBadGateway, "Couldn't open the billing portal. Please try again.")
+		}
+	}
+	return h.NewSuccessResponse(e, http.StatusOK, portal)
+}
+
 func (h *Handler) CancelSubscriptionHandler(e *core.RequestEvent) error {
 	if e.Auth == nil {
 		return h.NewErrorResponse(e, http.StatusUnauthorized, "authentication required")

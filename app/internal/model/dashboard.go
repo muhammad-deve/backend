@@ -9,6 +9,12 @@ type DashboardResponse struct {
 	Avatar        string            `json:"avatar"`
 	TotalRequests int64             `json:"totalRequests"`
 	TotalBytes    int64             `json:"totalBytes"`
+	// MonthBytes is traffic used since the first of the current UTC month --
+	// the figure the plan's monthly allowance is actually measured against.
+	// TotalRequests/TotalBytes above are lifetime figures.
+	MonthBytes int64 `json:"monthBytes"`
+	// MonthResetsAt is when the monthly allowance rolls over (RFC 3339).
+	MonthResetsAt string `json:"monthResetsAt"`
 	Domains       []DashboardDomain `json:"domains"`
 	Tokens        []TokenItem       `json:"tokens"`
 	Billing       *BillingData      `json:"billing"`

@@ -10,6 +10,9 @@ type TokenItem struct {
 	Name    string `json:"name"`
 	Token   string `json:"token"`
 	Created string `json:"created,omitempty"`
+	// LastUsed is when this token last authenticated a tunnel. Empty means the
+	// token has not been used since tracking began.
+	LastUsed string `json:"lastUsed,omitempty"`
 }
 
 // CreateTokenRequest is the payload for creating a new named token.
