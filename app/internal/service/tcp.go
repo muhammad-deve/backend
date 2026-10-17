@@ -45,6 +45,30 @@ type tunnelRegistrationRequest struct {
 	Subdomain string `json:"subdomain,omitempty"`
 	Reset     bool   `json:"reset,omitempty"`
 	Token     string `json:"token,omitempty"`
+	// Resume is the subdomain a reconnecting CLI held before its connection
+	// dropped. It is honoured only for a tunnel the same account already owns,
+	// so it never grants a name the plan would not allow on a fresh start.
+	Resume string `json:"resume,omitempty"`
+}
+
+// registrationTimeout bounds the JSON handshake so a client that connects and
+// never sends a request cannot hold a goroutine forever.
+const registrationTimeout = 15 * time.Second
+
+// staleSessionProbeTimeout is how long a held session gets to answer a ping
+// before a reconnect from the same account replaces it. A var so tests can
+// shorten it.
+var staleSessionProbeTimeout = 5 * time.Second
+
+// tunnelSessionConfig tolerates slow uplinks. yamux sends pings on the same TCP
+// connection as data, so with the default 10s timeout a CLI pushing a large
+// response over a slow link missed its keepalive and the whole tunnel dropped.
+func tunnelSessionConfig() *yamux.Config {
+	cfg := yamux.DefaultConfig()
+	cfg.KeepAliveInterval = 20 * time.Second
+	cfg.ConnectionWriteTimeout = 30 * time.Second
+	cfg.LogOutput = log.Writer()
+	return cfg
 }
 
 type tunnelRegistrationResponse struct {
@@ -226,13 +250,16 @@ func (t *tcpService) handleConnection(conn net.Conn) {
 		// Only the connection that still holds the subdomain may mark it offline.
 		// A rejected duplicate registration, or a reconnect that already handed the
 		// subdomain to a newer connection, would otherwise flag a tunnel that is
-		// still serving traffic as offline in the dashboard.
-		if ownedSession {
+		// still serving traffic as offline in the dashboard. Check again right
+		// before the write: a reconnecting CLI may have claimed it meanwhile.
+		if ownedSession && !t.isReserved(subdomain) {
 			t.setTunnelCurrent(subdomain, false)
 		}
 
 		log.Printf("CLI disconnected: %s", remoteAddr)
 	}()
+
+	_ = conn.SetDeadline(time.Now().Add(registrationTimeout))
 
 	var req tunnelRegistrationRequest
 	if err := json.NewDecoder(conn).Decode(&req); err != nil {
@@ -267,12 +294,15 @@ func (t *tcpService) handleConnection(conn net.Conn) {
 		return
 	}
 
+	// The handshake is done; from here yamux keepalives detect a dead link.
+	_ = conn.SetDeadline(time.Time{})
+
 	log.Printf("registered %s tunnel %s -> localhost:%s", req.Type, resp.URL, req.Port)
 
 	// Mark the subdomain as actively in use.
 	t.setTunnelCurrent(subdomain, true)
 
-	session, err := yamux.Server(conn, nil)
+	session, err := yamux.Server(conn, tunnelSessionConfig())
 	if err != nil {
 		log.Printf("failed to start yamux server: %v", err)
 		return
@@ -338,6 +368,24 @@ func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (string, strin
 		return "", "", "", 0, false, fmt.Errorf("monthly traffic limit reached for Free (%d GB); upgrade to Pro for %d GB", limits.MonthlyBytes/(1024*1024*1024), model.ProMonthlyBytes/(1024*1024*1024))
 	}
 
+	// A reconnecting CLI asks for the subdomain it already had, so a dropped
+	// connection does not move the public URL. A name that was claimed by someone
+	// else meanwhile, or a custom name the plan no longer covers, falls through to
+	// the normal flow below.
+	if resume := strings.TrimSpace(req.Resume); resume != "" && !req.Reset {
+		record, err := t.findTunnelBySubdomain(resume)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return "", "", "", 0, false, err
+		}
+		if err == nil && record.GetString("user") == userID {
+			isCustom := record.GetBool("is_custom")
+			if !isCustom || limits.CustomSubdomains {
+				subdomain, tunnelID, err := t.saveTunnel(resume, isCustom, userID, req.Port, req.Type)
+				return subdomain, tunnelID, userID, limits.MaxActiveTunnels, isCustom, err
+			}
+		}
+	}
+
 	if strings.TrimSpace(req.Subdomain) != "" {
 		if !limits.CustomSubdomains {
 			return "", "", "", 0, false, fmt.Errorf("%w: custom subdomains are available on Pro; upgrade at https://goport.uz/dashboard#billing", ErrProRequired)
@@ -351,7 +399,10 @@ func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (string, strin
 	}
 
 	if !req.Reset {
-		record, err := t.findCurrentTunnel(userID)
+		// Free accounts skip custom names they kept from before custom subdomains
+		// moved to Pro. Otherwise a newer custom row hides their generated one and
+		// every start hands out a fresh random URL.
+		record, err := t.findCurrentTunnel(userID, limits.CustomSubdomains)
 		if err == nil {
 			subdomain := record.GetString("subdomain")
 			isCustom := record.GetBool("is_custom")
@@ -383,7 +434,7 @@ func (t *tcpService) saveTunnel(subdomain string, isCustom bool, userID, localPo
 		// is_current column, which can be left stale by an unclean shutdown.
 		// Checking it before any write also stops a second CLI from rewriting the
 		// connection metadata of a tunnel that is still online.
-		if t.hasLiveSession(subdomain) {
+		if t.hasLiveSession(subdomain) && !t.releaseDeadSession(subdomain, userID) {
 			return "", "", fmt.Errorf("subdomain %q is currently in use", subdomain)
 		}
 
@@ -465,8 +516,12 @@ func (t *tcpService) DeleteTunnel(userID, subdomain string) error {
 	return t.tunnels.DeleteWithLogs(record.ID)
 }
 
-func (t *tcpService) findCurrentTunnel(userID string) (*core.Record, error) {
-	records, err := t.app.FindRecordsByFilter("tunnels", "user = {:user}", "-updated", 1, 0, dbx.Params{
+func (t *tcpService) findCurrentTunnel(userID string, includeCustom bool) (*core.Record, error) {
+	filter := "user = {:user}"
+	if !includeCustom {
+		filter += " && is_custom = false"
+	}
+	records, err := t.app.FindRecordsByFilter("tunnels", filter, "-updated", 1, 0, dbx.Params{
 		"user": userID,
 	})
 	if err != nil {
@@ -532,6 +587,51 @@ func (t *tcpService) hasLiveSession(subdomain string) bool {
 		return false
 	}
 	return session == nil || !session.IsClosed()
+}
+
+// isReserved reports whether any connection currently holds the subdomain.
+func (t *tcpService) isReserved(subdomain string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	_, ok := t.owners[subdomain]
+	return ok
+}
+
+// releaseDeadSession frees a subdomain whose session the server still holds but
+// which no longer answers. That happens when a CLI's link dies without a clean
+// close (Wi-Fi switch, sleep, NAT reset) and the CLI reconnects before the
+// server's own keepalive notices. Only the same account's session is probed,
+// and a session that answers is left alone, so two live CLIs can't evict each
+// other. It reports whether the subdomain was freed.
+func (t *tcpService) releaseDeadSession(subdomain, userID string) bool {
+	t.mu.Lock()
+	session := t.sessions[subdomain]
+	owner := t.sessionUsers[subdomain]
+	t.mu.Unlock()
+
+	if session == nil || session.IsClosed() || owner != userID {
+		return false
+	}
+	if sessionAnswers(session, staleSessionProbeTimeout) {
+		return false
+	}
+	log.Printf("tunnel %s: held session stopped answering; releasing it for a reconnect", subdomain)
+	_ = session.Close()
+	return true
+}
+
+func sessionAnswers(session *yamux.Session, timeout time.Duration) bool {
+	result := make(chan error, 1)
+	go func() {
+		_, err := session.Ping()
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		return err == nil
+	case <-time.After(timeout):
+		return false
+	}
 }
 
 func (t *tcpService) reserveSession(subdomain, tunnelID, userID string, maxActive int, isCustom bool, conn net.Conn) error {
