@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -100,7 +101,26 @@ type tcpService struct {
 	tokens        TokensI
 	quotaMu       sync.Mutex
 	quotaCache    map[string]trafficQuotaCacheEntry
+	// onlineSince is when each live session's connected time was last
+	// counted; pendingOnline holds time from sessions that ended since the
+	// last write. Both are guarded by mu.
+	onlineSince   map[string]time.Time
+	pendingOnline []onlineDelta
+	// recordMu serialises read-modify-write saves of tunnel rows with the
+	// minutes_used increment, so a save from a stale copy can't undo it.
+	recordMu sync.Mutex
 }
+
+// onlineDelta is connected time to add to one tunnel and its owner.
+type onlineDelta struct {
+	tunnelID string
+	userID   string
+	seconds  float64
+}
+
+// onlineAccrualInterval is how often connected time is written. A crash
+// loses at most this much; a clean shutdown loses none.
+var onlineAccrualInterval = time.Minute
 
 type tunnelStatKey struct {
 	tunnelID    string
@@ -150,6 +170,7 @@ func NewTCPService(app core.App, tunnels repository.TunnelsI, usage repository.U
 		billing:       billing,
 		tokens:        tokens,
 		quotaCache:    make(map[string]trafficQuotaCacheEntry),
+		onlineSince:   make(map[string]time.Time),
 	}
 }
 
@@ -183,7 +204,11 @@ func (t *tcpService) Stop() {
 		close(t.stopFlush)
 	}
 
+	now := time.Now()
 	t.mu.Lock()
+	for subdomain := range t.onlineSince {
+		t.endOnlineLocked(subdomain, now)
+	}
 	for addr, conn := range t.conns {
 		conn.Close()
 		delete(t.conns, addr)
@@ -201,8 +226,9 @@ func (t *tcpService) Stop() {
 	}
 	t.mu.Unlock()
 
-	// Persist any traffic accumulated since the last flush.
+	// Persist any traffic and connected time accumulated since the last flush.
 	t.flushStats()
+	t.flushOnline(now)
 
 	log.Printf("TCP tunnel listener stopped")
 }
@@ -238,6 +264,7 @@ func (t *tcpService) handleConnection(conn net.Conn) {
 		delete(t.conns, remoteAddr)
 		ownedSession := sessionReserved && subdomain != "" && t.owners[subdomain] == conn
 		if ownedSession {
+			t.endOnlineLocked(subdomain, time.Now())
 			delete(t.sessions, subdomain)
 			delete(t.owners, subdomain)
 			delete(t.tunnelIDs, subdomain)
@@ -311,6 +338,7 @@ func (t *tcpService) handleConnection(conn net.Conn) {
 
 	t.mu.Lock()
 	t.sessions[subdomain] = session
+	t.onlineSince[subdomain] = time.Now()
 	t.mu.Unlock()
 
 	<-session.CloseChan()
@@ -444,6 +472,13 @@ func (t *tcpService) saveTunnel(subdomain string, isCustom bool, userID, localPo
 				return "", "", err
 			}
 		} else {
+			t.recordMu.Lock()
+			defer t.recordMu.Unlock()
+			// Re-read under the lock: the liveness probe above can take seconds,
+			// and saving the old copy would undo minutes added meanwhile.
+			if fresh, err := t.findTunnelBySubdomain(subdomain); err == nil {
+				existing = fresh
+			}
 			existing.Set("user", userID)
 			existing.Set("is_custom", isCustom)
 			existing.Set("is_current", false)
@@ -543,6 +578,8 @@ func (t *tcpService) findTunnelBySubdomain(subdomain string) (*core.Record, erro
 // This tracks whether a tunnel is actively connected so other users know if a
 // subdomain is available to claim.
 func (t *tcpService) setTunnelCurrent(subdomain string, current bool) {
+	t.recordMu.Lock()
+	defer t.recordMu.Unlock()
 	rec, err := t.findTunnelBySubdomain(subdomain)
 	if err != nil {
 		return
@@ -642,6 +679,7 @@ func (t *tcpService) reserveSession(subdomain, tunnelID, userID string, maxActiv
 		if existing == nil || !existing.IsClosed() {
 			return fmt.Errorf("subdomain %q is already connected", subdomain)
 		}
+		t.endOnlineLocked(subdomain, time.Now())
 		delete(t.sessions, subdomain)
 		delete(t.owners, subdomain)
 		delete(t.tunnelIDs, subdomain)
@@ -987,13 +1025,116 @@ func (t *tcpService) recordTraffic(tunnelID, subdomain, userID string, bytesTran
 func (t *tcpService) flushLoop() {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
+	online := time.NewTicker(onlineAccrualInterval)
+	defer online.Stop()
 	for {
 		select {
 		case <-t.stopFlush:
 			return
 		case <-ticker.C:
 			t.flushStats()
+		case now := <-online.C:
+			t.flushOnline(now)
 		}
+	}
+}
+
+// endOnlineLocked queues the connected time a session built up since it was
+// last counted and stops its clock. It must run while mu is held and before
+// the session's tunnelIDs and sessionUsers entries are removed.
+func (t *tcpService) endOnlineLocked(subdomain string, now time.Time) {
+	since, ok := t.onlineSince[subdomain]
+	if !ok {
+		return
+	}
+	delete(t.onlineSince, subdomain)
+	t.pendingOnline = append(t.pendingOnline, onlineDelta{
+		tunnelID: t.tunnelIDs[subdomain],
+		userID:   t.sessionUsers[subdomain],
+		seconds:  now.Sub(since).Seconds(),
+	})
+}
+
+// collectOnline returns the connected time of every live session since it was
+// last counted, plus the time of sessions that ended, and restarts the clocks.
+func (t *tcpService) collectOnline(now time.Time) []onlineDelta {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	deltas := t.pendingOnline
+	t.pendingOnline = nil
+	for subdomain, since := range t.onlineSince {
+		deltas = append(deltas, onlineDelta{
+			tunnelID: t.tunnelIDs[subdomain],
+			userID:   t.sessionUsers[subdomain],
+			seconds:  now.Sub(since).Seconds(),
+		})
+		t.onlineSince[subdomain] = now
+	}
+	return deltas
+}
+
+// sumOnlineMinutes totals the deltas per tunnel and per user, in minutes
+// rounded to two decimals. Several sessions of one account add up.
+func sumOnlineMinutes(deltas []onlineDelta) (tunnels, users map[string]float64) {
+	tunnelSeconds, userSeconds := map[string]float64{}, map[string]float64{}
+	for _, d := range deltas {
+		if d.seconds <= 0 {
+			continue
+		}
+		if d.tunnelID != "" {
+			tunnelSeconds[d.tunnelID] += d.seconds
+		}
+		if d.userID != "" {
+			userSeconds[d.userID] += d.seconds
+		}
+	}
+	toMinutes := func(seconds map[string]float64) map[string]float64 {
+		minutes := make(map[string]float64, len(seconds))
+		for id, s := range seconds {
+			if m := math.Round(s/60*100) / 100; m > 0 {
+				minutes[id] = m
+			}
+		}
+		return minutes
+	}
+	return toMinutes(tunnelSeconds), toMinutes(userSeconds)
+}
+
+// flushOnline adds connected time to tunnels.minutes_used and
+// users.minutes_used. The increments run in SQL so they never read a stale
+// value, and they leave the tunnel's `updated` alone, which findCurrentTunnel
+// sorts by. Failed writes are queued again for the next tick.
+func (t *tcpService) flushOnline(now time.Time) {
+	deltas := t.collectOnline(now)
+	if len(deltas) == 0 {
+		return
+	}
+	tunnels, users := sumOnlineMinutes(deltas)
+
+	var retry []onlineDelta
+	for id, minutes := range tunnels {
+		t.recordMu.Lock()
+		_, err := t.app.DB().NewQuery("UPDATE tunnels SET minutes_used = minutes_used + {:minutes} WHERE id = {:id}").
+			Bind(dbx.Params{"minutes": minutes, "id": id}).Execute()
+		t.recordMu.Unlock()
+		if err != nil {
+			log.Printf("failed to add %.2f minutes to tunnel %s: %v", minutes, id, err)
+			retry = append(retry, onlineDelta{tunnelID: id, seconds: minutes * 60})
+		}
+	}
+	for id, minutes := range users {
+		_, err := t.app.DB().NewQuery("UPDATE users SET minutes_used = minutes_used + {:minutes} WHERE id = {:id}").
+			Bind(dbx.Params{"minutes": minutes, "id": id}).Execute()
+		if err != nil {
+			log.Printf("failed to add %.2f minutes to user %s: %v", minutes, id, err)
+			retry = append(retry, onlineDelta{userID: id, seconds: minutes * 60})
+		}
+	}
+	if len(retry) > 0 {
+		t.mu.Lock()
+		t.pendingOnline = append(t.pendingOnline, retry...)
+		t.mu.Unlock()
 	}
 }
 
