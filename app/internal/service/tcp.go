@@ -24,6 +24,7 @@ import (
 	"github.com/pocketbase/pocketbase/core"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/model"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/repository"
+	"gitlab.yurtal.tech/company/pocketbase-app-template/pkg/geoip"
 )
 
 type TCPI interface {
@@ -50,6 +51,14 @@ type tunnelRegistrationRequest struct {
 	// dropped. It is honoured only for a tunnel the same account already owns,
 	// so it never grants a name the plan would not allow on a fresh start.
 	Resume string `json:"resume,omitempty"`
+
+	// What the CLI reports about itself (0.1.9 and newer). Older CLIs send
+	// none of these, so blank means "0.1.8 or older".
+	Version         string `json:"version,omitempty"`
+	OS              string `json:"os,omitempty"`
+	Arch            string `json:"arch,omitempty"`
+	Install         string `json:"install,omitempty"`
+	ReconnectReason string `json:"reconnect_reason,omitempty"`
 }
 
 // registrationTimeout bounds the JSON handshake so a client that connects and
@@ -109,6 +118,7 @@ type tcpService struct {
 	// recordMu serialises read-modify-write saves of tunnel rows with the
 	// minutes_used increment, so a save from a stale copy can't undo it.
 	recordMu sync.Mutex
+	geo      *geoip.DB
 }
 
 // onlineDelta is connected time to add to one tunnel and its owner.
@@ -171,6 +181,7 @@ func NewTCPService(app core.App, tunnels repository.TunnelsI, usage repository.U
 		tokens:        tokens,
 		quotaCache:    make(map[string]trafficQuotaCacheEntry),
 		onlineSince:   make(map[string]time.Time),
+		geo:           geoip.Open(""),
 	}
 }
 
@@ -328,6 +339,7 @@ func (t *tcpService) handleConnection(conn net.Conn) {
 
 	// Mark the subdomain as actively in use.
 	t.setTunnelCurrent(subdomain, true)
+	t.recordDevice(req, conn.RemoteAddr().String())
 
 	session, err := yamux.Server(conn, tunnelSessionConfig())
 	if err != nil {
@@ -342,6 +354,62 @@ func (t *tcpService) handleConnection(conn net.Conn) {
 	t.mu.Unlock()
 
 	<-session.CloseChan()
+}
+
+// deviceField keeps a value the CLI reported short and plain before it is
+// stored. Anything outside letters, digits and "._-+" is dropped.
+func deviceField(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) > 32 {
+		value = value[:32]
+	}
+	for _, r := range value {
+		ok := r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("._-+", r)
+		if !ok {
+			return ""
+		}
+	}
+	return value
+}
+
+// recordDevice stores what the CLI reported about itself on its token row,
+// since each token is one device, plus the country its IP belongs to (the IP
+// itself is not stored). It is one UPDATE, so tunnels opening at once from one
+// device can't lose a reconnect, and blank values from older CLIs keep what
+// was already there.
+func (t *tcpService) recordDevice(req tunnelRegistrationRequest, remoteAddr string) {
+	token := strings.TrimSpace(req.Token)
+	if token == "" || t.app == nil {
+		return
+	}
+	reason := deviceField(req.ReconnectReason)
+	increment := 0
+	if reason != "" {
+		increment = 1
+	}
+	_, err := t.app.DB().NewQuery(`
+		UPDATE tokens SET
+			client_version  = CASE WHEN {:version} != '' THEN {:version} ELSE client_version END,
+			client_os       = CASE WHEN {:os} != '' THEN {:os} ELSE client_os END,
+			client_arch     = CASE WHEN {:arch} != '' THEN {:arch} ELSE client_arch END,
+			install_method  = CASE WHEN {:install} != '' THEN {:install} ELSE install_method END,
+			country         = CASE WHEN {:country} != '' THEN {:country} ELSE country END,
+			reconnects      = reconnects + {:increment},
+			last_disconnect = CASE WHEN {:reason} != '' THEN {:reason} ELSE last_disconnect END
+		WHERE token = {:token}
+	`).Bind(dbx.Params{
+		"version":   deviceField(req.Version),
+		"os":        deviceField(req.OS),
+		"arch":      deviceField(req.Arch),
+		"install":   deviceField(req.Install),
+		"country":   t.geo.Country(remoteAddr),
+		"increment": increment,
+		"reason":    reason,
+		"token":     token,
+	}).Execute()
+	if err != nil {
+		log.Printf("failed to record device details: %v", err)
+	}
 }
 
 func (t *tcpService) sendRegistrationError(conn net.Conn, msg string) {
@@ -452,6 +520,13 @@ func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (string, strin
 }
 
 func (t *tcpService) saveTunnel(subdomain string, isCustom bool, userID, localPort, protocol string) (string, string, error) {
+	// Every way a custom name is handed out (--custom, a reconnect, or a
+	// restart reusing the latest tunnel) comes through here, so a word added
+	// to blocked_words also stops names that were allowed before.
+	if isCustom && containsBlockedWord(subdomain, t.blockedWords()) {
+		return "", "", errBlockedSubdomain
+	}
+
 	collection, err := t.app.FindCollectionByNameOrId(model.TunnelsCollection)
 	if err != nil {
 		return "", "", err
@@ -767,10 +842,15 @@ func isReservedSubdomain(subdomain string) bool {
 }
 
 func (t *tcpService) generateUniqueSubdomain() (string, error) {
+	blocked := t.blockedWords()
 	for i := 0; i < 10; i++ {
 		subdomain, err := randomSubdomain(6)
 		if err != nil {
 			return "", err
+		}
+		// Random letters can spell a blocked word too; just draw again.
+		if containsBlockedWord(subdomain, blocked) {
+			continue
 		}
 
 		_, err = t.app.FindFirstRecordByFilter("tunnels", "subdomain = {:subdomain}", dbx.Params{

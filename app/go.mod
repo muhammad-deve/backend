@@ -6,6 +6,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/yamux v0.1.2
 	github.com/ilyakaznacheev/cleanenv v1.5.0
+	github.com/oschwald/maxminddb-golang v1.13.1
 	github.com/pocketbase/dbx v1.11.0
 	github.com/pocketbase/pocketbase v0.27.2
 	github.com/resend/resend-go/v2 v2.28.0
