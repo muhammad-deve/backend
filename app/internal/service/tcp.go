@@ -22,6 +22,7 @@ import (
 	"github.com/hashicorp/yamux"
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
+	"github.com/pocketbase/pocketbase/tools/types"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/model"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/repository"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/pkg/geoip"
@@ -475,36 +476,37 @@ func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (string, strin
 		}
 		if err == nil && record.GetString("user") == userID {
 			isCustom := record.GetBool("is_custom")
-			if !isCustom || limits.CustomSubdomains {
+			if !isCustom || limits.CustomSubdomains || isGrandfathered(record) {
 				subdomain, tunnelID, err := t.saveTunnel(resume, isCustom, userID, req.Port, req.Type)
-				return subdomain, tunnelID, userID, limits.MaxActiveTunnels, isCustom, err
+				return subdomain, tunnelID, userID, limits.MaxActiveTunnels, needsPro(record), err
 			}
 		}
 	}
 
 	if strings.TrimSpace(req.Subdomain) != "" {
-		if !limits.CustomSubdomains {
-			return "", "", "", 0, false, fmt.Errorf("%w: custom subdomains are available on Pro; upgrade at https://goport.uz/dashboard#billing", ErrProRequired)
-		}
 		subdomain, err := normalizeRequestedSubdomain(req.Subdomain, t.domain)
 		if err != nil {
 			return "", "", "", 0, false, err
 		}
+		owned := t.ownsGrandfatheredName(subdomain, userID)
+		if !limits.CustomSubdomains && !owned {
+			return "", "", "", 0, false, fmt.Errorf("%w: custom subdomains are available on Pro; upgrade at https://goport.uz/dashboard#billing", ErrProRequired)
+		}
 		subdomain, tunnelID, err := t.saveTunnel(subdomain, true, userID, req.Port, req.Type)
-		return subdomain, tunnelID, userID, limits.MaxActiveTunnels, true, err
+		return subdomain, tunnelID, userID, limits.MaxActiveTunnels, !owned, err
 	}
 
 	if !req.Reset {
-		// Free accounts skip custom names they kept from before custom subdomains
+		// Free accounts skip custom names they claimed after custom subdomains
 		// moved to Pro. Otherwise a newer custom row hides their generated one and
 		// every start hands out a fresh random URL.
 		record, err := t.findCurrentTunnel(userID, limits.CustomSubdomains)
 		if err == nil {
 			subdomain := record.GetString("subdomain")
 			isCustom := record.GetBool("is_custom")
-			if subdomain != "" && (!isCustom || limits.CustomSubdomains) {
+			if subdomain != "" && (!isCustom || limits.CustomSubdomains || isGrandfathered(record)) {
 				subdomain, tunnelID, err := t.saveTunnel(subdomain, isCustom, userID, req.Port, req.Type)
-				return subdomain, tunnelID, userID, limits.MaxActiveTunnels, isCustom, err
+				return subdomain, tunnelID, userID, limits.MaxActiveTunnels, needsPro(record), err
 			}
 		} else if !errors.Is(err, sql.ErrNoRows) {
 			return "", "", "", 0, false, err
@@ -626,13 +628,38 @@ func (t *tcpService) DeleteTunnel(userID, subdomain string) error {
 	return t.tunnels.DeleteWithLogs(record.ID)
 }
 
+// customProOnlySince is when custom subdomains became a Pro feature (billing
+// launched 2026-09-12). A custom name its owner created before then stays
+// theirs on any plan; new custom names need Pro.
+var customProOnlySince = time.Date(2026, 9, 13, 0, 0, 0, 0, time.UTC)
+
+// isGrandfathered reports whether a tunnel row is a custom name created
+// before custom subdomains became Pro-only.
+func isGrandfathered(record *core.Record) bool {
+	return record.GetBool("is_custom") && record.GetDateTime("created").Time().Before(customProOnlySince)
+}
+
+// needsPro reports whether traffic on this tunnel requires an active Pro plan.
+func needsPro(record *core.Record) bool {
+	return record.GetBool("is_custom") && !isGrandfathered(record)
+}
+
+// ownsGrandfatheredName reports whether userID owns subdomain as a custom
+// name from before custom subdomains became Pro-only.
+func (t *tcpService) ownsGrandfatheredName(subdomain, userID string) bool {
+	record, err := t.findTunnelBySubdomain(subdomain)
+	return err == nil && record.GetString("user") == userID && isGrandfathered(record)
+}
+
 func (t *tcpService) findCurrentTunnel(userID string, includeCustom bool) (*core.Record, error) {
 	filter := "user = {:user}"
 	if !includeCustom {
-		filter += " && is_custom = false"
+		// Grandfathered custom names still count as the account's own.
+		filter += " && (is_custom = false || created < {:proOnlySince})"
 	}
 	records, err := t.app.FindRecordsByFilter("tunnels", filter, "-updated", 1, 0, dbx.Params{
-		"user": userID,
+		"user":         userID,
+		"proOnlySince": customProOnlySince.Format(types.DefaultDateLayout),
 	})
 	if err != nil {
 		return nil, err
@@ -780,6 +807,9 @@ func (t *tcpService) reserveSession(subdomain, tunnelID, userID string, maxActiv
 	t.owners[subdomain] = conn
 	t.tunnelIDs[subdomain] = tunnelID
 	t.sessionUsers[subdomain] = userID
+	// isCustom here means "needs Pro": custom names created before custom
+	// subdomains became Pro-only are passed as false so their traffic flows on
+	// any plan.
 	t.sessionCustom[subdomain] = isCustom
 	t.nextSession++
 	t.sessionOrder[subdomain] = t.nextSession
