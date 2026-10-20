@@ -2,6 +2,8 @@ package handler
 
 import (
 	"log/slog"
+	"sync"
+	"time"
 
 	"github.com/pocketbase/pocketbase/apis"
 	"github.com/pocketbase/pocketbase/core"
@@ -11,9 +13,12 @@ import (
 )
 
 type Handler struct {
-	logger  *slog.Logger
-	service service.I
-	cfg     *config.Config
+	logger         *slog.Logger
+	service        service.I
+	cfg            *config.Config
+	shareUploads   chan struct{}
+	shareDownloads chan struct{}
+	shareAttempts  *shareAttemptLimiter
 }
 
 func (h *Handler) Register(router *router.Router[*core.RequestEvent]) {
@@ -68,6 +73,27 @@ func (h *Handler) Register(router *router.Router[*core.RequestEvent]) {
 			tunnels.DELETE("/{subdomain}", h.DeleteTunnelHandler)
 		}
 
+		shares := api.Group("/shares")
+		{
+			shares.Bind(apis.RequireAuth("users"))
+			shares.GET("", h.ListSharesHandler)
+			shares.POST("", h.UploadShareHandler)
+			shares.PATCH("/{id}", h.UpdateShareHandler)
+			shares.POST("/{id}/revoke", h.RevokeShareHandler)
+			shares.DELETE("/{id}", h.DeleteShareHandler)
+		}
+
+		publicShares := api.Group("/public/shares")
+		{
+			publicShares.OPTIONS("/{token}", h.PublicShareOptionsHandler)
+			publicShares.OPTIONS("/{token}/unlock", h.PublicShareOptionsHandler)
+			publicShares.OPTIONS("/{token}/content", h.PublicShareOptionsHandler)
+			publicShares.GET("/{token}", h.PublicShareHandler)
+			publicShares.POST("/{token}/unlock", h.UnlockShareHandler)
+			publicShares.GET("/{token}/content", h.ShareContentHandler)
+			publicShares.HEAD("/{token}/content", h.ShareContentHandler)
+		}
+
 		api.POST("/billing/webhook", h.LemonSqueezyWebhookHandler)
 		billing := api.Group("/billing")
 		{
@@ -81,5 +107,10 @@ func (h *Handler) Register(router *router.Router[*core.RequestEvent]) {
 }
 
 func NewHandler(logger *slog.Logger, service service.I, cfg *config.Config) *Handler {
-	return &Handler{logger: logger, service: service, cfg: cfg}
+	return &Handler{logger: logger, service: service, cfg: cfg, shareUploads: make(chan struct{}, 2), shareDownloads: make(chan struct{}, 32), shareAttempts: &shareAttemptLimiter{hits: make(map[string][]time.Time)}}
+}
+
+type shareAttemptLimiter struct {
+	mu   sync.Mutex
+	hits map[string][]time.Time
 }

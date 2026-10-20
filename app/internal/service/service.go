@@ -21,6 +21,7 @@ type I interface {
 	Usage() UsageI
 	Tokens() TokensI
 	Billing() BillingI
+	Shares() SharesI
 }
 
 type service struct {
@@ -33,6 +34,7 @@ type service struct {
 	usageService     UsageI
 	tokensService    TokensI
 	billingService   BillingI
+	sharesService    SharesI
 }
 
 func (s *service) Authorization() AuthorizationI { return s.AuthorizationI }
@@ -44,11 +46,13 @@ func (s *service) Dashboard() DashboardI         { return s.dashboardService }
 func (s *service) Usage() UsageI                 { return s.usageService }
 func (s *service) Tokens() TokensI               { return s.tokensService }
 func (s *service) Billing() BillingI             { return s.billingService }
+func (s *service) Shares() SharesI               { return s.sharesService }
 
 func NewService(app *pocketbase.PocketBase, cfg *config.Config) I {
 	emailService := NewEmailService(cfg)
 	repositories := repository.NewRepository(app)
 	billingService := NewBillingService(cfg, repositories.Billing())
+	sharesService := NewSharesService(cfg, repositories.Shares(), billingService)
 	tokensService := NewTokensService(app, billingService)
 	usageService := NewUsageService(repositories.Tunnels(), repositories.Usage())
 	return &service{
@@ -61,5 +65,6 @@ func NewService(app *pocketbase.PocketBase, cfg *config.Config) I {
 		usageService:     usageService,
 		tokensService:    tokensService,
 		billingService:   billingService,
+		sharesService:    sharesService,
 	}
 }

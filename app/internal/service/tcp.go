@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/rand"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -60,6 +61,8 @@ type tunnelRegistrationRequest struct {
 	Arch            string `json:"arch,omitempty"`
 	Install         string `json:"install,omitempty"`
 	ReconnectReason string `json:"reconnect_reason,omitempty"`
+	ShareToken      string `json:"share_token,omitempty"`
+	ExpiresAt       int64  `json:"expires_at,omitempty"`
 }
 
 // registrationTimeout bounds the JSON handshake so a client that connects and
@@ -98,6 +101,9 @@ type tcpService struct {
 	tunnelIDs     map[string]string
 	sessionUsers  map[string]string
 	sessionCustom map[string]bool
+	sessionTypes  map[string]string
+	shareTokens   map[string]string
+	shareExpires  map[string]time.Time
 	sessionOrder  map[string]uint64
 	nextSession   uint64
 	app           core.App
@@ -171,6 +177,9 @@ func NewTCPService(app core.App, tunnels repository.TunnelsI, usage repository.U
 		tunnelIDs:     make(map[string]string),
 		sessionUsers:  make(map[string]string),
 		sessionCustom: make(map[string]bool),
+		sessionTypes:  make(map[string]string),
+		shareTokens:   make(map[string]string),
+		shareExpires:  make(map[string]time.Time),
 		sessionOrder:  make(map[string]uint64),
 		app:           app,
 		domain:        domain,
@@ -234,6 +243,9 @@ func (t *tcpService) Stop() {
 		delete(t.tunnelIDs, subdomain)
 		delete(t.sessionUsers, subdomain)
 		delete(t.sessionCustom, subdomain)
+		delete(t.sessionTypes, subdomain)
+		delete(t.shareTokens, subdomain)
+		delete(t.shareExpires, subdomain)
 		delete(t.sessionOrder, subdomain)
 	}
 	t.mu.Unlock()
@@ -282,6 +294,9 @@ func (t *tcpService) handleConnection(conn net.Conn) {
 			delete(t.tunnelIDs, subdomain)
 			delete(t.sessionUsers, subdomain)
 			delete(t.sessionCustom, subdomain)
+			delete(t.sessionTypes, subdomain)
+			delete(t.shareTokens, subdomain)
+			delete(t.shareExpires, subdomain)
 			delete(t.sessionOrder, subdomain)
 		}
 		t.mu.Unlock()
@@ -310,6 +325,21 @@ func (t *tcpService) handleConnection(conn net.Conn) {
 		t.sendRegistrationError(conn, "missing port")
 		return
 	}
+	req.Type = normalizedProtocol(req.Type)
+	if req.Type != "http" && req.Type != "tcp" && req.Type != "share" {
+		t.sendRegistrationError(conn, "unsupported tunnel type")
+		return
+	}
+	if req.Type == "share" {
+		if len(req.ShareToken) < 24 || strings.ContainsAny(req.ShareToken, "/\\") {
+			t.sendRegistrationError(conn, "invalid share token")
+			return
+		}
+		if req.ExpiresAt > 0 && req.ExpiresAt <= time.Now().Unix() {
+			t.sendRegistrationError(conn, "share expiration must be in the future")
+			return
+		}
+	}
 
 	createdSubdomain, tunnelID, userID, maxActiveTunnels, isCustom, err := t.resolveTunnel(req)
 	if err != nil {
@@ -318,7 +348,7 @@ func (t *tcpService) handleConnection(conn net.Conn) {
 		return
 	}
 	subdomain = createdSubdomain
-	if err := t.reserveSession(subdomain, tunnelID, userID, maxActiveTunnels, isCustom, conn); err != nil {
+	if err := t.reserveSession(subdomain, tunnelID, userID, maxActiveTunnels, isCustom, req, conn); err != nil {
 		t.sendRegistrationError(conn, err.Error())
 		return
 	}
@@ -327,6 +357,9 @@ func (t *tcpService) handleConnection(conn net.Conn) {
 	resp := tunnelRegistrationResponse{
 		Subdomain: subdomain,
 		URL:       fmt.Sprintf("https://%s.%s", subdomain, t.domain),
+	}
+	if req.Type == "share" {
+		resp.URL += "/s/" + req.ShareToken
 	}
 	if err := json.NewEncoder(conn).Encode(resp); err != nil {
 		log.Printf("failed to send tunnel registration response: %v", err)
@@ -463,6 +496,14 @@ func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (string, strin
 			return "", "", "", 0, false, fmt.Errorf("monthly traffic limit reached for Pro (%d GB)", limits.MonthlyBytes/(1024*1024*1024))
 		}
 		return "", "", "", 0, false, fmt.Errorf("monthly traffic limit reached for Free (%d GB); upgrade to Pro for %d GB", limits.MonthlyBytes/(1024*1024*1024), model.ProMonthlyBytes/(1024*1024*1024))
+	}
+	if req.Type == "share" && strings.TrimSpace(req.Resume) == "" {
+		subdomain, err := t.generateUniqueSubdomain()
+		if err != nil {
+			return "", "", "", 0, false, err
+		}
+		subdomain, tunnelID, err := t.saveTunnel(subdomain, false, userID, req.Port, req.Type)
+		return subdomain, tunnelID, userID, limits.MaxActiveTunnels, false, err
 	}
 
 	// A reconnecting CLI asks for the subdomain it already had, so a dropped
@@ -773,7 +814,7 @@ func sessionAnswers(session *yamux.Session, timeout time.Duration) bool {
 	}
 }
 
-func (t *tcpService) reserveSession(subdomain, tunnelID, userID string, maxActive int, isCustom bool, conn net.Conn) error {
+func (t *tcpService) reserveSession(subdomain, tunnelID, userID string, maxActive int, isCustom bool, req tunnelRegistrationRequest, conn net.Conn) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -787,6 +828,9 @@ func (t *tcpService) reserveSession(subdomain, tunnelID, userID string, maxActiv
 		delete(t.tunnelIDs, subdomain)
 		delete(t.sessionUsers, subdomain)
 		delete(t.sessionCustom, subdomain)
+		delete(t.sessionTypes, subdomain)
+		delete(t.shareTokens, subdomain)
+		delete(t.shareExpires, subdomain)
 		delete(t.sessionOrder, subdomain)
 	}
 
@@ -811,6 +855,13 @@ func (t *tcpService) reserveSession(subdomain, tunnelID, userID string, maxActiv
 	// subdomains became Pro-only are passed as false so their traffic flows on
 	// any plan.
 	t.sessionCustom[subdomain] = isCustom
+	t.sessionTypes[subdomain] = req.Type
+	if req.Type == "share" {
+		t.shareTokens[subdomain] = req.ShareToken
+		if req.ExpiresAt > 0 {
+			t.shareExpires[subdomain] = time.Unix(req.ExpiresAt, 0)
+		}
+	}
 	t.nextSession++
 	t.sessionOrder[subdomain] = t.nextSession
 	return nil
@@ -936,7 +987,23 @@ func (t *tcpService) HandleTunnelRequest(e *core.RequestEvent) (bool, error) {
 	tunnelID := t.tunnelIDs[subdomain]
 	userID := t.sessionUsers[subdomain]
 	isCustom := t.sessionCustom[subdomain]
+	sessionType := t.sessionTypes[subdomain]
+	shareToken := t.shareTokens[subdomain]
+	shareExpiry := t.shareExpires[subdomain]
 	t.mu.Unlock()
+	if strings.HasPrefix(e.Request.URL.Path, "/s/") {
+		if sessionType != "share" || !sharePathMatches(e.Request.URL.Path, shareToken) {
+			http.NotFound(e.Response, e.Request)
+			return true, nil
+		}
+	} else if sessionType == "share" {
+		http.NotFound(e.Response, e.Request)
+		return true, nil
+	}
+	if !shareExpiry.IsZero() && !time.Now().Before(shareExpiry) {
+		http.Error(e.Response, "This share has expired.", http.StatusGone)
+		return true, nil
+	}
 
 	if session == nil || session.IsClosed() || tunnelID == "" {
 		http.Error(e.Response, "tunnel is not connected", http.StatusBadGateway)
@@ -1017,6 +1084,17 @@ func (t *tcpService) HandleTunnelRequest(e *core.RequestEvent) (bool, error) {
 	}
 	t.recordTraffic(tunnelID, subdomain, userID, written+maxInt64(outReq.ContentLength, 0))
 	return true, nil
+}
+
+func sharePathMatches(requestPath, token string) bool {
+	if token == "" {
+		return false
+	}
+	prefix := "/s/" + token
+	if len(requestPath) < len(prefix) || subtle.ConstantTimeCompare([]byte(requestPath[:len(prefix)]), []byte(prefix)) != 1 {
+		return false
+	}
+	return len(requestPath) == len(prefix) || requestPath[len(prefix)] == '/'
 }
 
 func (t *tcpService) sessionWithinPlanLimit(subdomain, userID string, maxActive int) bool {

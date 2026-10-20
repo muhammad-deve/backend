@@ -34,11 +34,25 @@ type BillingI interface {
 	FindUserIDByEmail(email string) (string, error)
 }
 
+type SharesI interface {
+	Create(record model.ShareRecord) (*model.ShareRecord, error)
+	ListOwned(userID string) ([]model.ShareRecord, error)
+	GetOwned(userID, id string) (*model.ShareRecord, error)
+	GetByTokenHash(hash string) (*model.ShareRecord, error)
+	Update(id string, expiresAt time.Time, passwordHash *string) (*model.ShareRecord, error)
+	SetRevoked(id string, revoked bool) error
+	Delete(id string) error
+	AddDownload(id string) error
+	StorageUsed(userID string) (int64, error)
+	Expired(before time.Time, limit int) ([]model.ShareRecord, error)
+}
+
 type I interface {
 	Authorization() AuthorizationI
 	Tunnels() TunnelsI
 	Usage() UsageI
 	Billing() BillingI
+	Shares() SharesI
 }
 
 type repository struct {
@@ -46,6 +60,7 @@ type repository struct {
 	tunnels TunnelsI
 	usage   UsageI
 	billing BillingI
+	shares  SharesI
 }
 
 func (r *repository) Authorization() AuthorizationI {
@@ -61,6 +76,7 @@ func (r *repository) Usage() UsageI {
 }
 
 func (r *repository) Billing() BillingI { return r.billing }
+func (r *repository) Shares() SharesI   { return r.shares }
 
 func NewRepository(app core.App) I {
 	return &repository{
@@ -68,5 +84,6 @@ func NewRepository(app core.App) I {
 		tunnels:        sqlite.NewTunnels(app),
 		usage:          sqlite.NewUsage(app),
 		billing:        sqlite.NewBilling(app),
+		shares:         sqlite.NewShares(app),
 	}
 }

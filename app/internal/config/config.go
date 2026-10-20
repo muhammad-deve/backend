@@ -26,6 +26,13 @@ type Config struct {
 	LemonSqueezyAPIURL              string `env:"LEMON_SQUEEZY_API_URL" env-default:"https://api.lemonsqueezy.com/v1"`
 	LemonSqueezyMonthlyAmountCents  int64  `env:"LEMON_SQUEEZY_MONTHLY_AMOUNT_CENTS" env-default:"299"`
 	LemonSqueezyYearlyAmountCents   int64  `env:"LEMON_SQUEEZY_YEARLY_AMOUNT_CENTS" env-default:"1999"`
+	ShareStorageDir                 string `env:"SHARE_STORAGE_DIR" env-default:"./pb_data/shares"`
+	ShareSigningKey                 string `env:"SHARE_SIGNING_KEY"`
+	ShareMaxUploadBytes             int64  `env:"SHARE_MAX_UPLOAD_BYTES" env-default:"104857600"`
+	ShareFreeStorageBytes           int64  `env:"SHARE_FREE_STORAGE_BYTES" env-default:"262144000"`
+	ShareProStorageBytes            int64  `env:"SHARE_PRO_STORAGE_BYTES" env-default:"5368709120"`
+	ShareDefaultRetentionHours      int    `env:"SHARE_DEFAULT_RETENTION_HOURS" env-default:"168"`
+	ShareMaxRetentionHours          int    `env:"SHARE_MAX_RETENTION_HOURS" env-default:"720"`
 }
 
 var instance *Config
@@ -62,6 +69,9 @@ func GetConfig() *Config {
 		}
 		if instance.LemonSqueezyKey == "" || instance.LemonSqueezyStoreID == "" || instance.LemonSqueezyWebhookSecret == "" {
 			log.Print("WARNING: Lemon Squeezy billing is not fully configured")
+		}
+		if len(instance.ShareSigningKey) < 32 {
+			log.Print("WARNING: SHARE_SIGNING_KEY should contain at least 32 random bytes before enabling cloud sharing")
 		}
 	})
 	return instance

@@ -11,4 +11,5 @@ const (
 	TokensCollection               = "tokens"
 	BillingSubscriptionsCollection = "billing_subscriptions"
 	BillingTransactionsCollection  = "billing_transactions"
+	SharesCollection               = "shares"
 )
