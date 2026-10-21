@@ -349,6 +349,9 @@ func (h *Handler) serveShareFile(e *core.RequestEvent, token string, inline, cou
 	contentType, disposition := "application/octet-stream", "attachment"
 	if inline {
 		contentType, disposition = record.MIMEType, "inline"
+		if service.IsHTMLType(record.MIMEType) {
+			e.Response.Header().Set("Content-Security-Policy", shareHTMLPolicy+"; frame-ancestors "+h.frameAncestors())
+		}
 	}
 	e.Response.Header().Set("Content-Type", contentType)
 	e.Response.Header().Set("Content-Disposition", contentDisposition(disposition, record.Filename))
@@ -416,11 +419,7 @@ func (h *Handler) publicShareError(e *core.RequestEvent, err error) error {
 func (h *Handler) publicShareHeaders(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Referrer-Policy", "no-referrer")
-	frameOrigin := "'self'"
-	if appURL, err := url.Parse(h.cfg.AppURL); err == nil && appURL.Scheme != "" && appURL.Host != "" {
-		frameOrigin += " " + appURL.Scheme + "://" + appURL.Host
-	}
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; frame-ancestors "+frameOrigin+"; object-src 'none'")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; frame-ancestors "+h.frameAncestors()+"; object-src 'none'")
 	w.Header().Add("Vary", "Origin")
 	if origin := r.Header.Get("Origin"); origin != "" && strings.TrimRight(origin, "/") == strings.TrimRight(h.cfg.AppURL, "/") {
 		w.Header().Set("Access-Control-Allow-Origin", origin)
@@ -428,6 +427,32 @@ func (h *Handler) publicShareHeaders(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Expose-Headers", "Retry-After, Content-Length, Content-Range")
 	}
 }
+
+// frameAncestors lists who may frame a shared file: the API itself and the
+// site, whose share page shows the preview.
+func (h *Handler) frameAncestors() string {
+	origins := "'self'"
+	if appURL, err := url.Parse(h.cfg.AppURL); err == nil && appURL.Scheme != "" && appURL.Host != "" {
+		origins += " " + appURL.Scheme + "://" + appURL.Host
+	}
+	return origins
+}
+
+// shareHTMLPolicy is how a shared web page is served, both in the share page
+// preview and through a direct link on goport.uz.
+//
+// "sandbox" without allow-same-origin gives the page an opaque origin even
+// when it is opened on its own: its scripts can't read goport.uz storage
+// (where the dashboard keeps the login token) or any GoPort cookie. Forms
+// can't be submitted (no allow-forms, form-action 'none'), and the page can't
+// navigate the window it is framed in. Scripts, styles, images and fonts may
+// load, so ordinary pages, including ones built from CDN libraries, still
+// render; links may open new tabs.
+const shareHTMLPolicy = "sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox; " +
+	"default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' https: data: blob:; " +
+	"style-src 'unsafe-inline' https: data:; img-src data: blob: https:; font-src data: https:; " +
+	"media-src data: blob: https:; connect-src https:; frame-src https:; worker-src blob:; " +
+	"form-action 'none'; base-uri 'none'; object-src 'none'"
 
 func parseShareExpiration(value string) (time.Time, error) {
 	value = strings.TrimSpace(value)

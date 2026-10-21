@@ -20,12 +20,12 @@ func TestShareFilenameAndTypeSafety(t *testing.T) {
 	if got := sanitizeFilename(`C:\Users\me\report.pdf`); got != "report.pdf" {
 		t.Fatalf("sanitizeFilename = %q", got)
 	}
-	for _, name := range []string{"payload.html", "vector.svg", "run.exe", "script.js"} {
+	for _, name := range []string{"vector.svg", "run.exe", "script.js"} {
 		if allowedUpload(name) {
 			t.Errorf("dangerous upload %q was allowed", name)
 		}
 	}
-	for _, name := range []string{"report.pdf", "archive.zip", "photo.png", "document.docx"} {
+	for _, name := range []string{"report.pdf", "archive.zip", "photo.png", "document.docx", "page.html", "old.HTM"} {
 		if !allowedUpload(name) {
 			t.Errorf("ordinary upload %q was rejected", name)
 		}

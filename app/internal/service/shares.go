@@ -204,7 +204,7 @@ func (s *sharesService) Create(userID, filename string, source io.Reader, expire
 	defer os.Remove(temporaryName)
 	reader := bufio.NewReader(source)
 	sniff, _ := reader.Peek(512)
-	mimeType := http.DetectContentType(sniff)
+	mimeType := detectShareType(filename, sniff)
 	if !allowedMIME(filename, mimeType) {
 		temporary.Close()
 		return nil, ErrShareType
@@ -341,7 +341,7 @@ func (s *sharesService) WriteUploadChunk(userID, uploadID string, offset int64, 
 	reader := bufio.NewReader(io.LimitReader(body, limit+1))
 	if offset == 0 {
 		sniff, _ := reader.Peek(512)
-		mimeType := http.DetectContentType(sniff)
+		mimeType := detectShareType(session.filename, sniff)
 		if !allowedMIME(session.filename, mimeType) {
 			s.dropUpload(session)
 			return 0, ErrShareType
@@ -897,22 +897,54 @@ func sanitizeFilename(name string) string {
 
 func allowedUpload(name string) bool {
 	switch strings.ToLower(filepath.Ext(name)) {
-	case ".html", ".htm", ".svg", ".js", ".mjs", ".exe", ".dll", ".com", ".bat", ".cmd", ".ps1", ".sh", ".msi", ".apk":
+	case ".svg", ".js", ".mjs", ".exe", ".dll", ".com", ".bat", ".cmd", ".ps1", ".sh", ".msi", ".apk":
 		return false
 	}
 	return filepath.Ext(name) != ""
 }
 
+func isHTMLName(name string) bool {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".html", ".htm":
+		return true
+	}
+	return false
+}
+
+// detectShareType sniffs a file's type. An .html file is always stored as
+// HTML when its content is text, since a page that starts with an unusual tag
+// sniffs as plain text.
+func detectShareType(name string, head []byte) string {
+	sniffed := http.DetectContentType(head)
+	if isHTMLName(name) && strings.HasPrefix(sniffed, "text/") {
+		return "text/html; charset=utf-8"
+	}
+	return sniffed
+}
+
+// allowedMIME refuses active formats. HTML is accepted only under an .html
+// or .htm name, because it is served in a sandbox (see isHTMLType); HTML
+// disguised as another type would bypass that.
 func allowedMIME(name, value string) bool {
 	if !allowedUpload(name) {
 		return false
 	}
 	lower := strings.ToLower(value)
-	return !strings.Contains(lower, "text/html") && !strings.Contains(lower, "javascript") && !strings.Contains(lower, "svg") && !strings.Contains(lower, "executable")
+	if strings.Contains(lower, "text/html") {
+		return isHTMLName(name)
+	}
+	return !strings.Contains(lower, "javascript") && !strings.Contains(lower, "svg") && !strings.Contains(lower, "executable")
+}
+
+// IsHTMLType reports whether a stored type is a web page, which must only
+// ever be served inline with the sandbox policy.
+func IsHTMLType(value string) bool {
+	return strings.HasPrefix(strings.ToLower(value), "text/html")
 }
 
 func safePreview(value string) bool {
 	return strings.HasPrefix(value, "image/png") || strings.HasPrefix(value, "image/jpeg") ||
 		strings.HasPrefix(value, "image/gif") || strings.HasPrefix(value, "image/webp") ||
-		strings.HasPrefix(value, "application/pdf") || strings.HasPrefix(value, "text/plain")
+		strings.HasPrefix(value, "application/pdf") || strings.HasPrefix(value, "text/plain") ||
+		IsHTMLType(value)
 }

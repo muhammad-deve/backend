@@ -85,8 +85,8 @@ func TestChunkedUploadChecksPlanBeforeSendingBytes(t *testing.T) {
 	if _, err := free.StartUpload("owner", model.StartShareUploadRequest{Filename: "cert.pdf", Size: 10, Direct: true}, time.Time{}); !errors.Is(err, ErrShareDirectPro) {
 		t.Fatalf("free direct link error = %v", err)
 	}
-	if _, err := free.StartUpload("owner", model.StartShareUploadRequest{Filename: "page.html", Size: 10}, time.Time{}); !errors.Is(err, ErrShareType) {
-		t.Fatalf("html upload error = %v", err)
+	if _, err := free.StartUpload("owner", model.StartShareUploadRequest{Filename: "logo.svg", Size: 10}, time.Time{}); !errors.Is(err, ErrShareType) {
+		t.Fatalf("svg upload error = %v", err)
 	}
 	// Uploads in progress count against the quota.
 	if _, err := free.StartUpload("owner", model.StartShareUploadRequest{Filename: "a.zip", Size: 60}, time.Time{}); err != nil {
@@ -275,5 +275,31 @@ func TestExpiryFollowsThePlan(t *testing.T) {
 	pro := newTestShares(t, true)
 	if _, err := pro.StartUpload("owner", model.StartShareUploadRequest{Filename: "a.pdf", Size: 10}, time.Now().Add(20*24*time.Hour)); err != nil {
 		t.Fatalf("pro twenty-day expiry refused: %v", err)
+	}
+}
+
+func TestHTMLFilesAreAcceptedOnlyUnderHTMLNames(t *testing.T) {
+	shares := newTestShares(t, true)
+	page := "<!DOCTYPE html><html><body><h1>Report</h1><script>draw()</script></body></html>"
+	item, err := shares.Create("owner", "report.html", strings.NewReader(page), time.Time{}, "", false)
+	if err != nil {
+		t.Fatalf("html upload refused: %v", err)
+	}
+	if !IsHTMLType(item.MIMEType) || !item.Previewable {
+		t.Fatalf("html item = %#v", item)
+	}
+	// A page that starts with an unusual tag still counts as HTML.
+	item, err = shares.Create("owner", "fragment.htm", strings.NewReader("<section>hello</section>"), time.Time{}, "", false)
+	if err != nil || !IsHTMLType(item.MIMEType) {
+		t.Fatalf("fragment = %#v, %v", item, err)
+	}
+	// HTML under any other name is still refused, so it can't dodge the sandbox.
+	for _, name := range []string{"notes.txt", "invoice.pdf", "photo.png"} {
+		if _, err := shares.Create("owner", name, strings.NewReader(page), time.Time{}, "", false); !errors.Is(err, ErrShareType) {
+			t.Errorf("html named %s error = %v", name, err)
+		}
+	}
+	if _, err := shares.Create("owner", "logo.svg", strings.NewReader("<svg></svg>"), time.Time{}, "", false); !errors.Is(err, ErrShareType) {
+		t.Fatalf("svg error = %v", err)
 	}
 }
