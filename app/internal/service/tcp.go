@@ -33,6 +33,7 @@ type TCPI interface {
 	Start() error
 	Stop()
 	HandleTunnelRequest(e *core.RequestEvent) (bool, error)
+	IsTunnelHost(host string) bool
 	StopTunnel(userID, subdomain string) error
 	DeleteTunnel(userID, subdomain string) error
 }
@@ -1465,6 +1466,13 @@ func isClosedErr(err error) bool {
 	return strings.Contains(msg, "use of closed network connection") ||
 		strings.Contains(msg, "broken pipe") ||
 		strings.Contains(msg, "connection reset by peer")
+}
+
+// IsTunnelHost reports whether host is a tunnel subdomain rather than the
+// site or API itself.
+func (t *tcpService) IsTunnelHost(host string) bool {
+	_, ok := t.subdomainFromHost(host)
+	return ok
 }
 
 func (t *tcpService) subdomainFromHost(host string) (string, bool) {

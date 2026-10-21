@@ -2,11 +2,10 @@ package handler
 
 import (
 	"log/slog"
-	"sync"
-	"time"
 
 	"github.com/pocketbase/pocketbase/apis"
 	"github.com/pocketbase/pocketbase/core"
+	"github.com/pocketbase/pocketbase/tools/hook"
 	"github.com/pocketbase/pocketbase/tools/router"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/config"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/service"
@@ -18,10 +17,19 @@ type Handler struct {
 	cfg            *config.Config
 	shareUploads   chan struct{}
 	shareDownloads chan struct{}
-	shareAttempts  *shareAttemptLimiter
+	sharePasswords *sharePasswordGuard
+	shareUploaders *shareUploaderLimit
 }
 
 func (h *Handler) Register(router *router.Router[*core.RequestEvent]) {
+	// Runs just before PocketBase's CORS middleware, which would otherwise
+	// answer these preflights itself.
+	router.Bind(&hook.Handler[*core.RequestEvent]{
+		Id:       "goportPublicSharePreflight",
+		Priority: apis.DefaultCorsMiddlewarePriority - 1,
+		Func:     h.publicSharePreflight,
+	})
+
 	router.BindFunc(func(e *core.RequestEvent) error {
 		handled, err := h.service.TCP().HandleTunnelRequest(e)
 		if handled || err != nil {
@@ -78,8 +86,13 @@ func (h *Handler) Register(router *router.Router[*core.RequestEvent]) {
 			shares.Bind(apis.RequireAuth("users"))
 			shares.GET("", h.ListSharesHandler)
 			shares.POST("", h.UploadShareHandler)
+			shares.POST("/uploads", h.StartShareUploadHandler)
+			shares.PUT("/uploads/{id}", h.ShareUploadChunkHandler)
+			shares.POST("/uploads/{id}/complete", h.CompleteShareUploadHandler)
+			shares.DELETE("/uploads/{id}", h.CancelShareUploadHandler)
 			shares.PATCH("/{id}", h.UpdateShareHandler)
 			shares.POST("/{id}/revoke", h.RevokeShareHandler)
+			shares.POST("/{id}/restore", h.RestoreShareHandler)
 			shares.DELETE("/{id}", h.DeleteShareHandler)
 		}
 
@@ -88,10 +101,13 @@ func (h *Handler) Register(router *router.Router[*core.RequestEvent]) {
 			publicShares.OPTIONS("/{token}", h.PublicShareOptionsHandler)
 			publicShares.OPTIONS("/{token}/unlock", h.PublicShareOptionsHandler)
 			publicShares.OPTIONS("/{token}/content", h.PublicShareOptionsHandler)
+			publicShares.OPTIONS("/{token}/raw", h.PublicShareOptionsHandler)
 			publicShares.GET("/{token}", h.PublicShareHandler)
 			publicShares.POST("/{token}/unlock", h.UnlockShareHandler)
 			publicShares.GET("/{token}/content", h.ShareContentHandler)
 			publicShares.HEAD("/{token}/content", h.ShareContentHandler)
+			publicShares.GET("/{token}/raw", h.ShareRawHandler)
+			publicShares.HEAD("/{token}/raw", h.ShareRawHandler)
 		}
 
 		api.POST("/billing/webhook", h.LemonSqueezyWebhookHandler)
@@ -107,10 +123,5 @@ func (h *Handler) Register(router *router.Router[*core.RequestEvent]) {
 }
 
 func NewHandler(logger *slog.Logger, service service.I, cfg *config.Config) *Handler {
-	return &Handler{logger: logger, service: service, cfg: cfg, shareUploads: make(chan struct{}, 2), shareDownloads: make(chan struct{}, 32), shareAttempts: &shareAttemptLimiter{hits: make(map[string][]time.Time)}}
-}
-
-type shareAttemptLimiter struct {
-	mu   sync.Mutex
-	hits map[string][]time.Time
+	return &Handler{logger: logger, service: service, cfg: cfg, shareUploads: make(chan struct{}, 2), shareDownloads: make(chan struct{}, 32), sharePasswords: newSharePasswordGuard(), shareUploaders: newShareUploaderLimit(cfg.ShareFreeUploadersPerIP)}
 }

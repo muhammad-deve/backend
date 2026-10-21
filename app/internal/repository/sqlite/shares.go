@@ -28,6 +28,7 @@ func (r *Shares) Create(value model.ShareRecord) (*model.ShareRecord, error) {
 	record.Set("size", value.Size)
 	record.Set("expires_at", value.ExpiresAt.Format(types.DefaultDateLayout))
 	record.Set("password_hash", value.PasswordHash)
+	record.Set("direct", value.Direct)
 	if err := r.app.Save(record); err != nil {
 		return nil, err
 	}
@@ -59,7 +60,7 @@ func (r *Shares) GetByTokenHash(hash string) (*model.ShareRecord, error) {
 	}
 	return shareRecord(record), nil
 }
-func (r *Shares) Update(id string, expiresAt time.Time, passwordHash *string) (*model.ShareRecord, error) {
+func (r *Shares) Update(id string, expiresAt time.Time, passwordHash *string, direct *bool) (*model.ShareRecord, error) {
 	record, err := r.app.FindRecordById(model.SharesCollection, id)
 	if err != nil {
 		return nil, err
@@ -67,6 +68,9 @@ func (r *Shares) Update(id string, expiresAt time.Time, passwordHash *string) (*
 	record.Set("expires_at", expiresAt.Format(types.DefaultDateLayout))
 	if passwordHash != nil {
 		record.Set("password_hash", *passwordHash)
+	}
+	if direct != nil {
+		record.Set("direct", *direct)
 	}
 	if err := r.app.Save(record); err != nil {
 		return nil, err
@@ -99,6 +103,15 @@ func (r *Shares) StorageUsed(userID string) (int64, error) {
 	err := r.app.DB().NewQuery("SELECT COALESCE(SUM(size), 0) AS total FROM shares WHERE owner = {:owner}").Bind(dbx.Params{"owner": userID}).One(&row)
 	return row.Total, err
 }
+
+// TotalStorageUsed is the size of every stored share, across all users.
+func (r *Shares) TotalStorageUsed() (int64, error) {
+	var row struct {
+		Total int64 `db:"total"`
+	}
+	err := r.app.DB().NewQuery("SELECT COALESCE(SUM(size), 0) AS total FROM shares").One(&row)
+	return row.Total, err
+}
 func (r *Shares) Expired(before time.Time, limit int) ([]model.ShareRecord, error) {
 	records, err := r.app.FindRecordsByFilter(model.SharesCollection, "expires_at <= {:before}", "expires_at", limit, 0, dbx.Params{"before": before.Format(types.DefaultDateLayout)})
 	if err != nil {
@@ -112,5 +125,5 @@ func (r *Shares) Expired(before time.Time, limit int) ([]model.ShareRecord, erro
 }
 
 func shareRecord(record *core.Record) *model.ShareRecord {
-	return &model.ShareRecord{ID: record.Id, OwnerID: record.GetString("owner"), TokenHash: record.GetString("token_hash"), TokenCipher: record.GetString("token_cipher"), StorageKey: record.GetString("storage_key"), Filename: record.GetString("filename"), MIMEType: record.GetString("mime_type"), Size: int64(record.GetFloat("size")), ExpiresAt: record.GetDateTime("expires_at").Time(), Revoked: record.GetBool("revoked"), PasswordHash: record.GetString("password_hash"), Downloads: int64(record.GetFloat("downloads")), Created: record.GetDateTime("created").Time()}
+	return &model.ShareRecord{ID: record.Id, OwnerID: record.GetString("owner"), TokenHash: record.GetString("token_hash"), TokenCipher: record.GetString("token_cipher"), StorageKey: record.GetString("storage_key"), Filename: record.GetString("filename"), MIMEType: record.GetString("mime_type"), Size: int64(record.GetFloat("size")), ExpiresAt: record.GetDateTime("expires_at").Time(), Revoked: record.GetBool("revoked"), PasswordHash: record.GetString("password_hash"), Direct: record.GetBool("direct"), Downloads: int64(record.GetFloat("downloads")), Created: record.GetDateTime("created").Time()}
 }

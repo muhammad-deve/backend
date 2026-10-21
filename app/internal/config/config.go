@@ -28,11 +28,19 @@ type Config struct {
 	LemonSqueezyYearlyAmountCents   int64  `env:"LEMON_SQUEEZY_YEARLY_AMOUNT_CENTS" env-default:"1999"`
 	ShareStorageDir                 string `env:"SHARE_STORAGE_DIR" env-default:"./pb_data/shares"`
 	ShareSigningKey                 string `env:"SHARE_SIGNING_KEY"`
-	ShareMaxUploadBytes             int64  `env:"SHARE_MAX_UPLOAD_BYTES" env-default:"104857600"`
-	ShareFreeStorageBytes           int64  `env:"SHARE_FREE_STORAGE_BYTES" env-default:"262144000"`
-	ShareProStorageBytes            int64  `env:"SHARE_PRO_STORAGE_BYTES" env-default:"5368709120"`
-	ShareDefaultRetentionHours      int    `env:"SHARE_DEFAULT_RETENTION_HOURS" env-default:"168"`
-	ShareMaxRetentionHours          int    `env:"SHARE_MAX_RETENTION_HOURS" env-default:"720"`
+	// Cloud file sharing. Free and Pro have separate limits; the total cap
+	// protects the shared server disk however many accounts exist.
+	ShareTotalStorageBytes         int64 `env:"SHARE_TOTAL_STORAGE_BYTES" env-default:"21474836480"`
+	ShareFreeStorageBytes          int64 `env:"SHARE_FREE_STORAGE_BYTES" env-default:"104857600"`
+	ShareFreeMaxUploadBytes        int64 `env:"SHARE_FREE_MAX_UPLOAD_BYTES" env-default:"26214400"`
+	ShareFreeDefaultRetentionHours int   `env:"SHARE_FREE_DEFAULT_RETENTION_HOURS" env-default:"24"`
+	ShareFreeMaxRetentionHours     int   `env:"SHARE_FREE_MAX_RETENTION_HOURS" env-default:"72"`
+	ShareFreeMaxDownloads          int64 `env:"SHARE_FREE_MAX_DOWNLOADS" env-default:"100"`
+	ShareFreeUploadersPerIP        int   `env:"SHARE_FREE_UPLOADERS_PER_IP" env-default:"5"`
+	ShareProStorageBytes           int64 `env:"SHARE_PRO_STORAGE_BYTES" env-default:"5368709120"`
+	ShareProMaxUploadBytes         int64 `env:"SHARE_PRO_MAX_UPLOAD_BYTES" env-default:"524288000"`
+	ShareProDefaultRetentionHours  int   `env:"SHARE_PRO_DEFAULT_RETENTION_HOURS" env-default:"168"`
+	ShareProMaxRetentionHours      int   `env:"SHARE_PRO_MAX_RETENTION_HOURS" env-default:"720"`
 }
 
 var instance *Config

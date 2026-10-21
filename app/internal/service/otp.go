@@ -11,6 +11,7 @@ import (
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/security"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/model"
+	"gitlab.yurtal.tech/company/pocketbase-app-template/pkg/disposable"
 )
 
 // errRateLimited is returned internally when a send is throttled. The handler
@@ -45,6 +46,10 @@ func IsRateLimited(err error) (*errRateLimited, bool) {
 // already has a completed (verified) account.
 var ErrEmailRegistered = errors.New("this email is already registered")
 
+// ErrDisposableEmail is returned for throwaway ("temp mail") addresses, which
+// would otherwise let one person open unlimited accounts.
+var ErrDisposableEmail = errors.New("disposable email addresses are not accepted")
+
 type OTPI interface {
 	SendOTP(req *model.SendOTPRequest) (*model.SendOTPResponse, error)
 	VerifyOTP(req *model.VerifyOTPRequest) (*model.VerifyOTPResponse, error)
@@ -75,6 +80,9 @@ func (s *otpService) SendOTP(req *model.SendOTPRequest) (*model.SendOTPResponse,
 	email := strings.ToLower(strings.TrimSpace(req.Email))
 	if email == "" || !strings.Contains(email, "@") {
 		return nil, fmt.Errorf("a valid email is required")
+	}
+	if disposable.Email(email) {
+		return nil, ErrDisposableEmail
 	}
 	name := strings.TrimSpace(req.Name)
 

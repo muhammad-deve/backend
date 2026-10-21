@@ -24,6 +24,8 @@ func (h *Handler) SendOTPHandler(e *core.RequestEvent) error {
 		switch {
 		case errors.Is(err, service.ErrEmailRegistered):
 			return h.NewErrorResponse(e, http.StatusConflict, "This email is already registered. Please log in instead.")
+		case errors.Is(err, service.ErrDisposableEmail):
+			return h.NewErrorResponse(e, http.StatusBadRequest, disposableEmailMessage)
 		default:
 			if rl, ok := service.IsRateLimited(err); ok {
 				e.Response.Header().Set("Retry-After", strconv.Itoa(rl.RetryAfterSeconds()))
@@ -107,3 +109,5 @@ func (h *Handler) ResetPasswordHandler(e *core.RequestEvent) error {
 
 	return h.NewSuccessResponse(e, http.StatusOK, resp)
 }
+
+const disposableEmailMessage = "Temporary email addresses can't be used. Please use your regular email."

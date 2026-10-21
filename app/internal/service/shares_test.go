@@ -68,10 +68,10 @@ func TestCloudShareLifecycleOwnershipAndQuota(t *testing.T) {
 	storage := t.TempDir()
 	repo := &memoryShares{records: make(map[string]model.ShareRecord)}
 	service := &sharesService{
-		cfg:  &config.Config{AppURL: "https://goport.test", ShareMaxUploadBytes: 1024, ShareFreeStorageBytes: 32, ShareProStorageBytes: 64, ShareDefaultRetentionHours: 24, ShareMaxRetentionHours: 48},
+		cfg:  &config.Config{AppURL: "https://goport.test", ShareFreeMaxUploadBytes: 1024, ShareFreeStorageBytes: 32, ShareProStorageBytes: 64, ShareFreeDefaultRetentionHours: 24, ShareFreeMaxRetentionHours: 48, ShareProDefaultRetentionHours: 24, ShareProMaxRetentionHours: 48},
 		repo: repo, billing: fakeShareBilling{}, storageDir: storage, cryptKey: [32]byte{9, 8, 7}, uploads: make(chan struct{}, 2),
 	}
-	created, err := service.Create("owner", "report.pdf", strings.NewReader("%PDF-cloud-file"), time.Now().Add(time.Hour), "strong password")
+	created, err := service.Create("owner", "report.pdf", strings.NewReader("%PDF-cloud-file"), time.Now().Add(time.Hour), "strong password", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +109,7 @@ func TestCloudShareLifecycleOwnershipAndQuota(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(storage, record.StorageKey)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("stored object still exists: %v", err)
 	}
-	if _, err := service.Create("owner", "large.zip", strings.NewReader(strings.Repeat("x", 33)), time.Now().Add(time.Hour), ""); !errors.Is(err, ErrShareQuota) {
+	if _, err := service.Create("owner", "large.zip", strings.NewReader(strings.Repeat("x", 33)), time.Now().Add(time.Hour), "", false); !errors.Is(err, ErrShareQuota) {
 		t.Fatalf("quota error = %v", err)
 	}
 }
@@ -162,7 +162,7 @@ func (r *memoryShares) GetByTokenHash(hash string) (*model.ShareRecord, error) {
 	}
 	return nil, ErrShareNotFound
 }
-func (r *memoryShares) Update(id string, expires time.Time, password *string) (*model.ShareRecord, error) {
+func (r *memoryShares) Update(id string, expires time.Time, password *string, direct *bool) (*model.ShareRecord, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	record, ok := r.records[id]
@@ -172,6 +172,9 @@ func (r *memoryShares) Update(id string, expires time.Time, password *string) (*
 	record.ExpiresAt = expires
 	if password != nil {
 		record.PasswordHash = *password
+	}
+	if direct != nil {
+		record.Direct = *direct
 	}
 	r.records[id] = record
 	copy := record
@@ -202,6 +205,15 @@ func (r *memoryShares) AddDownload(id string) error {
 	r.records[id] = record
 	return nil
 }
+func (r *memoryShares) TotalStorageUsed() (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var total int64
+	for _, record := range r.records {
+		total += record.Size
+	}
+	return total, nil
+}
 func (r *memoryShares) StorageUsed(userID string) (int64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -217,10 +229,15 @@ func (r *memoryShares) Expired(before time.Time, limit int) ([]model.ShareRecord
 	return nil, nil
 }
 
-type fakeShareBilling struct{}
+type fakeShareBilling struct{ pro bool }
 
 func (fakeShareBilling) Get(string) (*model.BillingData, error) { return nil, nil }
-func (fakeShareBilling) Plan(string) (model.PlanLimits, error)  { return model.FreePlanLimits(), nil }
+func (b fakeShareBilling) Plan(string) (model.PlanLimits, error) {
+	if b.pro {
+		return model.ProPlanLimits(), nil
+	}
+	return model.FreePlanLimits(), nil
+}
 func (fakeShareBilling) CreateCheckout(context.Context, *core.Record, string) (*model.CheckoutResponse, error) {
 	return nil, nil
 }

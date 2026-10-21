@@ -11,6 +11,7 @@ import (
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/security"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/model"
+	"gitlab.yurtal.tech/company/pocketbase-app-template/pkg/disposable"
 )
 
 var (
@@ -45,6 +46,9 @@ func (s *accountService) RequestEmailChange(user *core.Record, req *model.Reques
 	}
 	if strings.EqualFold(email, user.Email()) {
 		return nil, fmt.Errorf("enter a different email address")
+	}
+	if disposable.Email(email) {
+		return nil, ErrDisposableEmail
 	}
 
 	usersCollection, err := s.app.FindCollectionByNameOrId(model.UsersCollection)

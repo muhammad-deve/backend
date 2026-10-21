@@ -39,11 +39,12 @@ type SharesI interface {
 	ListOwned(userID string) ([]model.ShareRecord, error)
 	GetOwned(userID, id string) (*model.ShareRecord, error)
 	GetByTokenHash(hash string) (*model.ShareRecord, error)
-	Update(id string, expiresAt time.Time, passwordHash *string) (*model.ShareRecord, error)
+	Update(id string, expiresAt time.Time, passwordHash *string, direct *bool) (*model.ShareRecord, error)
 	SetRevoked(id string, revoked bool) error
 	Delete(id string) error
 	AddDownload(id string) error
 	StorageUsed(userID string) (int64, error)
+	TotalStorageUsed() (int64, error)
 	Expired(before time.Time, limit int) ([]model.ShareRecord, error)
 }
 

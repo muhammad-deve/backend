@@ -28,6 +28,9 @@ func (h *Handler) RequestEmailChangeHandler(e *core.RequestEvent) error {
 		if errors.Is(err, service.ErrEmailTaken) {
 			return h.NewErrorResponse(e, http.StatusConflict, "This email is already in use.")
 		}
+		if errors.Is(err, service.ErrDisposableEmail) {
+			return h.NewErrorResponse(e, http.StatusBadRequest, disposableEmailMessage)
+		}
 		h.logger.Error("failed to request email change", "error", err, "userId", e.Auth.Id)
 		return h.NewErrorResponse(e, http.StatusBadRequest, err.Error())
 	}
