@@ -36,15 +36,19 @@ type BillingI interface {
 
 type SharesI interface {
 	Create(record model.ShareRecord) (*model.ShareRecord, error)
-	ListOwned(userID string) ([]model.ShareRecord, error)
+	// ListOwned returns an owner's newest shares, at most limit of them.
+	ListOwned(userID string, limit int) ([]model.ShareRecord, error)
 	GetOwned(userID, id string) (*model.ShareRecord, error)
 	GetByTokenHash(hash string) (*model.ShareRecord, error)
 	Update(id string, expiresAt time.Time, passwordHash *string, direct *bool) (*model.ShareRecord, error)
 	SetRevoked(id string, revoked bool) error
 	Delete(id string) error
 	AddDownload(id string) error
-	StorageUsed(userID string) (int64, error)
-	TotalStorageUsed() (int64, error)
+	// Usage is what an owner's files count against their plan: bytes, with
+	// each file counted as at least minBytes, and the number of files.
+	Usage(userID string, minBytes int64) (bytes int64, files int64, err error)
+	// TotalStorageUsed is Usage's byte count across all owners.
+	TotalStorageUsed(minBytes int64) (int64, error)
 	Expired(before time.Time, limit int) ([]model.ShareRecord, error)
 	// TokenCiphers pages through shares by id, filling only ID and
 	// TokenCipher.

@@ -79,3 +79,20 @@ func TestShareTokenCiphersPageAndSwap(t *testing.T) {
 		}
 	}
 }
+
+func TestShareUsageCountsFilesAndASmallestSize(t *testing.T) {
+	_, repo, owner := newShareTestApp(t, 1, 10_000, 100)
+	used, files, err := repo.Usage(owner, 4096)
+	if err != nil || used != 4096+10_000+4096 || files != 3 {
+		t.Fatalf("usage = %d bytes, %d files, %v", used, files, err)
+	}
+	if total, err := repo.TotalStorageUsed(4096); err != nil || total != used {
+		t.Fatalf("total = %d, %v", total, err)
+	}
+	if used, files, err := repo.Usage("someone-else", 4096); err != nil || used != 0 || files != 0 {
+		t.Fatalf("empty usage = %d, %d, %v", used, files, err)
+	}
+	if listed, err := repo.ListOwned(owner, 2); err != nil || len(listed) != 2 {
+		t.Fatalf("limited list = %d, %v", len(listed), err)
+	}
+}

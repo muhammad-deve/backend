@@ -73,7 +73,7 @@ func TestCloudShareLifecycleOwnershipAndQuota(t *testing.T) {
 	storage := t.TempDir()
 	repo := &memoryShares{records: make(map[string]model.ShareRecord)}
 	service := &sharesService{
-		cfg:  &config.Config{AppURL: "https://goport.test", ShareFreeMaxUploadBytes: 1024, ShareFreeStorageBytes: 32, ShareProStorageBytes: 64, ShareFreeDefaultRetentionHours: 24, ShareFreeMaxRetentionHours: 48, ShareProDefaultRetentionHours: 24, ShareProMaxRetentionHours: 48},
+		cfg:  &config.Config{AppURL: "https://goport.test", ShareFreeMaxUploadBytes: 1024, ShareFreeStorageBytes: 6000, ShareProStorageBytes: 12000, ShareFreeDefaultRetentionHours: 24, ShareFreeMaxRetentionHours: 48, ShareProDefaultRetentionHours: 24, ShareProMaxRetentionHours: 48},
 		repo: repo, billing: fakeShareBilling{}, storageDir: storage, cryptKey: [32]byte{9, 8, 7}, uploads: make(chan struct{}, 2),
 	}
 	created, err := service.Create("owner", "report.pdf", strings.NewReader("%PDF-cloud-file"), time.Now().Add(time.Hour), "strong password", false)
@@ -114,7 +114,11 @@ func TestCloudShareLifecycleOwnershipAndQuota(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(storage, record.StorageKey)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("stored object still exists: %v", err)
 	}
-	if _, err := service.Create("owner", "large.zip", strings.NewReader(strings.Repeat("x", 33)), time.Now().Add(time.Hour), "", false); !errors.Is(err, ErrShareQuota) {
+	// Every file counts as at least 4 KB, so two tiny files fill 6000 bytes.
+	if _, err := service.Create("owner", "a.zip", strings.NewReader("PK tiny"), time.Now().Add(time.Hour), "", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Create("owner", "b.zip", strings.NewReader("PK tiny"), time.Now().Add(time.Hour), "", false); !errors.Is(err, ErrShareQuota) {
 		t.Fatalf("quota error = %v", err)
 	}
 }
@@ -135,7 +139,7 @@ func (r *memoryShares) Create(value model.ShareRecord) (*model.ShareRecord, erro
 	copy := value
 	return &copy, nil
 }
-func (r *memoryShares) ListOwned(userID string) ([]model.ShareRecord, error) {
+func (r *memoryShares) ListOwned(userID string, limit int) ([]model.ShareRecord, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	var result []model.ShareRecord
@@ -143,6 +147,10 @@ func (r *memoryShares) ListOwned(userID string) ([]model.ShareRecord, error) {
 		if record.OwnerID == userID {
 			result = append(result, record)
 		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Created.After(result[j].Created) })
+	if len(result) > limit {
+		result = result[:limit]
 	}
 	return result, nil
 }
@@ -210,25 +218,26 @@ func (r *memoryShares) AddDownload(id string) error {
 	r.records[id] = record
 	return nil
 }
-func (r *memoryShares) TotalStorageUsed() (int64, error) {
+func (r *memoryShares) TotalStorageUsed(minBytes int64) (int64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	var total int64
 	for _, record := range r.records {
-		total += record.Size
+		total += max(record.Size, minBytes)
 	}
 	return total, nil
 }
-func (r *memoryShares) StorageUsed(userID string) (int64, error) {
+func (r *memoryShares) Usage(userID string, minBytes int64) (int64, int64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	var total int64
+	var total, files int64
 	for _, record := range r.records {
 		if record.OwnerID == userID {
-			total += record.Size
+			total += max(record.Size, minBytes)
+			files++
 		}
 	}
-	return total, nil
+	return total, files, nil
 }
 func (r *memoryShares) TokenCiphers(afterID string, limit int) ([]model.ShareRecord, error) {
 	r.mu.Lock()
@@ -435,6 +444,142 @@ func TestLockedViewHidesTheFile(t *testing.T) {
 	}
 	if view := PublicView(record); view.Filename != record.Filename || view.Locked {
 		t.Fatalf("public view = %#v", view)
+	}
+}
+
+func TestFileCountIsCapped(t *testing.T) {
+	shares := newTestShares(t, false)
+	shares.cfg.ShareFreeMaxFiles = 2
+	shares.cfg.ShareFreeStorageBytes = 1 << 20
+	if _, err := shares.Create("owner", "a.txt", strings.NewReader("a"), time.Time{}, "", false); err != nil {
+		t.Fatal(err)
+	}
+	// An upload in progress holds a file slot too.
+	if _, err := shares.StartUpload("owner", "1.2.3.4", model.StartShareUploadRequest{Filename: "b.txt", Size: 1}, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := shares.StartUpload("owner", "1.2.3.4", model.StartShareUploadRequest{Filename: "c.txt", Size: 1}, time.Time{}); !errors.Is(err, ErrShareFileLimit) {
+		t.Fatalf("over the file cap error = %v", err)
+	}
+	if _, err := shares.Create("owner", "b.txt", strings.NewReader("b"), time.Time{}, "", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := shares.Create("owner", "c.txt", strings.NewReader("c"), time.Time{}, "", false); !errors.Is(err, ErrShareFileLimit) {
+		t.Fatalf("third file error = %v", err)
+	}
+	_, usage, limits, err := shares.List("owner")
+	if err != nil || usage.Files != 2 || usage.UsedBytes != 2*shareMinFileBytes || limits.Current.MaxFiles != 2 {
+		t.Fatalf("usage = %#v, limits %#v, %v", usage, limits.Current, err)
+	}
+}
+
+func TestListShowsEveryFileUpToTheLargestCap(t *testing.T) {
+	shares := newTestShares(t, false)
+	shares.cfg.ShareFreeMaxFiles, shares.cfg.ShareProMaxFiles = 3, 5
+	repo := shares.repo.(*memoryShares)
+	for index := 0; index < 7; index++ {
+		_, _ = repo.Create(model.ShareRecord{OwnerID: "owner", StorageKey: "k", Filename: "a.txt", Size: 1, ExpiresAt: time.Now().Add(time.Hour)})
+	}
+	if items, _, _, err := shares.List("owner"); err != nil || len(items) != 5 {
+		t.Fatalf("listed %d items, %v", len(items), err)
+	}
+}
+
+func TestUploadSessionsCantBeHeldForever(t *testing.T) {
+	shares := newTestShares(t, true)
+	session, err := shares.StartUpload("owner", "1.2.3.4", model.StartShareUploadRequest{Filename: "big.zip", Size: 1 << 20}, time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := shares.sessions[session.ID]
+	long := time.Now().Add(-time.Hour)
+	stored.touched = long
+
+	// A few bytes are not progress.
+	if _, err := shares.WriteUploadChunk("owner", session.ID, 0, strings.NewReader("PK")); err != nil {
+		t.Fatal(err)
+	}
+	if !stored.touched.Equal(long) {
+		t.Fatal("two bytes counted as activity")
+	}
+	if _, err := shares.WriteUploadChunk("owner", session.ID, 2, strings.NewReader(strings.Repeat("x", int(shareUploadProgress)))); err != nil {
+		t.Fatal(err)
+	}
+	if stored.touched.Equal(long) {
+		t.Fatal("64 KB of new data did not count as activity")
+	}
+	// Resending the same bytes is not progress either.
+	stored.touched = long
+	if _, err := shares.WriteUploadChunk("owner", session.ID, 0, strings.NewReader("PK"+strings.Repeat("x", int(shareUploadProgress)))); err != nil {
+		t.Fatal(err)
+	}
+	if !stored.touched.Equal(long) {
+		t.Fatal("resent bytes counted as activity")
+	}
+
+	// However active, a session ends after its lifetime.
+	stored.started = time.Now().Add(-shareUploadMaxLifetime - time.Minute)
+	if _, err := shares.WriteUploadChunk("owner", session.ID, stored.received, strings.NewReader("more")); !errors.Is(err, ErrShareUploadExpired) {
+		t.Fatalf("old session error = %v", err)
+	}
+	if _, err := os.Stat(stored.tempPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expired upload file kept: %v", err)
+	}
+
+	other, _ := shares.StartUpload("owner", "1.2.3.4", model.StartShareUploadRequest{Filename: "b.zip", Size: 10}, time.Time{})
+	shares.sessions[other.ID].started = time.Now().Add(-shareUploadMaxLifetime - time.Minute)
+	shares.sessionsMu.Lock()
+	shares.pruneUploadsLocked(time.Now())
+	shares.sessionsMu.Unlock()
+	if _, ok := shares.sessions[other.ID]; ok {
+		t.Fatal("prune kept a session past its lifetime")
+	}
+}
+
+func TestUploadsPerAddressAreCapped(t *testing.T) {
+	shares := newTestShares(t, true)
+	for index := 0; index < shareMaxVisitorUploads; index++ {
+		user := string(rune('a' + index/shareMaxUserUploads))
+		if _, err := shares.StartUpload(user, "1.2.3.4", model.StartShareUploadRequest{Filename: "a.zip", Size: 10}, time.Time{}); err != nil {
+			t.Fatalf("upload %d: %v", index, err)
+		}
+	}
+	if _, err := shares.StartUpload("z", "1.2.3.4", model.StartShareUploadRequest{Filename: "a.zip", Size: 10}, time.Time{}); !errors.Is(err, ErrShareBusy) {
+		t.Fatalf("upload over the address cap error = %v", err)
+	}
+	if _, err := shares.StartUpload("z", "5.6.7.8", model.StartShareUploadRequest{Filename: "a.zip", Size: 10}, time.Time{}); err != nil {
+		t.Fatalf("another address was capped: %v", err)
+	}
+}
+
+func TestEditedExpiryCountsFromUpload(t *testing.T) {
+	free := newTestShares(t, false)
+	item, err := free.Create("owner", "a.txt", strings.NewReader("hello"), time.Time{}, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := free.repo.(*memoryShares)
+	record := repo.records[item.ID]
+	record.Created = time.Now().Add(-48 * time.Hour)
+	record.ExpiresAt = time.Now().Add(12 * time.Hour)
+	repo.records[item.ID] = record
+
+	var expiry *ErrShareExpiry
+	if _, err := free.Update("owner", item.ID, time.Now().Add(72*time.Hour), nil, nil); !errors.As(err, &expiry) {
+		t.Fatalf("extending past three days after upload error = %v", err)
+	}
+	if _, err := free.Update("owner", item.ID, time.Now().Add(23*time.Hour), nil, nil); err != nil {
+		t.Fatalf("extending within three days of upload refused: %v", err)
+	}
+	// Keeping the current expiry always works, even after the plan shrank.
+	record = repo.records[item.ID]
+	record.Created = time.Now().Add(-10 * 24 * time.Hour)
+	repo.records[item.ID] = record
+	if _, err := free.Update("owner", item.ID, record.ExpiresAt, nil, nil); err != nil {
+		t.Fatalf("keeping the expiry refused: %v", err)
+	}
+	if _, err := free.Update("owner", item.ID, time.Now().Add(time.Hour), nil, nil); err != nil {
+		t.Fatalf("shortening refused: %v", err)
 	}
 }
 

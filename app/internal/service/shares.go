@@ -35,6 +35,7 @@ var (
 	ErrShareRevoked          = errors.New("share revoked")
 	ErrSharePassword         = errors.New("invalid share password")
 	ErrShareQuota            = errors.New("storage quota exceeded")
+	ErrShareFileLimit        = errors.New("file count limit reached")
 	ErrShareTooLarge         = errors.New("file is too large")
 	ErrShareType             = errors.New("file type is not allowed")
 	ErrShareEmpty            = errors.New("file is empty")
@@ -43,6 +44,7 @@ var (
 	ErrShareDirectPassword   = errors.New("direct links can't have a password")
 	ErrShareUploadNotFound   = errors.New("upload not found")
 	ErrShareUploadIncomplete = errors.New("upload is incomplete")
+	ErrShareUploadExpired    = errors.New("upload took too long")
 	ErrShareFull             = errors.New("cloud storage is full")
 	ErrShareDownloadLimit    = errors.New("download limit reached")
 )
@@ -60,18 +62,29 @@ const (
 	// 50 MB limit, so file size is bounded only by the plan.
 	shareChunkSize         int64 = 8 << 20
 	shareMaxUserUploads          = 3
+	shareMaxVisitorUploads       = 6
 	shareMaxUploads              = 40
 	shareUploadIdleTimeout       = 30 * time.Minute
+	// An upload must finish within this time, however steadily it moves.
+	shareUploadMaxLifetime = 2 * time.Hour
+	// shareUploadProgress is how much new data counts as activity. The end of
+	// a file counts whatever its size.
+	shareUploadProgress int64 = 64 << 10
+	// shareMinFileBytes is the least one file counts against storage: a tiny
+	// file still costs a disk block, an inode and a row.
+	shareMinFileBytes int64 = 4096
 	// Link tokens are 32 random bytes in unpadded base64url.
 	shareTokenBytes  = 32
 	shareTokenLength = 43
 	// Stored files are named with 24 random bytes in hex.
 	shareStorageKeyBytes = 24
+	// shareListFallback bounds the dashboard list when no file cap is set.
+	shareListFallback = 1000
 )
 
 type SharesI interface {
 	Create(userID, filename string, source io.Reader, expiresAt time.Time, password string, direct bool) (*model.ShareItem, error)
-	StartUpload(userID string, request model.StartShareUploadRequest, expiresAt time.Time) (*model.ShareUploadSession, error)
+	StartUpload(userID, visitor string, request model.StartShareUploadRequest, expiresAt time.Time) (*model.ShareUploadSession, error)
 	WriteUploadChunk(userID, uploadID string, offset int64, body io.Reader) (int64, error)
 	CompleteUpload(userID, uploadID string) (*model.ShareItem, error)
 	CancelUpload(userID, uploadID string) error
@@ -116,16 +129,21 @@ type shareUploadSession struct {
 	mu           sync.Mutex
 	id           string
 	userID       string
+	visitor      string
 	filename     string
 	mimeType     string
 	passwordHash string
 	tempPath     string
 	size         int64
 	received     int64
-	expiresAt    time.Time
-	direct       bool
-	touched      time.Time
-	done         bool
+	// progress is what had been received when the session last counted as
+	// active.
+	progress  int64
+	expiresAt time.Time
+	direct    bool
+	started   time.Time
+	touched   time.Time
+	done      bool
 }
 
 // NewSharesService builds the cloud share service. dataDir is PocketBase's
@@ -170,16 +188,21 @@ func (s *sharesService) planLimits() (model.SharePlanLimits, model.SharePlanLimi
 		DefaultRetentionHours: s.cfg.ShareFreeDefaultRetentionHours,
 		MaxRetentionHours:     s.cfg.ShareFreeMaxRetentionHours,
 		MaxDownloads:          max(s.cfg.ShareFreeMaxDownloads, 0),
+		MaxFiles:              max(s.cfg.ShareFreeMaxFiles, 0),
 	}
 	pro := model.SharePlanLimits{
 		StorageBytes:          s.cfg.ShareProStorageBytes,
 		MaxUploadBytes:        max(s.cfg.ShareProMaxUploadBytes, s.cfg.ShareFreeMaxUploadBytes),
 		DefaultRetentionHours: s.cfg.ShareProDefaultRetentionHours,
 		MaxRetentionHours:     max(s.cfg.ShareProMaxRetentionHours, s.cfg.ShareFreeMaxRetentionHours),
+		MaxFiles:              max(s.cfg.ShareProMaxFiles, 0),
 		DirectLinks:           true,
 	}
 	return free, pro
 }
+
+// billedBytes is what a file of size bytes counts against storage.
+func billedBytes(size int64) int64 { return max(size, shareMinFileBytes) }
 
 // Create stores a file sent in one request. The dashboard uploads in chunks
 // instead; this path remains for small files and older clients.
@@ -246,8 +269,9 @@ func (s *sharesService) Create(userID, filename string, source io.Reader, expire
 }
 
 // StartUpload opens a chunked upload after checking the plan, the quota and
-// the file type, so a doomed upload fails before any bytes are sent.
-func (s *sharesService) StartUpload(userID string, request model.StartShareUploadRequest, expiresAt time.Time) (*model.ShareUploadSession, error) {
+// the file type, so a doomed upload fails before any bytes are sent. visitor
+// is the uploader's network address, which caps uploads across accounts.
+func (s *sharesService) StartUpload(userID, visitor string, request model.StartShareUploadRequest, expiresAt time.Time) (*model.ShareUploadSession, error) {
 	filename := sanitizeFilename(request.Filename)
 	if filename == "" || !allowedUpload(filename) {
 		return nil, ErrShareType
@@ -275,11 +299,11 @@ func (s *sharesService) StartUpload(userID string, request model.StartShareUploa
 	if err != nil {
 		return nil, err
 	}
-	used, err := s.repo.StorageUsed(userID)
+	used, files, err := s.repo.Usage(userID, shareMinFileBytes)
 	if err != nil {
 		return nil, err
 	}
-	total, err := s.repo.TotalStorageUsed()
+	total, err := s.repo.TotalStorageUsed(shareMinFileBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -290,22 +314,29 @@ func (s *sharesService) StartUpload(userID string, request model.StartShareUploa
 
 	s.sessionsMu.Lock()
 	defer s.sessionsMu.Unlock()
-	s.pruneUploadsLocked(time.Now())
-	userUploads, reserved, reservedTotal := 0, int64(0), int64(0)
+	now := time.Now()
+	s.pruneUploadsLocked(now)
+	userUploads, visitorUploads, reserved, reservedTotal := 0, 0, int64(0), int64(0)
 	for _, session := range s.sessions {
-		reservedTotal += session.size
+		reservedTotal += billedBytes(session.size)
 		if session.userID == userID {
 			userUploads++
-			reserved += session.size
+			reserved += billedBytes(session.size)
+		}
+		if visitor != "" && session.visitor == visitor {
+			visitorUploads++
 		}
 	}
-	if userUploads >= shareMaxUserUploads || len(s.sessions) >= shareMaxUploads {
+	if userUploads >= shareMaxUserUploads || visitorUploads >= shareMaxVisitorUploads || len(s.sessions) >= shareMaxUploads {
 		return nil, ErrShareBusy
 	}
-	if used+reserved+request.Size > limits.Current.StorageBytes {
+	if limits.Current.MaxFiles > 0 && files+int64(userUploads) >= limits.Current.MaxFiles {
+		return nil, ErrShareFileLimit
+	}
+	if used+reserved+billedBytes(request.Size) > limits.Current.StorageBytes {
 		return nil, ErrShareQuota
 	}
-	if s.cfg.ShareTotalStorageBytes > 0 && total+reservedTotal+request.Size > s.cfg.ShareTotalStorageBytes {
+	if s.cfg.ShareTotalStorageBytes > 0 && total+reservedTotal+billedBytes(request.Size) > s.cfg.ShareTotalStorageBytes {
 		return nil, ErrShareFull
 	}
 	temporary, err := os.CreateTemp(s.storageDir, ".upload-*")
@@ -317,8 +348,8 @@ func (s *sharesService) StartUpload(userID string, request model.StartShareUploa
 		return nil, err
 	}
 	s.sessions[id] = &shareUploadSession{
-		id: id, userID: userID, filename: filename, passwordHash: passwordHash, tempPath: temporary.Name(),
-		size: request.Size, expiresAt: expiresAt, direct: request.Direct, touched: time.Now(),
+		id: id, userID: userID, visitor: visitor, filename: filename, passwordHash: passwordHash, tempPath: temporary.Name(),
+		size: request.Size, expiresAt: expiresAt, direct: request.Direct, started: now, touched: now,
 	}
 	return &model.ShareUploadSession{ID: id, ChunkSize: shareChunkSize}, nil
 }
@@ -335,6 +366,10 @@ func (s *sharesService) WriteUploadChunk(userID, uploadID string, offset int64, 
 	defer session.mu.Unlock()
 	if session.done {
 		return 0, ErrShareUploadNotFound
+	}
+	if time.Since(session.started) > shareUploadMaxLifetime {
+		s.dropUpload(session)
+		return 0, ErrShareUploadExpired
 	}
 	if offset < 0 || offset > session.received || offset >= session.size {
 		return session.received, &UploadOffsetError{Received: session.received}
@@ -374,8 +409,21 @@ func (s *sharesService) WriteUploadChunk(userID, uploadID string, offset int64, 
 		return session.received, ErrShareTooLarge
 	}
 	session.received = offset + written
-	session.touched = time.Now()
+	session.recordProgress(time.Now())
 	return session.received, nil
+}
+
+// recordProgress marks the session active when enough new data has arrived
+// since it last was, so resending the same bytes or trickling a few at a time
+// does not keep an upload slot.
+func (session *shareUploadSession) recordProgress(now time.Time) {
+	if session.received <= session.progress {
+		return
+	}
+	if session.received-session.progress >= min(shareUploadProgress, session.size-session.progress) {
+		session.progress = session.received
+		session.touched = now
+	}
 }
 
 // CompleteUpload turns a fully received upload into a share.
@@ -442,14 +490,14 @@ func (s *sharesService) dropUpload(session *shareUploadSession) {
 	s.sessionsMu.Unlock()
 }
 
-// pruneUploadsLocked drops sessions idle for too long. The caller holds
-// sessionsMu; sessions busy writing a chunk are skipped.
+// pruneUploadsLocked drops sessions that stalled or ran past their lifetime.
+// The caller holds sessionsMu; sessions busy writing a chunk are skipped.
 func (s *sharesService) pruneUploadsLocked(now time.Time) {
 	for id, session := range s.sessions {
 		if !session.mu.TryLock() {
 			continue
 		}
-		if now.Sub(session.touched) > shareUploadIdleTimeout {
+		if now.Sub(session.touched) > shareUploadIdleTimeout || now.Sub(session.started) > shareUploadMaxLifetime {
 			session.done = true
 			_ = os.Remove(session.tempPath)
 			delete(s.sessions, id)
@@ -475,19 +523,22 @@ func (s *sharesService) finalize(userID, temporaryPath string, size int64, value
 
 	s.createMu.Lock()
 	defer s.createMu.Unlock()
-	used, err := s.repo.StorageUsed(userID)
+	used, files, err := s.repo.Usage(userID, shareMinFileBytes)
 	if err != nil {
 		return nil, err
 	}
-	if used+size > limits.Current.StorageBytes {
+	if limits.Current.MaxFiles > 0 && files >= limits.Current.MaxFiles {
+		return nil, ErrShareFileLimit
+	}
+	if used+billedBytes(size) > limits.Current.StorageBytes {
 		return nil, ErrShareQuota
 	}
 	if s.cfg.ShareTotalStorageBytes > 0 {
-		total, err := s.repo.TotalStorageUsed()
+		total, err := s.repo.TotalStorageUsed(shareMinFileBytes)
 		if err != nil {
 			return nil, err
 		}
-		if total+size > s.cfg.ShareTotalStorageBytes {
+		if total+billedBytes(size) > s.cfg.ShareTotalStorageBytes {
 			return nil, ErrShareFull
 		}
 	}
@@ -510,7 +561,7 @@ func (s *sharesService) finalize(userID, temporaryPath string, size int64, value
 }
 
 func (s *sharesService) List(userID string) ([]model.ShareItem, model.ShareStorageUsage, model.ShareLimits, error) {
-	records, err := s.repo.ListOwned(userID)
+	records, err := s.repo.ListOwned(userID, s.listLimit())
 	if err != nil {
 		return nil, model.ShareStorageUsage{}, model.ShareLimits{}, err
 	}
@@ -528,12 +579,22 @@ func (s *sharesService) List(userID string) ([]model.ShareItem, model.ShareStora
 		}
 		items = append(items, s.item(record, token, &limits))
 	}
-	used, err := s.repo.StorageUsed(userID)
+	used, files, err := s.repo.Usage(userID, shareMinFileBytes)
 	if err != nil {
 		return nil, model.ShareStorageUsage{}, model.ShareLimits{}, err
 	}
 	quota := limits.Current.StorageBytes
-	return items, model.ShareStorageUsage{UsedBytes: used, QuotaBytes: quota, RemainingBytes: max(quota-used, 0)}, limits, nil
+	return items, model.ShareStorageUsage{UsedBytes: used, QuotaBytes: quota, RemainingBytes: max(quota-used, 0), Files: files}, limits, nil
+}
+
+// listLimit is how many shares the dashboard lists: every file the largest
+// plan allows, so an account that moved from Pro to Free still sees them all.
+func (s *sharesService) listLimit() int {
+	free, pro := s.planLimits()
+	if limit := max(free.MaxFiles, pro.MaxFiles); limit > 0 {
+		return int(limit)
+	}
+	return shareListFallback
 }
 
 func (s *sharesService) Update(userID, id string, expiresAt time.Time, password *string, direct *bool) (*model.ShareItem, error) {
@@ -545,7 +606,7 @@ func (s *sharesService) Update(userID, id string, expiresAt time.Time, password 
 	if err != nil {
 		return nil, err
 	}
-	if err := validateExpiry(expiresAt, limits.Current); err != nil {
+	if err := validateNewExpiry(expiresAt, record, limits.Current); err != nil {
 		return nil, err
 	}
 	if direct != nil && *direct && !record.Direct && !limits.Current.DirectLinks {
@@ -762,6 +823,23 @@ func validateExpiry(value time.Time, limits model.SharePlanLimits) error {
 	// the time the request took.
 	if value.After(now.Add(time.Duration(limits.MaxRetentionHours)*time.Hour + time.Minute)) {
 		return &ErrShareExpiry{Message: "Your plan keeps files for up to " + retentionText(limits.MaxRetentionHours) + "."}
+	}
+	return nil
+}
+
+// validateNewExpiry checks an edited expiry. Retention counts from the
+// upload, so editing can't keep a file longer than the plan allows. Keeping
+// or shortening the current expiry is always fine, so a plan change never
+// blocks other edits.
+func validateNewExpiry(value time.Time, record *model.ShareRecord, limits model.SharePlanLimits) error {
+	if !value.After(time.Now()) {
+		return &ErrShareExpiry{Message: "Choose an expiry time in the future."}
+	}
+	if !value.After(record.ExpiresAt.Add(time.Minute)) {
+		return nil
+	}
+	if value.After(record.Created.Add(time.Duration(limits.MaxRetentionHours)*time.Hour + time.Minute)) {
+		return &ErrShareExpiry{Message: "Your plan keeps files for up to " + retentionText(limits.MaxRetentionHours) + " after upload."}
 	}
 	return nil
 }

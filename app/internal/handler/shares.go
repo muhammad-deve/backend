@@ -85,7 +85,7 @@ func (h *Handler) StartShareUploadHandler(e *core.RequestEvent) error {
 	if _, allowed, err := h.shareUploadAllowed(e); !allowed {
 		return err
 	}
-	session, err := h.service.Shares().StartUpload(e.Auth.Id, *request, expiresAt)
+	session, err := h.service.Shares().StartUpload(e.Auth.Id, shareVisitorKey(e.Request), *request, expiresAt)
 	if err != nil {
 		return h.shareError(e, err)
 	}
@@ -411,6 +411,8 @@ func (h *Handler) shareError(e *core.RequestEvent, err error) error {
 		return h.NewErrorResponse(e, http.StatusRequestEntityTooLarge, "The file exceeds your plan's upload limit.")
 	case errors.Is(err, service.ErrShareQuota):
 		return h.NewErrorResponse(e, http.StatusInsufficientStorage, "Your storage is full. Delete files or upgrade to Pro for more space.")
+	case errors.Is(err, service.ErrShareFileLimit):
+		return h.NewErrorResponse(e, http.StatusInsufficientStorage, "You have as many files as your plan allows. Delete files or upgrade to Pro to keep more.")
 	case errors.Is(err, service.ErrShareType):
 		return h.NewErrorResponse(e, http.StatusUnsupportedMediaType, "This file type is not allowed.")
 	case errors.Is(err, service.ErrShareEmpty):
@@ -423,6 +425,8 @@ func (h *Handler) shareError(e *core.RequestEvent, err error) error {
 		return h.NewErrorResponse(e, http.StatusBadRequest, "Direct links open the file itself, so they can't ask for a password.")
 	case errors.Is(err, service.ErrShareUploadNotFound):
 		return h.NewErrorResponse(e, http.StatusNotFound, "This upload was interrupted. Start it again.")
+	case errors.Is(err, service.ErrShareUploadExpired):
+		return h.NewErrorResponse(e, http.StatusNotFound, "Uploads must finish within 2 hours. Start it again.")
 	case errors.Is(err, service.ErrShareUploadIncomplete):
 		return h.NewErrorResponse(e, http.StatusConflict, "The upload hasn't finished yet.")
 	case errors.Is(err, service.ErrShareExpired):

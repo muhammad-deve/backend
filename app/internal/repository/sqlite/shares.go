@@ -35,8 +35,8 @@ func (r *Shares) Create(value model.ShareRecord) (*model.ShareRecord, error) {
 	return shareRecord(record), nil
 }
 
-func (r *Shares) ListOwned(userID string) ([]model.ShareRecord, error) {
-	records, err := r.app.FindRecordsByFilter(model.SharesCollection, "owner = {:owner}", "-created", 200, 0, dbx.Params{"owner": userID})
+func (r *Shares) ListOwned(userID string, limit int) ([]model.ShareRecord, error) {
+	records, err := r.app.FindRecordsByFilter(model.SharesCollection, "owner = {:owner}", "-created", limit, 0, dbx.Params{"owner": userID})
 	if err != nil {
 		return nil, err
 	}
@@ -96,20 +96,22 @@ func (r *Shares) AddDownload(id string) error {
 	_, err := r.app.DB().NewQuery("UPDATE shares SET downloads = downloads + 1 WHERE id = {:id}").Bind(dbx.Params{"id": id}).Execute()
 	return err
 }
-func (r *Shares) StorageUsed(userID string) (int64, error) {
+func (r *Shares) Usage(userID string, minBytes int64) (int64, int64, error) {
 	var row struct {
 		Total int64 `db:"total"`
+		Files int64 `db:"files"`
 	}
-	err := r.app.DB().NewQuery("SELECT COALESCE(SUM(size), 0) AS total FROM shares WHERE owner = {:owner}").Bind(dbx.Params{"owner": userID}).One(&row)
-	return row.Total, err
+	err := r.app.DB().NewQuery("SELECT COALESCE(SUM(MAX(size, {:min})), 0) AS total, COUNT(*) AS files FROM shares WHERE owner = {:owner}").
+		Bind(dbx.Params{"owner": userID, "min": minBytes}).One(&row)
+	return row.Total, row.Files, err
 }
 
 // TotalStorageUsed is the size of every stored share, across all users.
-func (r *Shares) TotalStorageUsed() (int64, error) {
+func (r *Shares) TotalStorageUsed(minBytes int64) (int64, error) {
 	var row struct {
 		Total int64 `db:"total"`
 	}
-	err := r.app.DB().NewQuery("SELECT COALESCE(SUM(size), 0) AS total FROM shares").One(&row)
+	err := r.app.DB().NewQuery("SELECT COALESCE(SUM(MAX(size, {:min})), 0) AS total FROM shares").Bind(dbx.Params{"min": minBytes}).One(&row)
 	return row.Total, err
 }
 

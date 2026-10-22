@@ -64,6 +64,7 @@ type ShareStorageUsage struct {
 	UsedBytes      int64 `json:"usedBytes"`
 	QuotaBytes     int64 `json:"quotaBytes"`
 	RemainingBytes int64 `json:"remainingBytes"`
+	Files          int64 `json:"files"`
 }
 
 // SharePlanLimits describes what one plan allows for cloud files.
@@ -74,7 +75,9 @@ type SharePlanLimits struct {
 	MaxRetentionHours     int   `json:"maxRetentionHours"`
 	// MaxDownloads is per file; zero means unlimited.
 	MaxDownloads int64 `json:"maxDownloads"`
-	DirectLinks  bool  `json:"directLinks"`
+	// MaxFiles is how many files one account may keep; zero means unlimited.
+	MaxFiles    int64 `json:"maxFiles"`
+	DirectLinks bool  `json:"directLinks"`
 }
 
 // ShareLimits is the caller's plan plus both plans, so the dashboard can show

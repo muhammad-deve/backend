@@ -37,10 +37,12 @@ type Config struct {
 	ShareFreeMaxRetentionHours     int   `env:"SHARE_FREE_MAX_RETENTION_HOURS" env-default:"72"`
 	ShareFreeMaxDownloads          int64 `env:"SHARE_FREE_MAX_DOWNLOADS" env-default:"100"`
 	ShareFreeUploadersPerIP        int   `env:"SHARE_FREE_UPLOADERS_PER_IP" env-default:"5"`
+	ShareFreeMaxFiles              int64 `env:"SHARE_FREE_MAX_FILES" env-default:"100"`
 	ShareProStorageBytes           int64 `env:"SHARE_PRO_STORAGE_BYTES" env-default:"5368709120"`
 	ShareProMaxUploadBytes         int64 `env:"SHARE_PRO_MAX_UPLOAD_BYTES" env-default:"524288000"`
 	ShareProDefaultRetentionHours  int   `env:"SHARE_PRO_DEFAULT_RETENTION_HOURS" env-default:"168"`
 	ShareProMaxRetentionHours      int   `env:"SHARE_PRO_MAX_RETENTION_HOURS" env-default:"720"`
+	ShareProMaxFiles               int64 `env:"SHARE_PRO_MAX_FILES" env-default:"1000"`
 }
 
 var instance *Config
