@@ -48,7 +48,7 @@ func (h *Handler) CreateTokenHandler(e *core.RequestEvent) error {
 		if errors.Is(err, service.ErrPlanLimitReached) {
 			return h.NewErrorResponse(e, http.StatusConflict, err.Error())
 		}
-		return h.NewErrorResponse(e, http.StatusBadRequest, err.Error())
+		return h.errorResponse(e, err, "Couldn't create the token. Please try again.", "failed to create token", "userId", user.Id)
 	}
 
 	return h.NewSuccessResponse(e, http.StatusCreated, token)

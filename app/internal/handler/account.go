@@ -33,8 +33,7 @@ func (h *Handler) RequestEmailChangeHandler(e *core.RequestEvent) error {
 		if errors.Is(err, service.ErrDisposableEmail) {
 			return h.NewErrorResponse(e, http.StatusBadRequest, disposableEmailMessage)
 		}
-		h.logger.Error("failed to request email change", "error", err, "userId", e.Auth.Id)
-		return h.NewErrorResponse(e, http.StatusBadRequest, err.Error())
+		return h.errorResponse(e, err, "Couldn't send the verification code. Please try again.", "failed to request email change", "userId", e.Auth.Id)
 	}
 
 	return h.NewSuccessResponse(e, http.StatusOK, resp)
@@ -58,7 +57,7 @@ func (h *Handler) ConfirmEmailChangeHandler(e *core.RequestEvent) error {
 		if errors.Is(err, service.ErrEmailTaken) {
 			return h.NewErrorResponse(e, http.StatusConflict, "This email is already in use.")
 		}
-		return h.NewErrorResponse(e, http.StatusBadRequest, err.Error())
+		return h.errorResponse(e, err, "Couldn't change your email. Please try again.", "failed to confirm email change", "userId", e.Auth.Id)
 	}
 
 	return h.NewSuccessResponse(e, http.StatusOK, resp)
@@ -82,8 +81,9 @@ func (h *Handler) ChangePasswordHandler(e *core.RequestEvent) error {
 	if err != nil {
 		if errors.Is(err, service.ErrCurrentPasswordIncorrect) {
 			h.service.Throttle().LoginFailed(ip, e.Auth.Email())
+			return h.NewErrorResponse(e, http.StatusBadRequest, service.ErrCurrentPasswordIncorrect.Error())
 		}
-		return h.NewErrorResponse(e, http.StatusBadRequest, err.Error())
+		return h.errorResponse(e, err, "Couldn't change your password. Please try again.", "failed to change password", "userId", e.Auth.Id)
 	}
 
 	return h.NewSuccessResponse(e, http.StatusOK, resp)

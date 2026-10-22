@@ -11,7 +11,10 @@ type UserError struct {
 
 func (e *UserError) Error() string { return e.msg }
 
-func userError(msg string) error { return &UserError{msg: msg} }
+// NewUserError returns an error whose message is shown to the user as is.
+func NewUserError(msg string) error { return &UserError{msg: msg} }
+
+func userError(msg string) error { return NewUserError(msg) }
 
 // UserMessage returns the user-facing message of err, if it has one.
 func UserMessage(err error) (string, bool) {

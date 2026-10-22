@@ -18,7 +18,7 @@ import (
 
 var (
 	ErrEmailTaken               = errors.New("this email is already in use")
-	ErrCurrentPasswordIncorrect = errors.New("current password is incorrect")
+	ErrCurrentPasswordIncorrect = errors.New("Current password is incorrect.")
 )
 
 type AccountI interface {
@@ -96,10 +96,10 @@ func (s *accountService) ReleasePending(user *core.Record, provider, providerID 
 func (s *accountService) RequestEmailChange(user *core.Record, req *model.RequestEmailChangeRequest) (*model.SendOTPResponse, error) {
 	email := strings.ToLower(strings.TrimSpace(req.Email))
 	if email == "" || !strings.Contains(email, "@") {
-		return nil, fmt.Errorf("a valid email is required")
+		return nil, errInvalidEmail
 	}
 	if strings.EqualFold(email, user.Email()) {
-		return nil, fmt.Errorf("enter a different email address")
+		return nil, userError("Enter a different email address.")
 	}
 	if disposable.Email(email) {
 		return nil, ErrDisposableEmail
@@ -202,13 +202,13 @@ func (s *accountService) ChangePassword(user *core.Record, req *model.ChangePass
 		return nil, ErrCurrentPasswordIncorrect
 	}
 	if req.NewPassword != req.ConfirmPassword {
-		return nil, fmt.Errorf("new passwords do not match")
+		return nil, userError("New passwords don't match.")
 	}
 	if ok, reason := model.ValidatePassword(req.NewPassword); !ok {
-		return nil, fmt.Errorf("%s", reason)
+		return nil, userError(reason)
 	}
 	if user.ValidatePassword(req.NewPassword) {
-		return nil, fmt.Errorf("new password must be different from the current password")
+		return nil, userError("New password must be different from the current one.")
 	}
 
 	user.SetPassword(req.NewPassword)

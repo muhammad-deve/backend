@@ -62,7 +62,7 @@ func (h *Handler) VerifyOTPHandler(e *core.RequestEvent) error {
 		if errors.Is(err, service.ErrEmailRegistered) {
 			return h.NewErrorResponse(e, http.StatusConflict, "This email is already registered. Please log in instead.")
 		}
-		return h.NewErrorResponse(e, http.StatusBadRequest, err.Error())
+		return h.errorResponse(e, err, "Couldn't check the code. Please try again.", "failed to verify OTP")
 	}
 
 	return h.NewSuccessResponse(e, http.StatusOK, resp)
@@ -85,7 +85,7 @@ func (h *Handler) CompleteRegistrationHandler(e *core.RequestEvent) error {
 		if errors.Is(err, service.ErrEmailRegistered) {
 			return h.NewErrorResponse(e, http.StatusConflict, "This email is already registered. Please log in instead.")
 		}
-		return h.NewErrorResponse(e, http.StatusBadRequest, err.Error())
+		return h.errorResponse(e, err, "Couldn't create your account. Please try again.", "failed to complete registration")
 	}
 
 	return h.NewSuccessResponse(e, http.StatusOK, resp)
@@ -108,8 +108,7 @@ func (h *Handler) ForgotPasswordHandler(e *core.RequestEvent) error {
 		if _, ok := service.IsRateLimited(err); ok {
 			return h.limitedResponse(e, err)
 		}
-		h.logger.Error("failed to send reset OTP", "error", err, "email", req.Email)
-		return h.NewErrorResponse(e, http.StatusBadRequest, err.Error())
+		return h.errorResponse(e, err, "Couldn't send the reset code. Please try again.", "failed to send reset OTP", "email", req.Email)
 	}
 
 	return h.NewSuccessResponse(e, http.StatusOK, resp)
@@ -128,13 +127,23 @@ func (h *Handler) ResetPasswordHandler(e *core.RequestEvent) error {
 
 	resp, err := h.service.OTP().ResetPassword(req)
 	if err != nil {
-		return h.NewErrorResponse(e, http.StatusBadRequest, err.Error())
+		return h.errorResponse(e, err, "Couldn't reset your password. Please try again.", "failed to reset password")
 	}
 
 	return h.NewSuccessResponse(e, http.StatusOK, resp)
 }
 
 const disposableEmailMessage = "Temporary email addresses can't be used. Please use your regular email."
+
+// errorResponse shows err's text when it is meant for the user (a
+// service.UserError) and otherwise logs it and shows fallback.
+func (h *Handler) errorResponse(e *core.RequestEvent, err error, fallback, logMessage string, logArgs ...any) error {
+	if msg, ok := service.UserMessage(err); ok {
+		return h.NewErrorResponse(e, http.StatusBadRequest, msg)
+	}
+	h.logger.Error(logMessage, append([]any{"error", err}, logArgs...)...)
+	return h.NewErrorResponse(e, http.StatusInternalServerError, fallback)
+}
 
 // limitedResponse writes a 429 for a rate-limit error.
 func (h *Handler) limitedResponse(e *core.RequestEvent, err error) error {

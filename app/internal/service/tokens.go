@@ -79,10 +79,10 @@ func (s *tokensService) List(userID string) ([]model.TokenItem, error) {
 func (s *tokensService) Create(userID, name string) (*model.TokenItem, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
-		return nil, fmt.Errorf("token name is required")
+		return nil, userError("Enter a token name.")
 	}
 	if len(name) > 50 {
-		return nil, fmt.Errorf("token name must be 50 characters or fewer")
+		return nil, userError("Token name must be 50 characters or fewer.")
 	}
 
 	s.createMu.Lock()

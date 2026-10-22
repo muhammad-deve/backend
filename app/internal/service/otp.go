@@ -82,7 +82,7 @@ func NewOTPService(app core.App, email EmailI, tokens TokensI, attempts *otpAtte
 func (s *otpService) SendOTP(req *model.SendOTPRequest) (*model.SendOTPResponse, error) {
 	email := strings.ToLower(strings.TrimSpace(req.Email))
 	if email == "" || !strings.Contains(email, "@") {
-		return nil, fmt.Errorf("a valid email is required")
+		return nil, errInvalidEmail
 	}
 	if disposable.Email(email) {
 		return nil, ErrDisposableEmail
@@ -192,7 +192,7 @@ func (s *otpService) VerifyOTP(req *model.VerifyOTPRequest) (*model.VerifyOTPRes
 // the user verified, and consumes the OTP. This is the final signup step.
 func (s *otpService) CompleteRegistration(req *model.CompleteRegistrationRequest) (*model.CompleteRegistrationResponse, error) {
 	if ok, reason := model.ValidatePassword(req.Password); !ok {
-		return nil, fmt.Errorf("%s", reason)
+		return nil, userError(reason)
 	}
 
 	otp, user, err := s.checkOwnEmailCode(req.OtpID, req.Code)
@@ -233,7 +233,7 @@ func (s *otpService) CompleteRegistration(req *model.CompleteRegistrationRequest
 func (s *otpService) ForgotPassword(req *model.ForgotPasswordRequest) (*model.SendOTPResponse, error) {
 	email := strings.ToLower(strings.TrimSpace(req.Email))
 	if email == "" || !strings.Contains(email, "@") {
-		return nil, fmt.Errorf("a valid email is required")
+		return nil, errInvalidEmail
 	}
 
 	usersCollection, err := s.app.FindCollectionByNameOrId(model.UsersCollection)
@@ -261,7 +261,7 @@ func (s *otpService) ForgotPassword(req *model.ForgotPasswordRequest) (*model.Se
 // ResetPassword re-validates the OTP and sets a new password for the account.
 func (s *otpService) ResetPassword(req *model.ResetPasswordRequest) (*model.ResetPasswordResponse, error) {
 	if ok, reason := model.ValidatePassword(req.Password); !ok {
-		return nil, fmt.Errorf("%s", reason)
+		return nil, userError(reason)
 	}
 
 	otp, user, err := s.checkOwnEmailCode(req.OtpID, req.Code)
@@ -271,7 +271,7 @@ func (s *otpService) ResetPassword(req *model.ResetPasswordRequest) (*model.Rese
 	// Reset codes are issued only to verified accounts. A sign-up code must
 	// not set a password here.
 	if !user.Verified() {
-		return nil, fmt.Errorf("invalid or expired code")
+		return nil, errInvalidCode
 	}
 
 	// Changing the password also ends every other session.
@@ -293,7 +293,12 @@ func (s *otpService) ResetPassword(req *model.ResetPasswordRequest) (*model.Rese
 
 // ErrTooManyCodeAttempts is returned once an OTP has had too many wrong codes.
 // The OTP is deleted at that point and a new code must be requested.
-var ErrTooManyCodeAttempts = errors.New("Too many wrong codes. Please request a new code.")
+var ErrTooManyCodeAttempts error = &UserError{msg: "Too many wrong codes. Please request a new code."}
+
+var (
+	errInvalidCode  error = &UserError{msg: "Invalid or expired code."}
+	errInvalidEmail error = &UserError{msg: "Please enter a valid email address."}
+)
 
 // checkOwnEmailCode checks a sign-up or password-reset code. Those codes are
 // sent to the account's own address, so a code sent anywhere else (an email
@@ -335,21 +340,21 @@ func checkOTPCode(app core.App, attempts *otpAttempts, otpID, code string, accep
 	otpID = strings.TrimSpace(otpID)
 	code = strings.TrimSpace(code)
 	if otpID == "" || code == "" {
-		return nil, fmt.Errorf("otpId and code are required")
+		return nil, userError("Enter the code from the email.")
 	}
 
 	otp, err := app.FindOTPById(otpID)
 	if err != nil {
-		return nil, fmt.Errorf("invalid or expired code")
+		return nil, errInvalidCode
 	}
 
 	if otp.HasExpired(model.OTPExpiry) {
 		deleteOTP(app, otp, "expired")
 		attempts.forget(otp.Id)
-		return nil, fmt.Errorf("invalid or expired code")
+		return nil, errInvalidCode
 	}
 	if accept != nil && !accept(otp) {
-		return nil, fmt.Errorf("invalid or expired code")
+		return nil, errInvalidCode
 	}
 
 	if !attempts.begin(otp.Id) {
@@ -360,7 +365,7 @@ func checkOTPCode(app core.App, attempts *otpAttempts, otpID, code string, accep
 		if attempts.exhausted(otp.Id) {
 			deleteOTP(app, otp, "too many wrong codes")
 		}
-		return nil, fmt.Errorf("invalid or expired code")
+		return nil, errInvalidCode
 	}
 	attempts.release(otp.Id)
 
