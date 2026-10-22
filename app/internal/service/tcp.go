@@ -33,6 +33,9 @@ type TCPI interface {
 	IsTunnelHost(host string) bool
 	StopTunnel(userID, subdomain string) error
 	DeleteTunnel(userID, subdomain string) error
+	// CloseSessionsForToken ends the tunnels opened with a token (by row id)
+	// and returns how many it closed.
+	CloseSessionsForToken(tokenID string) int
 }
 
 var (
@@ -128,6 +131,12 @@ type tcpService struct {
 	shareTokens   map[string]string
 	shareExpires  map[string]time.Time
 	sessionOrder  map[string]uint64
+	// sessionTokens is the token row id each session registered with.
+	sessionTokens map[string]string
+	// stopped holds subdomains stopped from the dashboard (key stopKey) until
+	// their hold ends; revokedTokens holds tokens deleted moments ago.
+	stopped       map[string]time.Time
+	revokedTokens map[string]time.Time
 	nextSession   uint64
 	app           core.App
 	domain        string
@@ -213,6 +222,9 @@ func NewTCPService(app core.App, tunnels repository.TunnelsI, usage repository.U
 		shareTokens:   make(map[string]string),
 		shareExpires:  make(map[string]time.Time),
 		sessionOrder:  make(map[string]uint64),
+		sessionTokens: make(map[string]string),
+		stopped:       make(map[string]time.Time),
+		revokedTokens: make(map[string]time.Time),
 		app:           app,
 		domain:        domain,
 		stats:         make(map[tunnelStatKey]*tunnelStat),
@@ -274,15 +286,7 @@ func (t *tcpService) Stop() {
 		if session != nil {
 			session.Close()
 		}
-		delete(t.sessions, subdomain)
-		delete(t.owners, subdomain)
-		delete(t.tunnelIDs, subdomain)
-		delete(t.sessionUsers, subdomain)
-		delete(t.sessionCustom, subdomain)
-		delete(t.sessionTypes, subdomain)
-		delete(t.shareTokens, subdomain)
-		delete(t.shareExpires, subdomain)
-		delete(t.sessionOrder, subdomain)
+		t.forgetSessionLocked(subdomain)
 	}
 	t.mu.Unlock()
 
@@ -352,15 +356,7 @@ func (t *tcpService) handleConnection(conn net.Conn, ip string) {
 		ownedSession := sessionReserved && subdomain != "" && t.owners[subdomain] == conn
 		if ownedSession {
 			t.endOnlineLocked(subdomain, time.Now())
-			delete(t.sessions, subdomain)
-			delete(t.owners, subdomain)
-			delete(t.tunnelIDs, subdomain)
-			delete(t.sessionUsers, subdomain)
-			delete(t.sessionCustom, subdomain)
-			delete(t.sessionTypes, subdomain)
-			delete(t.shareTokens, subdomain)
-			delete(t.shareExpires, subdomain)
-			delete(t.sessionOrder, subdomain)
+			t.forgetSessionLocked(subdomain)
 		}
 		t.mu.Unlock()
 
@@ -410,7 +406,7 @@ func (t *tcpService) handleConnection(conn net.Conn, ip string) {
 		}
 	}
 
-	createdSubdomain, tunnelID, userID, maxActiveTunnels, isCustom, err := t.resolveTunnel(req)
+	claim, err := t.resolveTunnel(req)
 	if err != nil {
 		var refused *refusal
 		if errors.As(err, &refused) {
@@ -423,8 +419,8 @@ func (t *tcpService) handleConnection(conn net.Conn, ip string) {
 		t.sendRegistrationError(conn, internalRegistrationError)
 		return
 	}
-	subdomain = createdSubdomain
-	if err := t.reserveSession(subdomain, tunnelID, userID, maxActiveTunnels, isCustom, req, conn); err != nil {
+	subdomain = claim.subdomain
+	if err := t.reserveSession(claim, req, conn); err != nil {
 		t.sendRegistrationError(conn, err.Error())
 		return
 	}
@@ -587,29 +583,49 @@ func (t *tcpService) resolveUserID(token string) (string, error) {
 	return owner.UserID, nil
 }
 
-func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (string, string, string, int, bool, error) {
+// tunnelClaim is a registration that passed resolveTunnel.
+type tunnelClaim struct {
+	subdomain string
+	tunnelID  string
+	userID    string
+	// tokenID is the token's row id, for CloseSessionsForToken.
+	tokenID   string
+	maxActive int
+	// needsPro is true for a custom name the plan must cover.
+	needsPro bool
+}
+
+func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (tunnelClaim, error) {
 	if req.Reset && strings.TrimSpace(req.Subdomain) != "" {
-		return "", "", "", 0, false, refuse(fmt.Errorf("reset and custom subdomain cannot be used together"))
+		return tunnelClaim{}, refuse(fmt.Errorf("reset and custom subdomain cannot be used together"))
 	}
 
 	userID, err := t.resolveUserID(req.Token)
 	if err != nil {
-		return "", "", "", 0, false, err
+		return tunnelClaim{}, err
 	}
+	tokenID := t.tokenID(strings.TrimSpace(req.Token))
 	limits, usedBytes, err := t.trafficAllowance(userID)
 	if err != nil {
 		log.Printf("could not load the plan or usage of %s: %v", userID, err)
-		return "", "", "", 0, false, refuse(fmt.Errorf("could not verify your subscription or monthly usage"))
+		return tunnelClaim{}, refuse(fmt.Errorf("could not verify your subscription or monthly usage"))
 	}
 	if usedBytes >= limits.MonthlyBytes {
 		if limits.IsPro {
-			return "", "", "", 0, false, refuse(fmt.Errorf("monthly traffic limit reached for Pro (%d GB)", limits.MonthlyBytes/(1024*1024*1024)))
+			return tunnelClaim{}, refuse(fmt.Errorf("monthly traffic limit reached for Pro (%d GB)", limits.MonthlyBytes/(1024*1024*1024)))
 		}
-		return "", "", "", 0, false, refuse(fmt.Errorf("monthly traffic limit reached for Free (%d GB); upgrade to Pro for %d GB", limits.MonthlyBytes/(1024*1024*1024), model.ProMonthlyBytes/(1024*1024*1024)))
+		return tunnelClaim{}, refuse(fmt.Errorf("monthly traffic limit reached for Free (%d GB); upgrade to Pro for %d GB", limits.MonthlyBytes/(1024*1024*1024), model.ProMonthlyBytes/(1024*1024*1024)))
 	}
+	claimed := func(subdomain, tunnelID string, needsPro bool, err error) (tunnelClaim, error) {
+		if err != nil {
+			return tunnelClaim{}, err
+		}
+		return tunnelClaim{subdomain, tunnelID, userID, tokenID, limits.MaxActiveTunnels, needsPro}, nil
+	}
+
 	if req.Type == "share" && strings.TrimSpace(req.Resume) == "" {
 		subdomain, tunnelID, err := t.createRandomTunnel(userID, req.Port, req.Type)
-		return subdomain, tunnelID, userID, limits.MaxActiveTunnels, false, err
+		return claimed(subdomain, tunnelID, false, err)
 	}
 
 	// A reconnecting CLI asks for the subdomain it already had, so a dropped
@@ -619,13 +635,13 @@ func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (string, strin
 	if resume := strings.TrimSpace(req.Resume); resume != "" && !req.Reset {
 		record, err := t.findTunnelBySubdomain(resume)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return "", "", "", 0, false, err
+			return tunnelClaim{}, err
 		}
 		if err == nil && record.GetString("user") == userID && validateLegacySubdomain(resume) == nil {
 			isCustom := record.GetBool("is_custom")
 			if !isCustom || limits.CustomSubdomains || isGrandfathered(record) {
 				subdomain, tunnelID, err := t.saveTunnel(resume, isCustom, userID, req.Port, req.Type)
-				return subdomain, tunnelID, userID, limits.MaxActiveTunnels, needsPro(record), err
+				return claimed(subdomain, tunnelID, needsPro(record), err)
 			}
 		}
 	}
@@ -636,15 +652,15 @@ func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (string, strin
 			// A name the account already holds keeps working after the rules
 			// for new names got stricter.
 			if validateLegacySubdomain(subdomain) != nil || !t.ownsName(subdomain, userID) {
-				return "", "", "", 0, false, refuse(err)
+				return tunnelClaim{}, refuse(err)
 			}
 		}
 		owned := t.ownsGrandfatheredName(subdomain, userID)
 		if !limits.CustomSubdomains && !owned {
-			return "", "", "", 0, false, refuse(fmt.Errorf("%w: custom subdomains are available on Pro; upgrade at https://goport.uz/dashboard#billing", ErrProRequired))
+			return tunnelClaim{}, refuse(fmt.Errorf("%w: custom subdomains are available on Pro; upgrade at https://goport.uz/dashboard#billing", ErrProRequired))
 		}
 		subdomain, tunnelID, err := t.saveTunnel(subdomain, true, userID, req.Port, req.Type)
-		return subdomain, tunnelID, userID, limits.MaxActiveTunnels, !owned, err
+		return claimed(subdomain, tunnelID, !owned, err)
 	}
 
 	if !req.Reset {
@@ -659,15 +675,15 @@ func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (string, strin
 			// straight through the REST API) gets a fresh random name instead.
 			if validateLegacySubdomain(subdomain) == nil && (!isCustom || limits.CustomSubdomains || isGrandfathered(record)) {
 				subdomain, tunnelID, err := t.saveTunnel(subdomain, isCustom, userID, req.Port, req.Type)
-				return subdomain, tunnelID, userID, limits.MaxActiveTunnels, needsPro(record), err
+				return claimed(subdomain, tunnelID, needsPro(record), err)
 			}
 		} else if !errors.Is(err, sql.ErrNoRows) {
-			return "", "", "", 0, false, err
+			return tunnelClaim{}, err
 		}
 	}
 
 	subdomain, tunnelID, err := t.createRandomTunnel(userID, req.Port, req.Type)
-	return subdomain, tunnelID, userID, limits.MaxActiveTunnels, false, err
+	return claimed(subdomain, tunnelID, false, err)
 }
 
 func normalizedProtocol(protocol string) string {
@@ -686,12 +702,15 @@ func (t *tcpService) StopTunnel(userID, subdomain string) error {
 	t.mu.Lock()
 	session := t.sessions[subdomain]
 	liveOwner := t.sessionUsers[subdomain]
-	t.mu.Unlock()
 	// The row says who owns the name; the session map says who is connected
 	// under it now. Only a session of the same account can be stopped.
 	if liveOwner != userID || session == nil || session.IsClosed() {
+		t.mu.Unlock()
 		return ErrTunnelInactive
 	}
+	// Without this the CLI resumes the tunnel within seconds.
+	t.markStoppedLocked(userID, subdomain, time.Now())
+	t.mu.Unlock()
 
 	if err := session.Close(); err != nil {
 		return err
@@ -859,24 +878,22 @@ func sessionAnswers(session *yamux.Session, timeout time.Duration) bool {
 	}
 }
 
-func (t *tcpService) reserveSession(subdomain, tunnelID, userID string, maxActive int, isCustom bool, req tunnelRegistrationRequest, conn net.Conn) error {
+func (t *tcpService) reserveSession(claim tunnelClaim, req tunnelRegistrationRequest, conn net.Conn) error {
+	subdomain, userID, maxActive := claim.subdomain, claim.userID, claim.maxActive
 	t.mu.Lock()
 	defer t.mu.Unlock()
+
+	// The token was deleted while this registration was verifying it.
+	if claim.tokenID != "" && t.tokenRevokedLocked(claim.tokenID) {
+		return refuse(errInvalidToken)
+	}
 
 	if existing, ok := t.sessions[subdomain]; ok {
 		if existing == nil || !existing.IsClosed() {
 			return fmt.Errorf("subdomain %q is already connected", subdomain)
 		}
 		t.endOnlineLocked(subdomain, time.Now())
-		delete(t.sessions, subdomain)
-		delete(t.owners, subdomain)
-		delete(t.tunnelIDs, subdomain)
-		delete(t.sessionUsers, subdomain)
-		delete(t.sessionCustom, subdomain)
-		delete(t.sessionTypes, subdomain)
-		delete(t.shareTokens, subdomain)
-		delete(t.shareExpires, subdomain)
-		delete(t.sessionOrder, subdomain)
+		t.forgetSessionLocked(subdomain)
 	}
 
 	active := 0
@@ -894,12 +911,13 @@ func (t *tcpService) reserveSession(subdomain, tunnelID, userID string, maxActiv
 
 	t.sessions[subdomain] = nil
 	t.owners[subdomain] = conn
-	t.tunnelIDs[subdomain] = tunnelID
+	t.tunnelIDs[subdomain] = claim.tunnelID
 	t.sessionUsers[subdomain] = userID
-	// isCustom here means "needs Pro": custom names created before custom
-	// subdomains became Pro-only are passed as false so their traffic flows on
-	// any plan.
-	t.sessionCustom[subdomain] = isCustom
+	t.sessionTokens[subdomain] = claim.tokenID
+	// sessionCustom means "needs Pro": custom names created before custom
+	// subdomains became Pro-only are false so their traffic flows on any
+	// plan.
+	t.sessionCustom[subdomain] = claim.needsPro
 	t.sessionTypes[subdomain] = req.Type
 	if req.Type == "share" {
 		t.shareTokens[subdomain] = req.ShareToken
@@ -910,6 +928,20 @@ func (t *tcpService) reserveSession(subdomain, tunnelID, userID string, maxActiv
 	t.nextSession++
 	t.sessionOrder[subdomain] = t.nextSession
 	return nil
+}
+
+// forgetSessionLocked drops every entry of a session. Must hold t.mu.
+func (t *tcpService) forgetSessionLocked(subdomain string) {
+	delete(t.sessions, subdomain)
+	delete(t.owners, subdomain)
+	delete(t.tunnelIDs, subdomain)
+	delete(t.sessionUsers, subdomain)
+	delete(t.sessionTokens, subdomain)
+	delete(t.sessionCustom, subdomain)
+	delete(t.sessionTypes, subdomain)
+	delete(t.shareTokens, subdomain)
+	delete(t.shareExpires, subdomain)
+	delete(t.sessionOrder, subdomain)
 }
 
 func (t *tcpService) sessionWithinPlanLimit(subdomain, userID string, maxActive int) bool {

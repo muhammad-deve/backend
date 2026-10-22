@@ -119,6 +119,9 @@ func isReservedSubdomain(subdomain string) bool {
 // another account owns is refused unless it has gone unused for
 // nameReclaimAfter.
 func (t *tcpService) saveTunnel(subdomain string, isCustom bool, userID, localPort, protocol string) (string, string, error) {
+	if t.recentlyStopped(userID, subdomain) {
+		return "", "", refuseWith(stoppedMessage)
+	}
 	// Every way a custom name is handed out (--custom, a reconnect, or a
 	// restart reusing the latest tunnel) comes through here, so a word added
 	// to blocked_words also stops names that were allowed before.

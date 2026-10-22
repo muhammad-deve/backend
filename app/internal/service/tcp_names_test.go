@@ -217,12 +217,12 @@ func TestSavedNamesBreakingTheRulesGetARandomName(t *testing.T) {
 		{Type: "http", Port: "3000", Token: "gp_alice", Resume: "www"},
 		{Type: "http", Port: "3000", Token: "gp_alice"},
 	} {
-		subdomain, _, _, _, _, err := service.resolveTunnel(req)
+		claim, err := service.resolveTunnel(req)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if subdomain == "www" || validateSubdomain(subdomain) != nil {
-			t.Fatalf("resume %q got %q, want a fresh valid name", req.Resume, subdomain)
+		if claim.subdomain == "www" || validateSubdomain(claim.subdomain) != nil {
+			t.Fatalf("resume %q got %q, want a fresh valid name", req.Resume, claim.subdomain)
 		}
 	}
 }
@@ -231,11 +231,11 @@ func TestOwnerKeepsANameReservedLater(t *testing.T) {
 	service, app, users := dbService(t, "alice", "bob")
 	saveRow(t, app, users["alice"], "login", true, time.Now())
 
-	subdomain, _, _, _, _, err := service.resolveTunnel(tunnelRegistrationRequest{Type: "http", Port: "3000", Token: "gp_alice", Subdomain: "login"})
-	if err != nil || subdomain != "login" {
-		t.Fatalf("owner: got %q, %v", subdomain, err)
+	claim, err := service.resolveTunnel(tunnelRegistrationRequest{Type: "http", Port: "3000", Token: "gp_alice", Subdomain: "login"})
+	if err != nil || claim.subdomain != "login" {
+		t.Fatalf("owner: got %q, %v", claim.subdomain, err)
 	}
-	_, _, _, _, _, err = service.resolveTunnel(tunnelRegistrationRequest{Type: "http", Port: "3000", Token: "gp_bob", Subdomain: "login"})
+	_, err = service.resolveTunnel(tunnelRegistrationRequest{Type: "http", Port: "3000", Token: "gp_bob", Subdomain: "login"})
 	if err == nil || !strings.Contains(err.Error(), "is reserved") {
 		t.Fatalf("another account: err = %v, want reserved", err)
 	}

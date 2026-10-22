@@ -10,6 +10,7 @@ import (
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/config"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/handler"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/hook"
+	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/model"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/service"
 )
 
@@ -47,6 +48,16 @@ func NewApp(config *config.Config) *pocketbase.PocketBase {
 		}
 		e.Server.Handler = tunnelFirst(services.TCP(), e.Server.Handler)
 		return nil
+	})
+
+	// A deleted token ends the tunnels it opened, however it was deleted (the
+	// dashboard, the admin UI, or with its user). Their reconnects then fail
+	// with "authentication required".
+	app.OnRecordAfterDeleteSuccess(model.TokensCollection).BindFunc(func(e *core.RecordEvent) error {
+		if services != nil {
+			services.TCP().CloseSessionsForToken(e.Record.Id)
+		}
+		return e.Next()
 	})
 
 	// On shutdown (every deploy) write out the tunnel traffic and connected
