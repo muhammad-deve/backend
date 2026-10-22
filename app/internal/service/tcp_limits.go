@@ -1,9 +1,12 @@
 package service
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"log"
 	"net"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
 )
@@ -15,6 +18,23 @@ const (
 	maxPendingHandshakes     = 512
 	maxPendingHandshakesByIP = 20
 )
+
+// Registrations per minute that reach the database. Refused attempts don't
+// count, so a CLI retrying every few seconds gets in once the minute passes.
+const (
+	maxRegistrationsPerIP    = 60
+	maxRegistrationsPerToken = 30
+)
+
+// tooManyRegistrationsMessage has no permanent phrase, so CLIs keep retrying.
+const tooManyRegistrationsMessage = "too many tunnel registrations, try again in a minute"
+
+// tokenKey is the rate limit key for a CLI token, so tokens themselves aren't
+// kept in the limiter.
+func tokenKey(token string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(token)))
+	return hex.EncodeToString(sum[:16])
+}
 
 // handshakeLimiter counts connections that have not finished registering yet,
 // in total and per IP, so slow or idle clients can't use up goroutines and

@@ -164,6 +164,9 @@ type tcpService struct {
 	geo        *geoip.DB
 	// handshakes caps connections that haven't finished registering.
 	handshakes *handshakeLimiter
+	// Registrations reaching the database, per IP and per token.
+	registrationsByIP    *otpRateLimiter
+	registrationsByToken *otpRateLimiter
 	// hopSecret is TUNNEL_HOP_SECRET; see tunnelHopHeader.
 	hopSecret string
 	proxy     proxyLimits
@@ -211,35 +214,37 @@ func NewTCPService(app core.App, tunnels repository.TunnelsI, usage repository.U
 	}
 
 	return &tcpService{
-		addr:          ":" + port,
-		conns:         make(map[string]net.Conn),
-		sessions:      make(map[string]*yamux.Session),
-		owners:        make(map[string]net.Conn),
-		tunnelIDs:     make(map[string]string),
-		sessionUsers:  make(map[string]string),
-		sessionCustom: make(map[string]bool),
-		sessionTypes:  make(map[string]string),
-		shareTokens:   make(map[string]string),
-		shareExpires:  make(map[string]time.Time),
-		sessionOrder:  make(map[string]uint64),
-		sessionTokens: make(map[string]string),
-		stopped:       make(map[string]time.Time),
-		revokedTokens: make(map[string]time.Time),
-		app:           app,
-		domain:        domain,
-		stats:         make(map[tunnelStatKey]*tunnelStat),
-		stopFlush:     make(chan struct{}),
-		tunnels:       tunnels,
-		usage:         usage,
-		billing:       billing,
-		tokens:        tokens,
-		quotaCache:    make(map[string]trafficQuotaCacheEntry),
-		onlineSince:   make(map[string]time.Time),
-		geo:           geoip.Open(""),
-		handshakes:    newHandshakeLimiter(maxPendingHandshakes, maxPendingHandshakesByIP),
-		hopSecret:     strings.TrimSpace(os.Getenv("TUNNEL_HOP_SECRET")),
-		proxy:         defaultProxyLimits(),
-		randomName:    func() (string, error) { return randomSubdomain(6) },
+		addr:                 ":" + port,
+		conns:                make(map[string]net.Conn),
+		sessions:             make(map[string]*yamux.Session),
+		owners:               make(map[string]net.Conn),
+		tunnelIDs:            make(map[string]string),
+		sessionUsers:         make(map[string]string),
+		sessionCustom:        make(map[string]bool),
+		sessionTypes:         make(map[string]string),
+		shareTokens:          make(map[string]string),
+		shareExpires:         make(map[string]time.Time),
+		sessionOrder:         make(map[string]uint64),
+		sessionTokens:        make(map[string]string),
+		stopped:              make(map[string]time.Time),
+		revokedTokens:        make(map[string]time.Time),
+		app:                  app,
+		domain:               domain,
+		stats:                make(map[tunnelStatKey]*tunnelStat),
+		stopFlush:            make(chan struct{}),
+		tunnels:              tunnels,
+		usage:                usage,
+		billing:              billing,
+		tokens:               tokens,
+		quotaCache:           make(map[string]trafficQuotaCacheEntry),
+		onlineSince:          make(map[string]time.Time),
+		geo:                  geoip.Open(""),
+		handshakes:           newHandshakeLimiter(maxPendingHandshakes, maxPendingHandshakesByIP),
+		registrationsByIP:    newOTPRateLimiter(time.Minute, maxRegistrationsPerIP, 0),
+		registrationsByToken: newOTPRateLimiter(time.Minute, maxRegistrationsPerToken, 0),
+		hopSecret:            strings.TrimSpace(os.Getenv("TUNNEL_HOP_SECRET")),
+		proxy:                defaultProxyLimits(),
+		randomName:           func() (string, error) { return randomSubdomain(6) },
 	}
 }
 
@@ -404,6 +409,18 @@ func (t *tcpService) handleConnection(conn net.Conn, ip string) {
 			t.sendRegistrationError(conn, "share expiration must be in the future")
 			return
 		}
+	}
+
+	// Every registration below costs database work.
+	if allowed, _ := t.registrationsByIP.Allow(ip); !allowed {
+		log.Printf("too many tunnel registrations from %s", conn.RemoteAddr())
+		t.sendRegistrationError(conn, tooManyRegistrationsMessage)
+		return
+	}
+	if allowed, _ := t.registrationsByToken.Allow(tokenKey(req.Token)); !allowed {
+		log.Printf("too many tunnel registrations with one token from %s", conn.RemoteAddr())
+		t.sendRegistrationError(conn, tooManyRegistrationsMessage)
+		return
 	}
 
 	claim, err := t.resolveTunnel(req)
@@ -622,8 +639,20 @@ func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (tunnelClaim, 
 		}
 		return tunnelClaim{subdomain, tunnelID, userID, tokenID, limits.MaxActiveTunnels, needsPro}, nil
 	}
+	// Checked before any row is written; reserveSession checks again under
+	// the lock. A held session of the same name is replaced, so it doesn't
+	// count.
+	full := func(subdomain string) error {
+		if t.activeSessions(userID, subdomain) >= limits.MaxActiveTunnels {
+			return refuseWith(planLimitMessage(limits.MaxActiveTunnels))
+		}
+		return nil
+	}
 
 	if req.Type == "share" && strings.TrimSpace(req.Resume) == "" {
+		if err := full(""); err != nil {
+			return tunnelClaim{}, err
+		}
 		subdomain, tunnelID, err := t.createRandomTunnel(userID, req.Port, req.Type)
 		return claimed(subdomain, tunnelID, false, err)
 	}
@@ -640,6 +669,9 @@ func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (tunnelClaim, 
 		if err == nil && record.GetString("user") == userID && validateLegacySubdomain(resume) == nil {
 			isCustom := record.GetBool("is_custom")
 			if !isCustom || limits.CustomSubdomains || isGrandfathered(record) {
+				if err := full(resume); err != nil {
+					return tunnelClaim{}, err
+				}
 				subdomain, tunnelID, err := t.saveTunnel(resume, isCustom, userID, req.Port, req.Type)
 				return claimed(subdomain, tunnelID, needsPro(record), err)
 			}
@@ -659,6 +691,9 @@ func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (tunnelClaim, 
 		if !limits.CustomSubdomains && !owned {
 			return tunnelClaim{}, refuse(fmt.Errorf("%w: custom subdomains are available on Pro; upgrade at https://goport.uz/dashboard#billing", ErrProRequired))
 		}
+		if err := full(subdomain); err != nil {
+			return tunnelClaim{}, err
+		}
 		subdomain, tunnelID, err := t.saveTunnel(subdomain, true, userID, req.Port, req.Type)
 		return claimed(subdomain, tunnelID, !owned, err)
 	}
@@ -674,6 +709,9 @@ func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (tunnelClaim, 
 			// A saved name that breaks the naming rules (rows once written
 			// straight through the REST API) gets a fresh random name instead.
 			if validateLegacySubdomain(subdomain) == nil && (!isCustom || limits.CustomSubdomains || isGrandfathered(record)) {
+				if err := full(subdomain); err != nil {
+					return tunnelClaim{}, err
+				}
 				subdomain, tunnelID, err := t.saveTunnel(subdomain, isCustom, userID, req.Port, req.Type)
 				return claimed(subdomain, tunnelID, needsPro(record), err)
 			}
@@ -682,6 +720,9 @@ func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (tunnelClaim, 
 		}
 	}
 
+	if err := full(""); err != nil {
+		return tunnelClaim{}, err
+	}
 	subdomain, tunnelID, err := t.createRandomTunnel(userID, req.Port, req.Type)
 	return claimed(subdomain, tunnelID, false, err)
 }
@@ -896,17 +937,8 @@ func (t *tcpService) reserveSession(claim tunnelClaim, req tunnelRegistrationReq
 		t.forgetSessionLocked(subdomain)
 	}
 
-	active := 0
-	for activeSubdomain, activeUserID := range t.sessionUsers {
-		if activeUserID != userID {
-			continue
-		}
-		if session, ok := t.sessions[activeSubdomain]; ok && (session == nil || !session.IsClosed()) {
-			active++
-		}
-	}
-	if active >= maxActive {
-		return fmt.Errorf("your plan allows up to %d active tunnels; stop one or upgrade at https://goport.uz/dashboard#billing", maxActive)
+	if t.activeSessionsLocked(userID, "") >= maxActive {
+		return refuseWith(planLimitMessage(maxActive))
 	}
 
 	t.sessions[subdomain] = nil
@@ -928,6 +960,33 @@ func (t *tcpService) reserveSession(claim tunnelClaim, req tunnelRegistrationReq
 	t.nextSession++
 	t.sessionOrder[subdomain] = t.nextSession
 	return nil
+}
+
+// activeSessions counts userID's live and still-registering sessions,
+// leaving out except.
+func (t *tcpService) activeSessions(userID, except string) int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.activeSessionsLocked(userID, except)
+}
+
+func (t *tcpService) activeSessionsLocked(userID, except string) int {
+	active := 0
+	for subdomain, owner := range t.sessionUsers {
+		if owner != userID || subdomain == except {
+			continue
+		}
+		if session, ok := t.sessions[subdomain]; ok && (session == nil || !session.IsClosed()) {
+			active++
+		}
+	}
+	return active
+}
+
+// planLimitMessage has no permanent phrase on purpose: the CLI keeps retrying
+// and connects once the user stops another tunnel.
+func planLimitMessage(maxActive int) string {
+	return fmt.Sprintf("your plan allows up to %d active tunnels; stop one or upgrade at https://goport.uz/dashboard#billing", maxActive)
 }
 
 // forgetSessionLocked drops every entry of a session. Must hold t.mu.
