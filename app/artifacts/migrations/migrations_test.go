@@ -99,3 +99,17 @@ func TestClearPreclaimedAccounts(t *testing.T) {
 		t.Fatal("verified accounts must be left alone")
 	}
 }
+
+func TestUsersDeleteIsSuperuserOnly(t *testing.T) {
+	app := newMigratedApp(t)
+	users, err := app.FindCollectionByNameOrId("users")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if users.DeleteRule != nil {
+		t.Fatalf("users deleteRule = %q, want nil", *users.DeleteRule)
+	}
+	if users.CreateRule == nil || *users.CreateRule != `@request.context = "oauth2"` {
+		t.Fatal("the create rule must stay locked to Google sign-in")
+	}
+}

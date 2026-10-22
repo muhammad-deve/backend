@@ -44,6 +44,16 @@ func (h *Hook) registerAuthHooks(app *pocketbase.PocketBase) {
 		return e.Next()
 	})
 
+	// Accounts are closed through support: deleting one would drop its
+	// billing rows while Lemon Squeezy keeps charging. The collection's
+	// deleteRule is superuser-only too; this also covers a changed rule.
+	app.OnRecordDeleteRequest(model.UsersCollection).BindFunc(func(e *core.RecordRequestEvent) error {
+		if !e.HasSuperuserAuth() {
+			return e.ForbiddenError("Accounts can't be deleted here. Please email support to close your account.", nil)
+		}
+		return e.Next()
+	})
+
 	// Delete sign-ups that never got past the email code, once a day.
 	app.Cron().MustAdd("goportPurgeStaleSignups", "40 3 * * *", func() {
 		deleted, err := h.service.Account().PurgeStalePending(7 * 24 * time.Hour)
