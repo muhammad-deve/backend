@@ -408,8 +408,15 @@ func (t *tcpService) handleConnection(conn net.Conn, ip string) {
 
 	createdSubdomain, tunnelID, userID, maxActiveTunnels, isCustom, err := t.resolveTunnel(req)
 	if err != nil {
+		var refused *refusal
+		if errors.As(err, &refused) {
+			log.Printf("tunnel registration from %s refused: %s", conn.RemoteAddr(), refused.text)
+			t.sendRegistrationError(conn, refused.text)
+			return
+		}
+		// Database and other internal errors stay in the log.
 		log.Printf("failed to register tunnel: %v", err)
-		t.sendRegistrationError(conn, fmt.Sprintf("failed to register tunnel: %v", err))
+		t.sendRegistrationError(conn, internalRegistrationError)
 		return
 	}
 	subdomain = createdSubdomain
@@ -519,6 +526,33 @@ func (t *tcpService) sendRegistrationError(conn net.Conn, msg string) {
 	}
 }
 
+// refusal is a registration error whose text is sent to the CLI as is. Any
+// other error is logged and the CLI gets internalRegistrationError. CLIs stop
+// retrying only when the text contains one of their permanent phrases
+// ("authentication required", "subdomain cannot", ...), so refusal texts
+// must keep them.
+type refusal struct {
+	text string
+	err  error
+}
+
+func (r *refusal) Error() string { return r.text }
+func (r *refusal) Unwrap() error { return r.err }
+
+// refuse sends err's text with the prefix registration refusals have always
+// had.
+func refuse(err error) error {
+	return &refusal{text: "failed to register tunnel: " + err.Error(), err: err}
+}
+
+// refuseWith sends text exactly.
+func refuseWith(text string) error {
+	return &refusal{text: text}
+}
+
+// internalRegistrationError has no permanent phrase, so CLIs retry.
+const internalRegistrationError = "failed to register tunnel: internal server error, try again"
+
 const tunnelUserID = "5743847505m28jb"
 
 // errInvalidToken signals that a CLI either supplied no token or a token that
@@ -533,11 +567,15 @@ var errInvalidToken = errors.New("authentication required: run `goport auth <tok
 func (t *tcpService) resolveUserID(token string) (string, error) {
 	token = strings.TrimSpace(token)
 	if token == "" {
-		return "", errInvalidToken
+		return "", refuse(errInvalidToken)
 	}
 	owner, err := t.tokens.Verify(token)
 	if errors.Is(err, ErrInvalidToken) {
-		return "", errInvalidToken
+		return "", refuse(errInvalidToken)
+	}
+	if errors.Is(err, ErrProRequired) {
+		// A token beyond the plan's device allowance.
+		return "", refuse(err)
 	}
 	if err != nil {
 		return "", err
@@ -547,7 +585,7 @@ func (t *tcpService) resolveUserID(token string) (string, error) {
 
 func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (string, string, string, int, bool, error) {
 	if req.Reset && strings.TrimSpace(req.Subdomain) != "" {
-		return "", "", "", 0, false, fmt.Errorf("reset and custom subdomain cannot be used together")
+		return "", "", "", 0, false, refuse(fmt.Errorf("reset and custom subdomain cannot be used together"))
 	}
 
 	userID, err := t.resolveUserID(req.Token)
@@ -556,13 +594,14 @@ func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (string, strin
 	}
 	limits, usedBytes, err := t.trafficAllowance(userID)
 	if err != nil {
-		return "", "", "", 0, false, fmt.Errorf("could not verify your subscription or monthly usage")
+		log.Printf("could not load the plan or usage of %s: %v", userID, err)
+		return "", "", "", 0, false, refuse(fmt.Errorf("could not verify your subscription or monthly usage"))
 	}
 	if usedBytes >= limits.MonthlyBytes {
 		if limits.IsPro {
-			return "", "", "", 0, false, fmt.Errorf("monthly traffic limit reached for Pro (%d GB)", limits.MonthlyBytes/(1024*1024*1024))
+			return "", "", "", 0, false, refuse(fmt.Errorf("monthly traffic limit reached for Pro (%d GB)", limits.MonthlyBytes/(1024*1024*1024)))
 		}
-		return "", "", "", 0, false, fmt.Errorf("monthly traffic limit reached for Free (%d GB); upgrade to Pro for %d GB", limits.MonthlyBytes/(1024*1024*1024), model.ProMonthlyBytes/(1024*1024*1024))
+		return "", "", "", 0, false, refuse(fmt.Errorf("monthly traffic limit reached for Free (%d GB); upgrade to Pro for %d GB", limits.MonthlyBytes/(1024*1024*1024), model.ProMonthlyBytes/(1024*1024*1024)))
 	}
 	if req.Type == "share" && strings.TrimSpace(req.Resume) == "" {
 		subdomain, err := t.generateUniqueSubdomain()
@@ -594,11 +633,11 @@ func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (string, strin
 	if strings.TrimSpace(req.Subdomain) != "" {
 		subdomain, err := normalizeRequestedSubdomain(req.Subdomain, t.domain)
 		if err != nil {
-			return "", "", "", 0, false, err
+			return "", "", "", 0, false, refuse(err)
 		}
 		owned := t.ownsGrandfatheredName(subdomain, userID)
 		if !limits.CustomSubdomains && !owned {
-			return "", "", "", 0, false, fmt.Errorf("%w: custom subdomains are available on Pro; upgrade at https://goport.uz/dashboard#billing", ErrProRequired)
+			return "", "", "", 0, false, refuse(fmt.Errorf("%w: custom subdomains are available on Pro; upgrade at https://goport.uz/dashboard#billing", ErrProRequired))
 		}
 		subdomain, tunnelID, err := t.saveTunnel(subdomain, true, userID, req.Port, req.Type)
 		return subdomain, tunnelID, userID, limits.MaxActiveTunnels, !owned, err
@@ -634,7 +673,7 @@ func (t *tcpService) saveTunnel(subdomain string, isCustom bool, userID, localPo
 	// restart reusing the latest tunnel) comes through here, so a word added
 	// to blocked_words also stops names that were allowed before.
 	if isCustom && containsBlockedWord(subdomain, t.blockedWords()) {
-		return "", "", errBlockedSubdomain
+		return "", "", refuse(errBlockedSubdomain)
 	}
 
 	collection, err := t.app.FindCollectionByNameOrId(model.TunnelsCollection)
@@ -648,7 +687,7 @@ func (t *tcpService) saveTunnel(subdomain string, isCustom bool, userID, localPo
 		// Checking it before any write also stops a second CLI from rewriting the
 		// connection metadata of a tunnel that is still online.
 		if t.hasLiveSession(subdomain) && !t.releaseDeadSession(subdomain, userID) {
-			return "", "", fmt.Errorf("subdomain %q is currently in use", subdomain)
+			return "", "", refuse(fmt.Errorf("subdomain %q is currently in use", subdomain))
 		}
 
 		owner := existing.GetString("user")
