@@ -5,7 +5,9 @@ import (
 
 	"github.com/pocketbase/pocketbase"
 	"github.com/pocketbase/pocketbase/core"
+	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/handler"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/model"
+	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/service"
 )
 
 // registerAuthHooks wires account-lifecycle side effects:
@@ -19,6 +21,25 @@ func (h *Hook) registerAuthHooks(app *pocketbase.PocketBase) {
 			h.logger.Error("failed to create default token", "error", err, "userId", e.Record.Id)
 		}
 		return e.Next()
+	})
+
+	// Limit wrong passwords per IP and per account. Only failures count, so
+	// someone else's attempts can lock an account for at most the window.
+	app.OnRecordAuthWithPasswordRequest(model.UsersCollection).BindFunc(func(e *core.RecordAuthWithPasswordRequestEvent) error {
+		ip := handler.ClientIP(e.Request)
+		if err := h.service.Throttle().LoginAllowed(ip, e.Identity); err != nil {
+			seconds := 60
+			if rl, ok := service.IsRateLimited(err); ok {
+				seconds = rl.RetryAfterSeconds()
+			}
+			return handler.TooManyAttempts(e.RequestEvent, seconds)
+		}
+		if err := e.Next(); err != nil {
+			h.service.Throttle().LoginFailed(ip, e.Identity)
+			return err
+		}
+		h.service.Throttle().LoginSucceeded(e.Identity)
+		return nil
 	})
 
 	// Pull the avatar URL from the OAuth provider (e.g. Google) on sign-in.

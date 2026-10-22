@@ -41,6 +41,10 @@ type Config struct {
 	ShareProMaxUploadBytes         int64 `env:"SHARE_PRO_MAX_UPLOAD_BYTES" env-default:"524288000"`
 	ShareProDefaultRetentionHours  int   `env:"SHARE_PRO_DEFAULT_RETENTION_HOURS" env-default:"168"`
 	ShareProMaxRetentionHours      int   `env:"SHARE_PRO_MAX_RETENTION_HOURS" env-default:"720"`
+	// Emails with a code (sign-up, password reset, email change) per client
+	// IP and for the whole server, per hour.
+	AuthCodeSendsPerIP   int `env:"AUTH_CODE_SENDS_PER_IP" env-default:"10"`
+	AuthCodeSendsPerHour int `env:"AUTH_CODE_SENDS_PER_HOUR" env-default:"300"`
 }
 
 var instance *Config

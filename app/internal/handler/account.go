@@ -3,7 +3,6 @@ package handler
 import (
 	"errors"
 	"net/http"
-	"strconv"
 
 	"github.com/pocketbase/pocketbase/core"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/model"
@@ -19,11 +18,14 @@ func (h *Handler) RequestEmailChangeHandler(e *core.RequestEvent) error {
 		return h.NewErrorResponse(e, http.StatusBadRequest, "invalid request body")
 	}
 
+	if err := h.service.Throttle().CodeSend(ClientIP(e.Request)); err != nil {
+		return h.limitedResponse(e, err)
+	}
+
 	resp, err := h.service.Account().RequestEmailChange(e.Auth, req)
 	if err != nil {
-		if rl, ok := service.IsRateLimited(err); ok {
-			e.Response.Header().Set("Retry-After", strconv.Itoa(rl.RetryAfterSeconds()))
-			return h.NewErrorResponse(e, http.StatusTooManyRequests, "Too many requests. Please try again later.")
+		if _, ok := service.IsRateLimited(err); ok {
+			return h.limitedResponse(e, err)
 		}
 		if errors.Is(err, service.ErrEmailTaken) {
 			return h.NewErrorResponse(e, http.StatusConflict, "This email is already in use.")
@@ -47,6 +49,10 @@ func (h *Handler) ConfirmEmailChangeHandler(e *core.RequestEvent) error {
 		return h.NewErrorResponse(e, http.StatusBadRequest, "invalid request body")
 	}
 
+	if err := h.service.Throttle().CodeCheck(ClientIP(e.Request)); err != nil {
+		return h.limitedResponse(e, err)
+	}
+
 	resp, err := h.service.Account().ConfirmEmailChange(e.Auth, req)
 	if err != nil {
 		if errors.Is(err, service.ErrEmailTaken) {
@@ -67,8 +73,16 @@ func (h *Handler) ChangePasswordHandler(e *core.RequestEvent) error {
 		return h.NewErrorResponse(e, http.StatusBadRequest, "invalid request body")
 	}
 
+	ip := ClientIP(e.Request)
+	if err := h.service.Throttle().LoginAllowed(ip, e.Auth.Email()); err != nil {
+		return h.limitedResponse(e, err)
+	}
+
 	resp, err := h.service.Account().ChangePassword(e.Auth, req)
 	if err != nil {
+		if errors.Is(err, service.ErrCurrentPasswordIncorrect) {
+			h.service.Throttle().LoginFailed(ip, e.Auth.Email())
+		}
 		return h.NewErrorResponse(e, http.StatusBadRequest, err.Error())
 	}
 

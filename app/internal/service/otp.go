@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pocketbase/pocketbase"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/security"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/model"
@@ -59,17 +58,19 @@ type OTPI interface {
 }
 
 type otpService struct {
-	app     *pocketbase.PocketBase
-	email   EmailI
-	limiter *otpRateLimiter
+	app      core.App
+	email    EmailI
+	limiter  *rateLimiter
+	attempts *otpAttempts
 }
 
-func NewOTPService(app *pocketbase.PocketBase, email EmailI) OTPI {
+func NewOTPService(app core.App, email EmailI, attempts *otpAttempts) OTPI {
 	return &otpService{
 		app:   app,
 		email: email,
 		// Max 5 codes per email per hour, with a 60s cooldown between sends.
-		limiter: newOTPRateLimiter(time.Hour, 5, 60*time.Second),
+		limiter:  newRateLimiter(time.Hour, 5, 60*time.Second),
+		attempts: attempts,
 	}
 }
 
@@ -166,7 +167,7 @@ func (s *otpService) issueOTP(collectionID string, user *core.Record) (*model.Se
 // valid so it can be re-checked by CompleteRegistration when the password is
 // set. Returns the pending user's email and name on success.
 func (s *otpService) VerifyOTP(req *model.VerifyOTPRequest) (*model.VerifyOTPResponse, error) {
-	otp, err := s.checkOTP(req.OtpID, req.Code)
+	otp, err := checkOTPCode(s.app, s.attempts, req.OtpID, req.Code)
 	if err != nil {
 		return nil, err
 	}
@@ -191,7 +192,7 @@ func (s *otpService) CompleteRegistration(req *model.CompleteRegistrationRequest
 		return nil, fmt.Errorf("%s", reason)
 	}
 
-	otp, err := s.checkOTP(req.OtpID, req.Code)
+	otp, err := checkOTPCode(s.app, s.attempts, req.OtpID, req.Code)
 	if err != nil {
 		return nil, err
 	}
@@ -260,7 +261,7 @@ func (s *otpService) ResetPassword(req *model.ResetPasswordRequest) (*model.Rese
 		return nil, fmt.Errorf("%s", reason)
 	}
 
-	otp, err := s.checkOTP(req.OtpID, req.Code)
+	otp, err := checkOTPCode(s.app, s.attempts, req.OtpID, req.Code)
 	if err != nil {
 		return nil, err
 	}
@@ -286,30 +287,48 @@ func (s *otpService) ResetPassword(req *model.ResetPasswordRequest) (*model.Rese
 	}, nil
 }
 
-// checkOTP loads an OTP by id and validates the submitted code and expiry.
-// Expired OTPs are deleted. It does not consume valid OTPs.
-func (s *otpService) checkOTP(otpID, code string) (*core.OTP, error) {
+// ErrTooManyCodeAttempts is returned once an OTP has had too many wrong codes.
+// The OTP is deleted at that point and a new code must be requested.
+var ErrTooManyCodeAttempts = errors.New("Too many wrong codes. Please request a new code.")
+
+// checkOTPCode loads an OTP by id and checks the code and expiry. Expired OTPs
+// are deleted, and so is an OTP after maxWrongCodesPerOTP wrong codes. It does
+// not consume a valid OTP.
+func checkOTPCode(app core.App, attempts *otpAttempts, otpID, code string) (*core.OTP, error) {
 	otpID = strings.TrimSpace(otpID)
 	code = strings.TrimSpace(code)
 	if otpID == "" || code == "" {
 		return nil, fmt.Errorf("otpId and code are required")
 	}
 
-	otp, err := s.app.FindOTPById(otpID)
+	otp, err := app.FindOTPById(otpID)
 	if err != nil {
 		return nil, fmt.Errorf("invalid or expired code")
 	}
 
 	if otp.HasExpired(model.OTPExpiry) {
-		if delErr := s.app.Delete(otp); delErr != nil {
-			s.app.Logger().Error("failed to delete expired OTP", "error", delErr, "otpId", otp.Id)
+		deleteOTP(app, otp, "expired")
+		attempts.forget(otp.Id)
+		return nil, fmt.Errorf("invalid or expired code")
+	}
+
+	if !attempts.begin(otp.Id) {
+		deleteOTP(app, otp, "too many wrong codes")
+		return nil, ErrTooManyCodeAttempts
+	}
+	if !otp.ValidatePassword(code) {
+		if attempts.exhausted(otp.Id) {
+			deleteOTP(app, otp, "too many wrong codes")
 		}
 		return nil, fmt.Errorf("invalid or expired code")
 	}
-
-	if !otp.ValidatePassword(code) {
-		return nil, fmt.Errorf("invalid or expired code")
-	}
+	attempts.release(otp.Id)
 
 	return otp, nil
+}
+
+func deleteOTP(app core.App, otp *core.OTP, reason string) {
+	if err := app.Delete(otp); err != nil {
+		app.Logger().Error("failed to delete OTP", "error", err, "otpId", otp.Id, "reason", reason)
+	}
 }

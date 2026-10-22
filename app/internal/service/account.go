@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pocketbase/pocketbase"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/security"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/model"
@@ -26,16 +25,18 @@ type AccountI interface {
 }
 
 type accountService struct {
-	app     *pocketbase.PocketBase
-	email   EmailI
-	limiter *otpRateLimiter
+	app      core.App
+	email    EmailI
+	limiter  *rateLimiter
+	attempts *otpAttempts
 }
 
-func NewAccountService(app *pocketbase.PocketBase, email EmailI) AccountI {
+func NewAccountService(app core.App, email EmailI, attempts *otpAttempts) AccountI {
 	return &accountService{
-		app:     app,
-		email:   email,
-		limiter: newOTPRateLimiter(time.Hour, 5, 60*time.Second),
+		app:      app,
+		email:    email,
+		limiter:  newRateLimiter(time.Hour, 5, 60*time.Second),
+		attempts: attempts,
 	}
 }
 
@@ -88,23 +89,11 @@ func (s *accountService) RequestEmailChange(user *core.Record, req *model.Reques
 }
 
 func (s *accountService) ConfirmEmailChange(user *core.Record, req *model.ConfirmEmailChangeRequest) (*model.EmailChangeResponse, error) {
-	otpID := strings.TrimSpace(req.OtpID)
-	code := strings.TrimSpace(req.Code)
-	if otpID == "" || code == "" {
-		return nil, fmt.Errorf("otpId and code are required")
+	otp, err := checkOTPCode(s.app, s.attempts, req.OtpID, req.Code)
+	if err != nil {
+		return nil, err
 	}
-
-	otp, err := s.app.FindOTPById(otpID)
-	if err != nil || otp.RecordRef() != user.Id {
-		return nil, fmt.Errorf("invalid or expired code")
-	}
-	if otp.HasExpired(model.OTPExpiry) {
-		if delErr := s.app.Delete(otp); delErr != nil {
-			s.app.Logger().Error("failed to delete expired email-change OTP", "error", delErr, "otpId", otp.Id)
-		}
-		return nil, fmt.Errorf("invalid or expired code")
-	}
-	if !otp.ValidatePassword(code) {
+	if otp.RecordRef() != user.Id {
 		return nil, fmt.Errorf("invalid or expired code")
 	}
 

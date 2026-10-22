@@ -3,7 +3,6 @@ package handler
 import (
 	"errors"
 	"net/http"
-	"strconv"
 
 	"github.com/pocketbase/pocketbase/core"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/model"
@@ -19,6 +18,11 @@ func (h *Handler) SendOTPHandler(e *core.RequestEvent) error {
 		return h.NewErrorResponse(e, http.StatusBadRequest, "invalid request body")
 	}
 
+	// Limit before the registered check so it can't be used to test emails.
+	if err := h.service.Throttle().CodeSend(ClientIP(e.Request)); err != nil {
+		return h.limitedResponse(e, err)
+	}
+
 	resp, err := h.service.OTP().SendOTP(req)
 	if err != nil {
 		switch {
@@ -27,9 +31,8 @@ func (h *Handler) SendOTPHandler(e *core.RequestEvent) error {
 		case errors.Is(err, service.ErrDisposableEmail):
 			return h.NewErrorResponse(e, http.StatusBadRequest, disposableEmailMessage)
 		default:
-			if rl, ok := service.IsRateLimited(err); ok {
-				e.Response.Header().Set("Retry-After", strconv.Itoa(rl.RetryAfterSeconds()))
-				return h.NewErrorResponse(e, http.StatusTooManyRequests, "Too many requests. Please try again later.")
+			if _, ok := service.IsRateLimited(err); ok {
+				return h.limitedResponse(e, err)
 			}
 			h.logger.Error("failed to send OTP", "error", err, "email", req.Email)
 			return h.NewErrorResponse(e, http.StatusBadRequest, "Couldn't send the verification code. Please try again.")
@@ -47,6 +50,10 @@ func (h *Handler) VerifyOTPHandler(e *core.RequestEvent) error {
 		return h.NewErrorResponse(e, http.StatusBadRequest, "invalid request body")
 	}
 
+	if err := h.service.Throttle().CodeCheck(ClientIP(e.Request)); err != nil {
+		return h.limitedResponse(e, err)
+	}
+
 	resp, err := h.service.OTP().VerifyOTP(req)
 	if err != nil {
 		return h.NewErrorResponse(e, http.StatusBadRequest, err.Error())
@@ -61,6 +68,10 @@ func (h *Handler) CompleteRegistrationHandler(e *core.RequestEvent) error {
 	req := &model.CompleteRegistrationRequest{}
 	if err := e.BindBody(req); err != nil {
 		return h.NewErrorResponse(e, http.StatusBadRequest, "invalid request body")
+	}
+
+	if err := h.service.Throttle().CodeCheck(ClientIP(e.Request)); err != nil {
+		return h.limitedResponse(e, err)
 	}
 
 	resp, err := h.service.OTP().CompleteRegistration(req)
@@ -82,11 +93,14 @@ func (h *Handler) ForgotPasswordHandler(e *core.RequestEvent) error {
 		return h.NewErrorResponse(e, http.StatusBadRequest, "invalid request body")
 	}
 
+	if err := h.service.Throttle().CodeSend(ClientIP(e.Request)); err != nil {
+		return h.limitedResponse(e, err)
+	}
+
 	resp, err := h.service.OTP().ForgotPassword(req)
 	if err != nil {
-		if rl, ok := service.IsRateLimited(err); ok {
-			e.Response.Header().Set("Retry-After", strconv.Itoa(rl.RetryAfterSeconds()))
-			return h.NewErrorResponse(e, http.StatusTooManyRequests, "Too many requests. Please try again later.")
+		if _, ok := service.IsRateLimited(err); ok {
+			return h.limitedResponse(e, err)
 		}
 		h.logger.Error("failed to send reset OTP", "error", err, "email", req.Email)
 		return h.NewErrorResponse(e, http.StatusBadRequest, err.Error())
@@ -102,6 +116,10 @@ func (h *Handler) ResetPasswordHandler(e *core.RequestEvent) error {
 		return h.NewErrorResponse(e, http.StatusBadRequest, "invalid request body")
 	}
 
+	if err := h.service.Throttle().CodeCheck(ClientIP(e.Request)); err != nil {
+		return h.limitedResponse(e, err)
+	}
+
 	resp, err := h.service.OTP().ResetPassword(req)
 	if err != nil {
 		return h.NewErrorResponse(e, http.StatusBadRequest, err.Error())
@@ -111,3 +129,12 @@ func (h *Handler) ResetPasswordHandler(e *core.RequestEvent) error {
 }
 
 const disposableEmailMessage = "Temporary email addresses can't be used. Please use your regular email."
+
+// limitedResponse writes a 429 for a rate-limit error.
+func (h *Handler) limitedResponse(e *core.RequestEvent, err error) error {
+	seconds := 60
+	if rl, ok := service.IsRateLimited(err); ok {
+		seconds = rl.RetryAfterSeconds()
+	}
+	return TooManyAttempts(e, seconds)
+}
