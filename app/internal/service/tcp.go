@@ -127,6 +127,8 @@ type tcpService struct {
 	// minutes_used increment, so a save from a stale copy can't undo it.
 	recordMu sync.Mutex
 	geo      *geoip.DB
+	// handshakes caps connections that haven't finished registering.
+	handshakes *handshakeLimiter
 }
 
 // onlineDelta is connected time to add to one tunnel and its owner.
@@ -193,6 +195,7 @@ func NewTCPService(app core.App, tunnels repository.TunnelsI, usage repository.U
 		quotaCache:    make(map[string]trafficQuotaCacheEntry),
 		onlineSince:   make(map[string]time.Time),
 		geo:           geoip.Open(""),
+		handshakes:    newHandshakeLimiter(maxPendingHandshakes, maxPendingHandshakesByIP),
 	}
 }
 
@@ -258,28 +261,55 @@ func (t *tcpService) Stop() {
 	log.Printf("TCP tunnel listener stopped")
 }
 
+// acceptLoop runs until the listener is closed. Other Accept errors (for
+// example too many open files) are logged and retried after a short pause, so
+// one bad moment can't stop new tunnels until the next restart.
 func (t *tcpService) acceptLoop() {
+	var delay time.Duration
 	for {
 		conn, err := t.listener.Accept()
 		if err != nil {
-			log.Printf("TCP accept error: %v", err)
-			return
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			delay = acceptBackoff(delay)
+			log.Printf("TCP accept error: %v; retrying in %v", err, delay)
+			time.Sleep(delay)
+			continue
 		}
+		delay = 0
 
 		remoteAddr := conn.RemoteAddr().String()
+		ip := remoteIP(conn.RemoteAddr())
+		if !t.handshakes.begin(ip) {
+			log.Printf("refusing CLI connection from %s: too many pending handshakes", remoteAddr)
+			_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			t.sendRegistrationError(conn, "the server is busy, try again in a moment")
+			conn.Close()
+			continue
+		}
 		log.Printf("new CLI connection from %s", remoteAddr)
 
 		t.mu.Lock()
 		t.conns[remoteAddr] = conn
 		t.mu.Unlock()
 
-		go t.handleConnection(conn)
+		go t.handleConnection(conn, ip)
 	}
 }
 
-func (t *tcpService) handleConnection(conn net.Conn) {
+func (t *tcpService) handleConnection(conn net.Conn, ip string) {
 	var subdomain string
 	var sessionReserved bool
+
+	// Registered first so it runs last, after the cleanup below.
+	defer recoverPanic("tunnel connection")
+
+	// The handshake slot is freed once registration is answered, or when the
+	// connection ends, whichever comes first.
+	var handshakeDone sync.Once
+	endHandshake := func() { handshakeDone.Do(func() { t.handshakes.end(ip) }) }
+	defer endHandshake()
 
 	defer func() {
 		remoteAddr := conn.RemoteAddr().String()
@@ -317,7 +347,13 @@ func (t *tcpService) handleConnection(conn net.Conn) {
 	_ = conn.SetDeadline(time.Now().Add(registrationTimeout))
 
 	var req tunnelRegistrationRequest
-	if err := json.NewDecoder(conn).Decode(&req); err != nil {
+	limited := &io.LimitedReader{R: conn, N: maxRegistrationBytes}
+	if err := json.NewDecoder(limited).Decode(&req); err != nil {
+		if limited.N <= 0 {
+			log.Printf("tunnel registration from %s is larger than %d bytes", conn.RemoteAddr(), maxRegistrationBytes)
+			t.sendRegistrationError(conn, "registration request is too large")
+			return
+		}
 		log.Printf("failed to read tunnel registration: %v", err)
 		return
 	}
@@ -369,6 +405,7 @@ func (t *tcpService) handleConnection(conn net.Conn) {
 
 	// The handshake is done; from here yamux keepalives detect a dead link.
 	_ = conn.SetDeadline(time.Time{})
+	endHandshake()
 
 	log.Printf("registered %s tunnel %s -> localhost:%s", req.Type, resp.URL, req.Port)
 
@@ -1221,11 +1258,17 @@ func (t *tcpService) flushLoop() {
 		case <-t.stopFlush:
 			return
 		case <-ticker.C:
-			t.flushStats()
+			t.safely("stats flush", t.flushStats)
 		case now := <-online.C:
-			t.flushOnline(now)
+			t.safely("online time flush", func() { t.flushOnline(now) })
 		}
 	}
+}
+
+// safely runs fn and logs a panic instead of ending the caller's loop.
+func (t *tcpService) safely(where string, fn func()) {
+	defer recoverPanic(where)
+	fn()
 }
 
 // endOnlineLocked queues the connected time a session built up since it was
