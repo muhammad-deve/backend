@@ -23,7 +23,7 @@ func newTestShares(t *testing.T, pro bool) *sharesService {
 			ShareProDefaultRetentionHours: 168, ShareProMaxRetentionHours: 720,
 		},
 		repo: &memoryShares{records: make(map[string]model.ShareRecord)}, billing: fakeShareBilling{pro: pro},
-		storageDir: t.TempDir(), cryptKey: [32]byte{4, 5, 6}, uploads: make(chan struct{}, 2),
+		storageDir: t.TempDir(), secret: []byte("test secret"), cryptKey: [32]byte{4, 5, 6}, uploads: make(chan struct{}, 2),
 		sessions: make(map[string]*shareUploadSession),
 	}
 }
@@ -130,7 +130,7 @@ func TestDirectLinksArePro(t *testing.T) {
 		t.Fatalf("direct item = %#v", item)
 	}
 	token := strings.Split(strings.TrimPrefix(item.URL, "https://goport.test/f/"), "/")[0]
-	_, record, err := pro.Public(token)
+	record, err := pro.Public(token)
 	if err != nil || !pro.DirectAllowed(record) {
 		t.Fatalf("direct link not served: %v", err)
 	}
@@ -151,7 +151,7 @@ func TestDirectLinksArePro(t *testing.T) {
 	item, _ = lapsed.Create("owner", "cert.pdf", strings.NewReader("%PDF-1.7 cert"), time.Time{}, "", true)
 	lapsed.billing = fakeShareBilling{pro: false}
 	token = strings.Split(strings.TrimPrefix(item.URL, "https://goport.test/f/"), "/")[0]
-	_, record, _ = lapsed.Public(token)
+	record, _ = lapsed.Public(token)
 	if lapsed.DirectAllowed(record) {
 		t.Fatal("direct link still served after Pro ended")
 	}
@@ -181,7 +181,7 @@ func TestRestoreRevokedShare(t *testing.T) {
 	if err := shares.Restore("owner", item.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := shares.Public(token); err != nil {
+	if _, err := shares.Public(token); err != nil {
 		t.Fatalf("restored link still unavailable: %v", err)
 	}
 }
@@ -231,7 +231,7 @@ func TestFreeFilesStopAfterTheirDownloadLimit(t *testing.T) {
 	for range 3 {
 		free.CountDownload(item.ID)
 	}
-	if _, _, err := free.Public(token); !errors.Is(err, ErrShareDownloadLimit) {
+	if _, err := free.Public(token); !errors.Is(err, ErrShareDownloadLimit) {
 		t.Fatalf("after the limit error = %v", err)
 	}
 
@@ -241,7 +241,7 @@ func TestFreeFilesStopAfterTheirDownloadLimit(t *testing.T) {
 	for range 10 {
 		pro.CountDownload(item.ID)
 	}
-	if _, _, err := pro.Public(token); err != nil || item.DownloadLimit != 0 {
+	if _, err := pro.Public(token); err != nil || item.DownloadLimit != 0 {
 		t.Fatalf("pro file limited: %v, limit %d", err, item.DownloadLimit)
 	}
 }

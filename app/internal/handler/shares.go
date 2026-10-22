@@ -1,11 +1,6 @@
 package handler
 
 import (
-	"crypto/hmac"
-	"crypto/sha256"
-	"crypto/subtle"
-	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,7 +18,10 @@ import (
 	"gitlab.yurtal.tech/company/pocketbase-app-template/pkg/disposable"
 )
 
-const publicSharesPath = "/api/v1/public/shares/"
+const (
+	publicSharesPath  = "/api/v1/public/shares/"
+	shareUnlockCookie = "goport_cloud_share"
+)
 
 func (h *Handler) ListSharesHandler(e *core.RequestEvent) error {
 	items, usage, limits, err := h.service.Shares().List(e.Auth.Id)
@@ -187,17 +185,21 @@ func (h *Handler) DeleteShareHandler(e *core.RequestEvent) error {
 	return h.NewSuccessResponse(e, http.StatusOK, map[string]string{"message": "File deleted"})
 }
 
+// PublicShareHandler describes a share for its public page. Until the
+// password is entered it says only that the file is locked.
 func (h *Handler) PublicShareHandler(e *core.RequestEvent) error {
 	h.publicShareHeaders(e.Response, e.Request)
 	token := e.Request.PathValue("token")
-	item, _, err := h.service.Shares().Public(token)
+	record, err := h.service.Shares().Public(token)
 	if err != nil {
 		return h.publicShareError(e, err)
 	}
-	if item.PasswordProtected {
-		item.RetryAfter = waitSeconds(h.sharePasswords.status(token, shareVisitorKey(e.Request)))
+	if record.PasswordHash != "" && !h.shareUnlocked(e.Request, token, record) {
+		view := service.LockedView(record)
+		view.RetryAfter = waitSeconds(h.sharePasswords.status(token, shareVisitorKey(e.Request)))
+		return h.NewSuccessResponse(e, http.StatusOK, view)
 	}
-	return h.NewSuccessResponse(e, http.StatusOK, item)
+	return h.NewSuccessResponse(e, http.StatusOK, service.PublicView(record))
 }
 
 func (h *Handler) PublicShareOptionsHandler(e *core.RequestEvent) error {
@@ -231,6 +233,14 @@ func (h *Handler) UnlockShareHandler(e *core.RequestEvent) error {
 		return h.NewErrorResponse(e, http.StatusBadRequest, "invalid request body")
 	}
 	token := e.Request.PathValue("token")
+	// The link must exist before the password guard keeps any state for it.
+	record, err := h.service.Shares().Public(token)
+	if err != nil {
+		return h.publicShareError(e, err)
+	}
+	if record.PasswordHash == "" {
+		return h.NewSuccessResponse(e, http.StatusOK, map[string]bool{"unlocked": true})
+	}
 	visitor := shareVisitorKey(e.Request)
 	if wait, reason := h.sharePasswords.begin(token, visitor); wait > 0 {
 		return h.sharePasswordPaused(e, wait, reason)
@@ -248,7 +258,7 @@ func (h *Handler) UnlockShareHandler(e *core.RequestEvent) error {
 		}
 	}()
 
-	record, err := h.service.Shares().VerifyPassword(token, request.Password)
+	record, err = h.service.Shares().VerifyPassword(token, request.Password)
 	switch {
 	case errors.Is(err, service.ErrSharePassword):
 		outcome = shareAttemptWrong
@@ -264,12 +274,26 @@ func (h *Handler) UnlockShareHandler(e *core.RequestEvent) error {
 	}
 	outcome = shareAttemptCorrect
 	finish()
+	// The password may have been removed meanwhile; then there is nothing to unlock.
+	if record.PasswordHash == "" {
+		return h.NewSuccessResponse(e, http.StatusOK, map[string]bool{"unlocked": true})
+	}
 	expires := time.Now().Add(12 * time.Hour)
 	if record.ExpiresAt.Before(expires) {
 		expires = record.ExpiresAt
 	}
-	http.SetCookie(e.Response, &http.Cookie{Name: "goport_cloud_share", Value: h.shareCookie(token, expires), Path: publicSharesPath + token, Expires: expires, HttpOnly: true, Secure: requestIsHTTPS(e.Request), SameSite: http.SameSiteLaxMode})
+	http.SetCookie(e.Response, &http.Cookie{
+		Name: shareUnlockCookie, Value: h.service.Shares().UnlockCookie(token, record, expires), Path: publicSharesPath + token,
+		Expires: expires, HttpOnly: true, Secure: requestIsHTTPS(e.Request), SameSite: http.SameSiteLaxMode,
+	})
 	return h.NewSuccessResponse(e, http.StatusOK, map[string]bool{"unlocked": true})
+}
+
+// shareUnlocked reports whether the request carries a valid unlock cookie for
+// this share and its current password.
+func (h *Handler) shareUnlocked(r *http.Request, token string, record *model.ShareRecord) bool {
+	cookie, err := r.Cookie(shareUnlockCookie)
+	return err == nil && h.service.Shares().ValidUnlockCookie(cookie.Value, token, record)
 }
 
 func (h *Handler) sharePasswordPaused(e *core.RequestEvent, wait time.Duration, reason shareLockReason) error {
@@ -294,14 +318,14 @@ func (h *Handler) ShareContentHandler(e *core.RequestEvent) error {
 		return h.NewErrorResponse(e, http.StatusTooManyRequests, "Too many downloads are in progress. Try again shortly.")
 	}
 	token := e.Request.PathValue("token")
-	item, record, err := h.service.Shares().Public(token)
+	record, err := h.service.Shares().Public(token)
 	if err != nil {
 		return h.publicShareError(e, err)
 	}
-	if record.PasswordHash != "" && !h.validShareCookie(e.Request, token) {
+	if record.PasswordHash != "" && !h.shareUnlocked(e.Request, token, record) {
 		return h.NewErrorResponse(e, http.StatusUnauthorized, "password required")
 	}
-	preview := e.Request.URL.Query().Get("preview") == "1" && item.Previewable
+	preview := e.Request.URL.Query().Get("preview") == "1" && service.SafePreview(record.MIMEType)
 	return h.serveShareFile(e, token, preview, countsAsDownload(e.Request))
 }
 
@@ -326,14 +350,14 @@ func (h *Handler) ShareRawHandler(e *core.RequestEvent) error {
 		return h.NewErrorResponse(e, http.StatusTooManyRequests, "Too many downloads are in progress. Try again shortly.")
 	}
 	token := e.Request.PathValue("token")
-	item, record, err := h.service.Shares().Public(token)
+	record, err := h.service.Shares().Public(token)
 	if err != nil {
 		return h.publicShareError(e, err)
 	}
 	if !h.service.Shares().DirectAllowed(record) {
 		return e.JSON(http.StatusConflict, map[string]string{"state": "page", "error": "This file opens on its share page."})
 	}
-	return h.serveShareFile(e, token, item.Previewable, countsAsDownload(e.Request))
+	return h.serveShareFile(e, token, service.SafePreview(record.MIMEType), countsAsDownload(e.Request))
 }
 
 func (h *Handler) serveShareFile(e *core.RequestEvent, token string, inline, countDownload bool) error {
@@ -464,48 +488,6 @@ func parseShareExpiration(value string) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("expiration must use RFC3339 format")
 	}
 	return parsed, nil
-}
-
-func (h *Handler) shareCookie(token string, expires time.Time) string {
-	payload := strconv.FormatInt(expires.Unix(), 10) + "." + token
-	mac := hmac.New(sha256.New, []byte(h.shareSecret()))
-	_, _ = mac.Write([]byte(payload))
-	return base64.RawURLEncoding.EncodeToString([]byte(payload)) + "." + hex.EncodeToString(mac.Sum(nil))
-}
-
-func (h *Handler) validShareCookie(r *http.Request, token string) bool {
-	cookie, err := r.Cookie("goport_cloud_share")
-	if err != nil {
-		return false
-	}
-	parts := strings.Split(cookie.Value, ".")
-	if len(parts) != 2 {
-		return false
-	}
-	raw, err := base64.RawURLEncoding.DecodeString(parts[0])
-	if err != nil {
-		return false
-	}
-	payload := string(raw)
-	segments := strings.SplitN(payload, ".", 2)
-	if len(segments) != 2 || segments[1] != token {
-		return false
-	}
-	expiry, err := strconv.ParseInt(segments[0], 10, 64)
-	if err != nil || time.Now().Unix() >= expiry {
-		return false
-	}
-	mac := hmac.New(sha256.New, []byte(h.shareSecret()))
-	_, _ = mac.Write(raw)
-	want := hex.EncodeToString(mac.Sum(nil))
-	return subtle.ConstantTimeCompare([]byte(want), []byte(parts[1])) == 1
-}
-
-func (h *Handler) shareSecret() string {
-	if h.cfg.ShareSigningKey != "" {
-		return h.cfg.ShareSigningKey
-	}
-	return "goport-development-share-key-change-in-production"
 }
 
 func contentDisposition(kind, filename string) string {

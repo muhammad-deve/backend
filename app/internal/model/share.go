@@ -37,8 +37,20 @@ type ShareItem struct {
 	DownloadLimit int64  `json:"downloadLimit,omitempty"`
 	Created       string `json:"created"`
 	Previewable   bool   `json:"previewable"`
-	// RetryAfter is set on the public page when this visitor is locked out of
-	// the password form, so a reload keeps showing the countdown.
+}
+
+// PublicShare is what the public share page receives. While a password is
+// still needed (Locked), it says only that, and when the link expires.
+type PublicShare struct {
+	Filename          string `json:"filename,omitempty"`
+	MIMEType          string `json:"mimeType,omitempty"`
+	Size              int64  `json:"size,omitempty"`
+	ExpiresAt         string `json:"expiresAt"`
+	PasswordProtected bool   `json:"passwordProtected"`
+	Locked            bool   `json:"locked"`
+	Previewable       bool   `json:"previewable"`
+	// RetryAfter is set when this visitor is locked out of the password
+	// form, so a reload keeps showing the countdown.
 	RetryAfter int64 `json:"retryAfter,omitempty"`
 }
 

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
@@ -17,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -60,6 +62,11 @@ const (
 	shareMaxUserUploads          = 3
 	shareMaxUploads              = 40
 	shareUploadIdleTimeout       = 30 * time.Minute
+	// Link tokens are 32 random bytes in unpadded base64url.
+	shareTokenBytes  = 32
+	shareTokenLength = 43
+	// Stored files are named with 24 random bytes in hex.
+	shareStorageKeyBytes = 24
 )
 
 type SharesI interface {
@@ -73,8 +80,10 @@ type SharesI interface {
 	Revoke(userID, id string) error
 	Restore(userID, id string) error
 	Delete(userID, id string) error
-	Public(token string) (*model.ShareItem, *model.ShareRecord, error)
+	Public(token string) (*model.ShareRecord, error)
 	VerifyPassword(token, password string) (*model.ShareRecord, error)
+	UnlockCookie(token string, record *model.ShareRecord, expires time.Time) string
+	ValidUnlockCookie(value, token string, record *model.ShareRecord) bool
 	Open(token string) (*os.File, *model.ShareRecord, error)
 	DirectAllowed(record *model.ShareRecord) bool
 	CountDownload(id string)
@@ -88,11 +97,17 @@ type sharesService struct {
 	repo       repository.SharesI
 	billing    BillingI
 	storageDir string
-	cryptKey   [32]byte
-	uploads    chan struct{}
-	createMu   sync.Mutex
-	sessionsMu sync.Mutex
-	sessions   map[string]*shareUploadSession
+	// secret signs unlock cookies; cryptKey, derived from it, encrypts the
+	// dashboard's copy of each link token.
+	secret   []byte
+	cryptKey [32]byte
+	// persistentKey is false when the key could not be saved and lasts only
+	// until restart. Old tokens are then left as they are.
+	persistentKey bool
+	uploads       chan struct{}
+	createMu      sync.Mutex
+	sessionsMu    sync.Mutex
+	sessions      map[string]*shareUploadSession
 }
 
 // shareUploadSession is a chunked upload in progress. Sessions live in memory:
@@ -113,20 +128,21 @@ type shareUploadSession struct {
 	done         bool
 }
 
-func NewSharesService(cfg *config.Config, repo repository.SharesI, billing BillingI) SharesI {
-	secret := cfg.ShareSigningKey
-	if secret == "" {
-		secret = "goport-development-share-key-change-in-production"
-	}
+// NewSharesService builds the cloud share service. dataDir is PocketBase's
+// data directory, where a generated signing key is kept when
+// SHARE_SIGNING_KEY is empty.
+func NewSharesService(cfg *config.Config, repo repository.SharesI, billing BillingI, dataDir string) SharesI {
+	secret, persistent := loadShareSecret(cfg.ShareSigningKey, dataDir)
 	service := &sharesService{
 		cfg: cfg, repo: repo, billing: billing, storageDir: cfg.ShareStorageDir,
-		cryptKey: sha256.Sum256([]byte(secret)), uploads: make(chan struct{}, 2),
-		sessions: make(map[string]*shareUploadSession),
+		secret: []byte(secret), cryptKey: sha256.Sum256([]byte(secret)), persistentKey: persistent,
+		uploads: make(chan struct{}, 2), sessions: make(map[string]*shareUploadSession),
 	}
 	_ = os.MkdirAll(service.storageDir, 0o700)
 	service.removeStaleUploadFiles()
 	free, pro := service.planLimits()
 	log.Printf("share limits: total %d bytes; free %+v; pro %+v", cfg.ShareTotalStorageBytes, free, pro)
+	go service.reencryptLegacyTokens()
 	go service.cleanupLoop()
 	return service
 }
@@ -444,11 +460,11 @@ func (s *sharesService) pruneUploadsLocked(now time.Time) {
 
 // finalize moves a completed temporary file into storage and records it.
 func (s *sharesService) finalize(userID, temporaryPath string, size int64, value model.ShareRecord, limits model.ShareLimits) (*model.ShareItem, error) {
-	token, err := randomURLToken(32)
+	token, err := randomURLToken(shareTokenBytes)
 	if err != nil {
 		return nil, err
 	}
-	storageKey, err := randomHex(24)
+	storageKey, err := randomHex(shareStorageKeyBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -504,9 +520,11 @@ func (s *sharesService) List(userID string) ([]model.ShareItem, model.ShareStora
 	}
 	items := make([]model.ShareItem, 0, len(records))
 	for _, record := range records {
-		token, decryptErr := s.decryptToken(record.TokenCipher)
+		token, legacy, decryptErr := s.decryptToken(record.TokenCipher)
 		if decryptErr != nil {
 			token = ""
+		} else if legacy {
+			s.upgradeTokenCipher(record.ID, record.TokenCipher, token)
 		}
 		items = append(items, s.item(record, token, &limits))
 	}
@@ -554,7 +572,7 @@ func (s *sharesService) Update(userID, id string, expiresAt time.Time, password 
 	if err != nil {
 		return nil, err
 	}
-	token, _ := s.decryptToken(record.TokenCipher)
+	token, _, _ := s.decryptToken(record.TokenCipher)
 	item := s.item(*record, token, &limits)
 	return &item, nil
 }
@@ -590,46 +608,108 @@ func (s *sharesService) Delete(userID, id string) error {
 	return s.repo.Delete(record.ID)
 }
 
-func (s *sharesService) Public(token string) (*model.ShareItem, *model.ShareRecord, error) {
-	if len(token) < 32 {
-		return nil, nil, ErrShareNotFound
+// ValidShareToken reports whether token has the shape of a link token. Every
+// public endpoint checks this before any lookup or bookkeeping.
+func ValidShareToken(token string) bool {
+	if len(token) != shareTokenLength {
+		return false
+	}
+	for i := 0; i < len(token); i++ {
+		c := token[i]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+// Public finds an active share by its link token. For a revoked, expired or
+// used-up share it returns the record along with the reason.
+func (s *sharesService) Public(token string) (*model.ShareRecord, error) {
+	if !ValidShareToken(token) {
+		return nil, ErrShareNotFound
 	}
 	record, err := s.repo.GetByTokenHash(tokenHash(token))
 	if errors.Is(err, sql.ErrNoRows) || errors.Is(err, ErrShareNotFound) {
-		return nil, nil, ErrShareNotFound
+		return nil, ErrShareNotFound
 	}
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if record.Revoked {
-		return nil, record, ErrShareRevoked
+		return record, ErrShareRevoked
 	}
 	if !time.Now().Before(record.ExpiresAt) {
-		return nil, record, ErrShareExpired
+		return record, ErrShareExpired
 	}
 	if s.downloadLimitReached(record) {
-		return nil, record, ErrShareDownloadLimit
+		return record, ErrShareDownloadLimit
 	}
-	item := s.item(*record, "", nil)
-	return &item, record, nil
+	return record, nil
 }
 
+// PublicView is what the share page shows once the visitor may see the file.
+func PublicView(record *model.ShareRecord) model.PublicShare {
+	return model.PublicShare{
+		Filename: record.Filename, MIMEType: record.MIMEType, Size: record.Size,
+		ExpiresAt:         record.ExpiresAt.UTC().Format(time.RFC3339),
+		PasswordProtected: record.PasswordHash != "", Previewable: SafePreview(record.MIMEType),
+	}
+}
+
+// LockedView is what the share page shows before the password is entered:
+// no name, size or type.
+func LockedView(record *model.ShareRecord) model.PublicShare {
+	return model.PublicShare{ExpiresAt: record.ExpiresAt.UTC().Format(time.RFC3339), PasswordProtected: true, Locked: true}
+}
+
+// VerifyPassword checks a visitor's password. Like the stored hash, the
+// password is compared without surrounding spaces.
 func (s *sharesService) VerifyPassword(token, password string) (*model.ShareRecord, error) {
-	_, record, err := s.Public(token)
+	record, err := s.Public(token)
 	if err != nil {
 		return nil, err
 	}
 	if record.PasswordHash == "" {
 		return record, nil
 	}
-	if bcrypt.CompareHashAndPassword([]byte(record.PasswordHash), []byte(password)) != nil {
+	if bcrypt.CompareHashAndPassword([]byte(record.PasswordHash), []byte(strings.TrimSpace(password))) != nil {
 		return nil, ErrSharePassword
 	}
 	return record, nil
 }
 
+// UnlockCookie signs proof that a visitor entered the password of this share.
+// The password hash is signed with it, so setting, changing or removing the
+// password ends every earlier unlock.
+func (s *sharesService) UnlockCookie(token string, record *model.ShareRecord, expires time.Time) string {
+	expiry := strconv.FormatInt(expires.Unix(), 10)
+	return expiry + "." + s.unlockSignature(expiry, token, record.PasswordHash)
+}
+
+func (s *sharesService) ValidUnlockCookie(value, token string, record *model.ShareRecord) bool {
+	if record == nil || record.PasswordHash == "" {
+		return false
+	}
+	expiry, signature, ok := strings.Cut(value, ".")
+	if !ok {
+		return false
+	}
+	unix, err := strconv.ParseInt(expiry, 10, 64)
+	if err != nil || time.Now().Unix() >= unix {
+		return false
+	}
+	return hmac.Equal([]byte(signature), []byte(s.unlockSignature(expiry, token, record.PasswordHash)))
+}
+
+func (s *sharesService) unlockSignature(expiry, token, passwordHash string) string {
+	mac := hmac.New(sha256.New, s.secret)
+	_, _ = mac.Write([]byte("goport-share-unlock-v2\x00" + expiry + "\x00" + token + "\x00" + passwordHash))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
 func (s *sharesService) Open(token string) (*os.File, *model.ShareRecord, error) {
-	_, record, err := s.Public(token)
+	record, err := s.Public(token)
 	if err != nil {
 		return nil, record, err
 	}
@@ -712,8 +792,7 @@ func checkDirect(direct bool, password string, limits model.ShareLimits) error {
 	return nil
 }
 
-// item builds the API view of a share. limits are the owner's, or nil on the
-// public page where they are not needed.
+// item builds the dashboard view of a share. limits are the owner's.
 func (s *sharesService) item(record model.ShareRecord, token string, limits *model.ShareLimits) model.ShareItem {
 	directActive := limits != nil && limits.Current.DirectLinks
 	downloadLimit := int64(0)
@@ -735,7 +814,7 @@ func (s *sharesService) item(record model.ShareRecord, token string, limits *mod
 		Size: record.Size, ExpiresAt: record.ExpiresAt.UTC().Format(time.RFC3339),
 		Revoked: record.Revoked, PasswordProtected: record.PasswordHash != "", Direct: direct,
 		Downloads: record.Downloads, DownloadLimit: downloadLimit, Created: record.Created.UTC().Format(time.RFC3339),
-		Previewable: safePreview(record.MIMEType),
+		Previewable: SafePreview(record.MIMEType),
 	}
 }
 
@@ -815,6 +894,15 @@ func (s *sharesService) removeStaleUploadFiles() {
 	}
 }
 
+// legacyShareCryptKeys open token copies encrypted under a public key.
+var legacyShareCryptKeys = func() [][32]byte {
+	keys := make([][32]byte, 0, len(publicShareSecrets))
+	for _, secret := range publicShareSecrets {
+		keys = append(keys, sha256.Sum256([]byte(secret)))
+	}
+	return keys
+}()
+
 func (s *sharesService) encryptToken(token string) (string, error) {
 	block, err := aes.NewCipher(s.cryptKey[:])
 	if err != nil {
@@ -832,12 +920,31 @@ func (s *sharesService) encryptToken(token string) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(sealed), nil
 }
 
-func (s *sharesService) decryptToken(value string) (string, error) {
+// decryptToken opens the dashboard copy of a link token. Copies made under a
+// public key still open; legacy reports that, so the caller can encrypt them
+// again with the current key.
+func (s *sharesService) decryptToken(value string) (token string, legacy bool, err error) {
+	token, err = openToken(s.cryptKey, value)
+	if err == nil {
+		return token, false, nil
+	}
+	for _, key := range legacyShareCryptKeys {
+		if key == s.cryptKey {
+			continue
+		}
+		if token, legacyErr := openToken(key, value); legacyErr == nil {
+			return token, true, nil
+		}
+	}
+	return "", false, err
+}
+
+func openToken(key [32]byte, value string) (string, error) {
 	raw, err := base64.RawURLEncoding.DecodeString(value)
 	if err != nil {
 		return "", err
 	}
-	block, err := aes.NewCipher(s.cryptKey[:])
+	block, err := aes.NewCipher(key[:])
 	if err != nil {
 		return "", err
 	}
@@ -847,6 +954,53 @@ func (s *sharesService) decryptToken(value string) (string, error) {
 	}
 	plain, err := gcm.Open(nil, raw[:gcm.NonceSize()], raw[gcm.NonceSize():], nil)
 	return string(plain), err
+}
+
+// upgradeTokenCipher stores token encrypted with the current key, unless the
+// row changed meanwhile or the key won't survive a restart.
+func (s *sharesService) upgradeTokenCipher(id, previous, token string) bool {
+	if !s.persistentKey {
+		return false
+	}
+	next, err := s.encryptToken(token)
+	if err != nil {
+		return false
+	}
+	return s.repo.SetTokenCipher(id, previous, next) == nil
+}
+
+// reencryptLegacyTokens moves token copies made under a public key to the
+// current key. It runs once at startup; failures are logged and retried by
+// List and the next start.
+func (s *sharesService) reencryptLegacyTokens() {
+	if !s.persistentKey {
+		return
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			log.Printf("shares: re-encrypting tokens stopped: %v", recovered)
+		}
+	}()
+	after, upgraded := "", 0
+	for {
+		rows, err := s.repo.TokenCiphers(after, 200)
+		if err != nil {
+			log.Printf("shares: couldn't read tokens to re-encrypt: %v", err)
+			return
+		}
+		if len(rows) == 0 {
+			break
+		}
+		for _, row := range rows {
+			after = row.ID
+			if token, legacy, err := s.decryptToken(row.TokenCipher); err == nil && legacy && s.upgradeTokenCipher(row.ID, row.TokenCipher, token) {
+				upgraded++
+			}
+		}
+	}
+	if upgraded > 0 {
+		log.Printf("shares: re-encrypted %d link tokens with the current key", upgraded)
+	}
 }
 
 func tokenHash(token string) string {
@@ -942,7 +1096,8 @@ func IsHTMLType(value string) bool {
 	return strings.HasPrefix(strings.ToLower(value), "text/html")
 }
 
-func safePreview(value string) bool {
+// SafePreview reports whether a stored type may be shown inline.
+func SafePreview(value string) bool {
 	return strings.HasPrefix(value, "image/png") || strings.HasPrefix(value, "image/jpeg") ||
 		strings.HasPrefix(value, "image/gif") || strings.HasPrefix(value, "image/webp") ||
 		strings.HasPrefix(value, "application/pdf") || strings.HasPrefix(value, "text/plain") ||

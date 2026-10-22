@@ -52,7 +52,7 @@ func NewService(app *pocketbase.PocketBase, cfg *config.Config) I {
 	emailService := NewEmailService(cfg)
 	repositories := repository.NewRepository(app)
 	billingService := NewBillingService(cfg, repositories.Billing())
-	sharesService := NewSharesService(cfg, repositories.Shares(), billingService)
+	sharesService := NewSharesService(cfg, repositories.Shares(), billingService, app.DataDir())
 	tokensService := NewTokensService(app, billingService)
 	usageService := NewUsageService(repositories.Tunnels(), repositories.Usage())
 	return &service{

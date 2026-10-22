@@ -78,9 +78,8 @@ func GetConfig() *Config {
 		if instance.LemonSqueezyKey == "" || instance.LemonSqueezyStoreID == "" || instance.LemonSqueezyWebhookSecret == "" {
 			log.Print("WARNING: Lemon Squeezy billing is not fully configured")
 		}
-		if len(instance.ShareSigningKey) < 32 {
-			log.Print("WARNING: SHARE_SIGNING_KEY should contain at least 32 random bytes before enabling cloud sharing")
-		}
+		// SHARE_SIGNING_KEY may be empty: the shares service then generates a
+		// key in the data directory and logs which one it uses.
 	})
 	return instance
 }

@@ -46,6 +46,12 @@ type SharesI interface {
 	StorageUsed(userID string) (int64, error)
 	TotalStorageUsed() (int64, error)
 	Expired(before time.Time, limit int) ([]model.ShareRecord, error)
+	// TokenCiphers pages through shares by id, filling only ID and
+	// TokenCipher.
+	TokenCiphers(afterID string, limit int) ([]model.ShareRecord, error)
+	// SetTokenCipher replaces a share's encrypted token if it still equals
+	// previous.
+	SetTokenCipher(id, previous, next string) error
 }
 
 type I interface {

@@ -112,6 +112,29 @@ func (r *Shares) TotalStorageUsed() (int64, error) {
 	err := r.app.DB().NewQuery("SELECT COALESCE(SUM(size), 0) AS total FROM shares").One(&row)
 	return row.Total, err
 }
+
+func (r *Shares) TokenCiphers(afterID string, limit int) ([]model.ShareRecord, error) {
+	var rows []struct {
+		ID          string `db:"id"`
+		TokenCipher string `db:"token_cipher"`
+	}
+	err := r.app.DB().NewQuery("SELECT id, token_cipher FROM shares WHERE id > {:after} ORDER BY id LIMIT {:limit}").
+		Bind(dbx.Params{"after": afterID, "limit": limit}).All(&rows)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]model.ShareRecord, 0, len(rows))
+	for _, row := range rows {
+		result = append(result, model.ShareRecord{ID: row.ID, TokenCipher: row.TokenCipher})
+	}
+	return result, nil
+}
+
+func (r *Shares) SetTokenCipher(id, previous, next string) error {
+	_, err := r.app.NonconcurrentDB().NewQuery("UPDATE shares SET token_cipher = {:next} WHERE id = {:id} AND token_cipher = {:previous}").
+		Bind(dbx.Params{"id": id, "previous": previous, "next": next}).Execute()
+	return err
+}
 func (r *Shares) Expired(before time.Time, limit int) ([]model.ShareRecord, error) {
 	records, err := r.app.FindRecordsByFilter(model.SharesCollection, "expires_at <= {:before}", "expires_at", limit, 0, dbx.Params{"before": before.Format(types.DefaultDateLayout)})
 	if err != nil {

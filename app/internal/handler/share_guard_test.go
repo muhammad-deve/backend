@@ -1,9 +1,20 @@
 package handler
 
 import (
+	"io"
+	"log/slog"
+	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/pocketbase/pocketbase/core"
+	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/config"
+	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/model"
+	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/service"
 )
 
 type guardClock struct{ now time.Time }
@@ -173,5 +184,149 @@ func TestShareUploaderLimit(t *testing.T) {
 	clock.advance(shareUploaderWindow + time.Minute)
 	if !limit.allow("1.2.3.4", "c") {
 		t.Fatal("limit did not reset after a day")
+	}
+}
+
+type fakeShareServices struct {
+	service.I
+	shares service.SharesI
+}
+
+func (f fakeShareServices) Shares() service.SharesI { return f.shares }
+
+// fakeShares serves one share from a file. Its unlock cookie is "signed".
+type fakeShares struct {
+	service.SharesI
+	token     string
+	record    *model.ShareRecord
+	path      string
+	downloads int
+	checked   int
+}
+
+func (f *fakeShares) Public(token string) (*model.ShareRecord, error) {
+	if !service.ValidShareToken(token) || token != f.token {
+		return nil, service.ErrShareNotFound
+	}
+	return f.record, nil
+}
+
+func (f *fakeShares) Open(token string) (*os.File, *model.ShareRecord, error) {
+	record, err := f.Public(token)
+	if err != nil {
+		return nil, record, err
+	}
+	file, err := os.Open(f.path)
+	return file, record, err
+}
+
+func (f *fakeShares) VerifyPassword(token, password string) (*model.ShareRecord, error) {
+	f.checked++
+	record, err := f.Public(token)
+	if err != nil {
+		return nil, err
+	}
+	if record.PasswordHash != "" && password != "right password" {
+		return nil, service.ErrSharePassword
+	}
+	return record, nil
+}
+
+func (f *fakeShares) UnlockCookie(string, *model.ShareRecord, time.Time) string { return "signed" }
+func (f *fakeShares) ValidUnlockCookie(value, token string, record *model.ShareRecord) bool {
+	return value == "signed" && token == f.token && record.PasswordHash != ""
+}
+func (f *fakeShares) DirectAllowed(*model.ShareRecord) bool { return true }
+func (f *fakeShares) CountDownload(string)                  { f.downloads++ }
+
+var testShareToken = strings.Repeat("t", 43)
+
+func newShareTestHandler(t *testing.T, mimeType, body, passwordHash string) (*Handler, *fakeShares) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "stored")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	shares := &fakeShares{token: testShareToken, path: path, record: &model.ShareRecord{
+		ID: "rec1", Filename: "file.txt", MIMEType: mimeType, Size: int64(len(body)), PasswordHash: passwordHash,
+		Downloads: 7, ExpiresAt: time.Now().Add(time.Hour),
+	}}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	return NewHandler(logger, fakeShareServices{shares: shares}, &config.Config{AppURL: "https://goport.test"}), shares
+}
+
+type shareRequest struct {
+	method, target, token, body, remote string
+	headers                             map[string]string
+}
+
+func serveShare(handle func(*core.RequestEvent) error, request shareRequest) *httptest.ResponseRecorder {
+	if request.method == "" {
+		request.method = http.MethodGet
+	}
+	if request.token == "" {
+		request.token = testShareToken
+	}
+	req := httptest.NewRequest(request.method, "/api/v1/public/shares/x"+request.target, strings.NewReader(request.body))
+	req.SetPathValue("token", request.token)
+	req.RemoteAddr = "84.54.1.2:40000"
+	if request.remote != "" {
+		req.RemoteAddr = request.remote
+	}
+	for name, value := range request.headers {
+		req.Header.Set(name, value)
+	}
+	recorder := httptest.NewRecorder()
+	// PocketBase's CORS middleware sets this before any handler runs.
+	recorder.Header().Set("Access-Control-Allow-Origin", "*")
+	event := &core.RequestEvent{}
+	event.Request, event.Response = req, recorder
+	_ = handle(event)
+	return recorder
+}
+
+func TestUnlockKeepsNoStateForUnknownLinks(t *testing.T) {
+	h, shares := newShareTestHandler(t, "text/plain", "hello", "$2a$hash")
+	for _, token := range []string{strings.Repeat("A", 1<<20), "short", strings.Repeat("B", 43)} {
+		recorder := serveShare(h.UnlockShareHandler, shareRequest{method: http.MethodPost, target: "/unlock", token: token, body: `{"password":"guess"}`})
+		if recorder.Code != http.StatusNotFound {
+			t.Errorf("unknown link answered %d", recorder.Code)
+		}
+	}
+	if len(h.sharePasswords.visitors) != 0 || len(h.sharePasswords.links) != 0 || shares.checked != 0 {
+		t.Fatalf("guard kept %d visitors and %d links, %d checks", len(h.sharePasswords.visitors), len(h.sharePasswords.links), shares.checked)
+	}
+}
+
+func TestUnlockWithoutAPasswordSetsNoCookie(t *testing.T) {
+	h, _ := newShareTestHandler(t, "text/plain", "hello", "")
+	recorder := serveShare(h.UnlockShareHandler, shareRequest{method: http.MethodPost, target: "/unlock", body: `{"password":""}`})
+	if recorder.Code != http.StatusOK || len(recorder.Result().Cookies()) != 0 {
+		t.Fatalf("unlock answered %d with cookies %v", recorder.Code, recorder.Result().Cookies())
+	}
+}
+
+func TestLockedShareRevealsNothingUntilUnlocked(t *testing.T) {
+	h, _ := newShareTestHandler(t, "application/pdf", "%PDF-1.7", "$2a$hash")
+	locked := serveShare(h.PublicShareHandler, shareRequest{})
+	for _, leak := range []string{"file.txt", "application/pdf", "rec1", "downloads"} {
+		if strings.Contains(locked.Body.String(), leak) {
+			t.Errorf("locked metadata %s reveals %q", locked.Body.String(), leak)
+		}
+	}
+	if !strings.Contains(locked.Body.String(), `"locked":true`) {
+		t.Fatalf("locked metadata = %s", locked.Body.String())
+	}
+	if content := serveShare(h.ShareContentHandler, shareRequest{target: "/content"}); content.Code != http.StatusUnauthorized {
+		t.Fatalf("locked content answered %d", content.Code)
+	}
+	unlock := serveShare(h.UnlockShareHandler, shareRequest{method: http.MethodPost, target: "/unlock", body: `{"password":"right password"}`})
+	cookies := unlock.Result().Cookies()
+	if unlock.Code != http.StatusOK || len(cookies) != 1 || cookies[0].Value != "signed" {
+		t.Fatalf("unlock answered %d with cookies %v", unlock.Code, cookies)
+	}
+	unlocked := serveShare(h.PublicShareHandler, shareRequest{headers: map[string]string{"Cookie": shareUnlockCookie + "=signed"}})
+	if !strings.Contains(unlocked.Body.String(), "file.txt") || strings.Contains(unlocked.Body.String(), `"locked":true`) {
+		t.Fatalf("unlocked metadata = %s", unlocked.Body.String())
 	}
 }
