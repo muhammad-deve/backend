@@ -1,4 +1,4 @@
-FROM golang:1.23-bullseye AS build
+FROM golang:1.27-bookworm AS build
 
 WORKDIR /app
 
@@ -10,7 +10,7 @@ COPY ./app .
 
 RUN go build -ldflags="-linkmode external -extldflags -static" -tags netgo -o /app/main ./cmd/main.go
 
-FROM alpine:3.19
+FROM alpine:3.24
 
 WORKDIR /app
 

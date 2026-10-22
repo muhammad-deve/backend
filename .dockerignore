@@ -1,3 +1,11 @@
 app/artifacts/pb_data/*
 .idea
 .vscode
+
+# Secrets are passed in by docker-compose (env_file); never copy them into a build.
+.env
+**/.env
+.env.*
+!**/.env.example
+.git
+.beads
