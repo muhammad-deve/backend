@@ -73,6 +73,9 @@ const (
 	// shareMinFileBytes is the least one file counts against storage: a tiny
 	// file still costs a disk block, an inode and a row.
 	shareMinFileBytes int64 = 4096
+	// shareOrphanAge is how old a stored file without a share must be before
+	// the sweep removes it. No upload lasts this long.
+	shareOrphanAge = 24 * time.Hour
 	// Link tokens are 32 random bytes in unpadded base64url.
 	shareTokenBytes  = 32
 	shareTokenLength = 43
@@ -103,6 +106,8 @@ type SharesI interface {
 	Limits(userID string) (model.ShareLimits, error)
 	ChunkSize() int64
 	CleanupExpired()
+	RemoveStoredFile(storageKey string)
+	SweepOrphans() (int, error)
 }
 
 type sharesService struct {
@@ -970,6 +975,85 @@ func (s *sharesService) removeStaleUploadFiles() {
 	for _, path := range matches {
 		_ = os.Remove(path)
 	}
+}
+
+// validStorageKey reports whether name is a stored file name this service
+// creates. Anything else in the storage directory is never touched.
+func validStorageKey(name string) bool {
+	if len(name) != shareStorageKeyBytes*2 {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		if c := name[i]; !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// RemoveStoredFile deletes a share's file once its row is gone. It runs from
+// the delete hook, which also covers rows removed along with their owner.
+func (s *sharesService) RemoveStoredFile(storageKey string) {
+	if !validStorageKey(storageKey) {
+		return
+	}
+	if err := os.Remove(filepath.Join(s.storageDir, storageKey)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		log.Printf("shares: couldn't remove stored file %s: %v", storageKey, err)
+	}
+}
+
+// SweepOrphans removes stored files that no share refers to, such as files of
+// accounts deleted before the delete hook existed, and temporary upload files
+// nothing uses. Only names this service creates are considered, and only once
+// they are a day old, so a file being uploaded or recorded is never touched.
+func (s *sharesService) SweepOrphans() (int, error) {
+	keys, err := s.repo.StorageKeys()
+	if err != nil {
+		return 0, err
+	}
+	known := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		known[key] = struct{}{}
+	}
+	entries, err := os.ReadDir(s.storageDir)
+	if err != nil {
+		return 0, err
+	}
+	active := make(map[string]struct{})
+	s.sessionsMu.Lock()
+	for _, session := range s.sessions {
+		active[filepath.Base(session.tempPath)] = struct{}{}
+	}
+	s.sessionsMu.Unlock()
+
+	cutoff := time.Now().Add(-shareOrphanAge)
+	removed := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if !entry.Type().IsRegular() {
+			continue
+		}
+		switch {
+		case validStorageKey(name):
+			if _, ok := known[name]; ok {
+				continue
+			}
+		case strings.HasPrefix(name, ".upload-"):
+			if _, ok := active[name]; ok {
+				continue
+			}
+		default:
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(s.storageDir, name)); err == nil {
+			removed++
+		}
+	}
+	return removed, nil
 }
 
 // legacyShareCryptKeys open token copies encrypted under a public key.

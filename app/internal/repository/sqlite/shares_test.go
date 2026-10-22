@@ -96,3 +96,10 @@ func TestShareUsageCountsFilesAndASmallestSize(t *testing.T) {
 		t.Fatalf("limited list = %d, %v", len(listed), err)
 	}
 }
+
+func TestShareStorageKeys(t *testing.T) {
+	_, repo, _ := newShareTestApp(t, 1, 2)
+	if keys, err := repo.StorageKeys(); err != nil || len(keys) != 2 || keys[0] == keys[1] {
+		t.Fatalf("storage keys = %v, %v", keys, err)
+	}
+}

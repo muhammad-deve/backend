@@ -239,6 +239,15 @@ func (r *memoryShares) Usage(userID string, minBytes int64) (int64, int64, error
 	}
 	return total, files, nil
 }
+func (r *memoryShares) StorageKeys() ([]string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var keys []string
+	for _, record := range r.records {
+		keys = append(keys, record.StorageKey)
+	}
+	return keys, nil
+}
 func (r *memoryShares) TokenCiphers(afterID string, limit int) ([]model.ShareRecord, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -612,5 +621,64 @@ func TestFileTypes(t *testing.T) {
 	}
 	if got := sanitizeFilename("invoice‮fdp.exe . "); got != "invoicefdp.exe" {
 		t.Fatalf("sanitized name = %q", got)
+	}
+}
+
+func TestOrphanSweepRemovesOnlyOldUnknownFiles(t *testing.T) {
+	shares := newTestShares(t, true)
+	item, err := shares.Create("owner", "kept.txt", strings.NewReader("hello"), time.Time{}, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	known := shares.repo.(*memoryShares).records[item.ID].StorageKey
+	session, err := shares.StartUpload("owner", "1.2.3.4", model.StartShareUploadRequest{Filename: "b.zip", Size: 10}, time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	active := filepath.Base(shares.sessions[session.ID].tempPath)
+	old := time.Now().Add(-shareOrphanAge - time.Hour)
+	write := func(name string, modified time.Time) string {
+		path := filepath.Join(shares.storageDir, name)
+		if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, modified, modified); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	orphan := write(strings.Repeat("ab", 24), old)
+	recent := write(strings.Repeat("cd", 24), time.Now())
+	staleUpload := write(".upload-stale", old)
+	unrelated := write("data.db", old)
+	write(known, old)
+	write(active, old)
+	if err := os.Mkdir(filepath.Join(shares.storageDir, strings.Repeat("ef", 24)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := shares.SweepOrphans()
+	if err != nil || removed != 2 {
+		t.Fatalf("sweep removed %d, %v", removed, err)
+	}
+	for _, path := range []string{orphan, staleUpload} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s kept", filepath.Base(path))
+		}
+	}
+	for _, path := range []string{recent, unrelated, filepath.Join(shares.storageDir, known), filepath.Join(shares.storageDir, active), filepath.Join(shares.storageDir, strings.Repeat("ef", 24))} {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("%s removed: %v", filepath.Base(path), err)
+		}
+	}
+
+	shares.RemoveStoredFile("../data.db")
+	shares.RemoveStoredFile("data.db")
+	if _, err := os.Stat(unrelated); err != nil {
+		t.Fatal("RemoveStoredFile touched a name it never creates")
+	}
+	shares.RemoveStoredFile(known)
+	if _, err := os.Stat(filepath.Join(shares.storageDir, known)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("RemoveStoredFile kept a share's file")
 	}
 }

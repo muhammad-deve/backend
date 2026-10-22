@@ -115,6 +115,12 @@ func (r *Shares) TotalStorageUsed(minBytes int64) (int64, error) {
 	return row.Total, err
 }
 
+func (r *Shares) StorageKeys() ([]string, error) {
+	var keys []string
+	err := r.app.DB().NewQuery("SELECT storage_key FROM shares").Column(&keys)
+	return keys, err
+}
+
 func (r *Shares) TokenCiphers(afterID string, limit int) ([]model.ShareRecord, error) {
 	var rows []struct {
 		ID          string `db:"id"`

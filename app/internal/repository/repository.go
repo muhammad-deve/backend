@@ -50,6 +50,8 @@ type SharesI interface {
 	// TotalStorageUsed is Usage's byte count across all owners.
 	TotalStorageUsed(minBytes int64) (int64, error)
 	Expired(before time.Time, limit int) ([]model.ShareRecord, error)
+	// StorageKeys lists the stored file name of every share.
+	StorageKeys() ([]string, error)
 	// TokenCiphers pages through shares by id, filling only ID and
 	// TokenCipher.
 	TokenCiphers(afterID string, limit int) ([]model.ShareRecord, error)
