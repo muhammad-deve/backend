@@ -14,6 +14,7 @@ type Hook struct {
 
 func (h *Hook) Register(app *pocketbase.PocketBase) {
 	h.registerAuthHooks(app)
+	h.registerShareHooks(app)
 }
 
 func New(logger *slog.Logger, service service.I) *Hook {

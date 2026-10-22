@@ -2,10 +2,15 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -42,9 +47,9 @@ func TestShareTokenEncryptionAndHashing(t *testing.T) {
 	if strings.Contains(ciphertext, token) {
 		t.Fatal("ciphertext contains plaintext token")
 	}
-	decrypted, err := service.decryptToken(ciphertext)
-	if err != nil || decrypted != token {
-		t.Fatalf("decrypt = %q, %v", decrypted, err)
+	decrypted, legacy, err := service.decryptToken(ciphertext)
+	if err != nil || decrypted != token || legacy {
+		t.Fatalf("decrypt = %q, %v, legacy %v", decrypted, err, legacy)
 	}
 	if tokenHash(token) == token || len(tokenHash(token)) != 64 {
 		t.Fatal("token hash is not a SHA-256 hex digest")
@@ -68,7 +73,7 @@ func TestCloudShareLifecycleOwnershipAndQuota(t *testing.T) {
 	storage := t.TempDir()
 	repo := &memoryShares{records: make(map[string]model.ShareRecord)}
 	service := &sharesService{
-		cfg:  &config.Config{AppURL: "https://goport.test", ShareFreeMaxUploadBytes: 1024, ShareFreeStorageBytes: 32, ShareProStorageBytes: 64, ShareFreeDefaultRetentionHours: 24, ShareFreeMaxRetentionHours: 48, ShareProDefaultRetentionHours: 24, ShareProMaxRetentionHours: 48},
+		cfg:  &config.Config{AppURL: "https://goport.test", ShareFreeMaxUploadBytes: 1024, ShareFreeStorageBytes: 6000, ShareProStorageBytes: 12000, ShareFreeDefaultRetentionHours: 24, ShareFreeMaxRetentionHours: 48, ShareProDefaultRetentionHours: 24, ShareProMaxRetentionHours: 48},
 		repo: repo, billing: fakeShareBilling{}, storageDir: storage, cryptKey: [32]byte{9, 8, 7}, uploads: make(chan struct{}, 2),
 	}
 	created, err := service.Create("owner", "report.pdf", strings.NewReader("%PDF-cloud-file"), time.Now().Add(time.Hour), "strong password", false)
@@ -100,7 +105,7 @@ func TestCloudShareLifecycleOwnershipAndQuota(t *testing.T) {
 	if err := service.Revoke("owner", record.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := service.Public(token); !errors.Is(err, ErrShareRevoked) {
+	if _, err := service.Public(token); !errors.Is(err, ErrShareRevoked) {
 		t.Fatalf("revoked public error = %v", err)
 	}
 	if err := service.Delete("owner", record.ID); err != nil {
@@ -109,7 +114,11 @@ func TestCloudShareLifecycleOwnershipAndQuota(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(storage, record.StorageKey)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("stored object still exists: %v", err)
 	}
-	if _, err := service.Create("owner", "large.zip", strings.NewReader(strings.Repeat("x", 33)), time.Now().Add(time.Hour), "", false); !errors.Is(err, ErrShareQuota) {
+	// Every file counts as at least 4 KB, so two tiny files fill 6000 bytes.
+	if _, err := service.Create("owner", "a.zip", strings.NewReader("PK tiny"), time.Now().Add(time.Hour), "", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Create("owner", "b.zip", strings.NewReader("PK tiny"), time.Now().Add(time.Hour), "", false); !errors.Is(err, ErrShareQuota) {
 		t.Fatalf("quota error = %v", err)
 	}
 }
@@ -124,13 +133,13 @@ func (r *memoryShares) Create(value model.ShareRecord) (*model.ShareRecord, erro
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.next++
-	value.ID = string(rune('a' + r.next))
-	value.Created = time.Now()
+	value.ID = fmt.Sprintf("id%013d", r.next)
+	value.Created = time.Now().Add(time.Duration(r.next) * time.Millisecond)
 	r.records[value.ID] = value
 	copy := value
 	return &copy, nil
 }
-func (r *memoryShares) ListOwned(userID string) ([]model.ShareRecord, error) {
+func (r *memoryShares) ListOwned(userID string, limit int) ([]model.ShareRecord, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	var result []model.ShareRecord
@@ -138,6 +147,10 @@ func (r *memoryShares) ListOwned(userID string) ([]model.ShareRecord, error) {
 		if record.OwnerID == userID {
 			result = append(result, record)
 		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Created.After(result[j].Created) })
+	if len(result) > limit {
+		result = result[:limit]
 	}
 	return result, nil
 }
@@ -205,25 +218,59 @@ func (r *memoryShares) AddDownload(id string) error {
 	r.records[id] = record
 	return nil
 }
-func (r *memoryShares) TotalStorageUsed() (int64, error) {
+func (r *memoryShares) TotalStorageUsed(minBytes int64) (int64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	var total int64
 	for _, record := range r.records {
-		total += record.Size
+		total += max(record.Size, minBytes)
 	}
 	return total, nil
 }
-func (r *memoryShares) StorageUsed(userID string) (int64, error) {
+func (r *memoryShares) Usage(userID string, minBytes int64) (int64, int64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	var total int64
+	var total, files int64
 	for _, record := range r.records {
 		if record.OwnerID == userID {
-			total += record.Size
+			total += max(record.Size, minBytes)
+			files++
 		}
 	}
-	return total, nil
+	return total, files, nil
+}
+func (r *memoryShares) StorageKeys() ([]string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var keys []string
+	for _, record := range r.records {
+		keys = append(keys, record.StorageKey)
+	}
+	return keys, nil
+}
+func (r *memoryShares) TokenCiphers(afterID string, limit int) ([]model.ShareRecord, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var result []model.ShareRecord
+	for _, record := range r.records {
+		if record.ID > afterID {
+			result = append(result, model.ShareRecord{ID: record.ID, TokenCipher: record.TokenCipher})
+		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].ID < result[j].ID })
+	if len(result) > limit {
+		result = result[:limit]
+	}
+	return result, nil
+}
+func (r *memoryShares) SetTokenCipher(id, previous, next string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if record, ok := r.records[id]; ok && record.TokenCipher == previous {
+		record.TokenCipher = next
+		r.records[id] = record
+	}
+	return nil
 }
 func (r *memoryShares) Expired(before time.Time, limit int) ([]model.ShareRecord, error) {
 	return nil, nil
@@ -247,3 +294,391 @@ func (fakeShareBilling) PortalURL(context.Context, string) (*model.BillingPortal
 	return nil, nil
 }
 func (fakeShareBilling) ProcessWebhook(context.Context, []byte, string) error { return nil }
+
+func shareToken(t *testing.T, item *model.ShareItem) string {
+	t.Helper()
+	parts := strings.Split(strings.TrimPrefix(strings.TrimPrefix(item.URL, "https://goport.test/s/"), "https://goport.test/f/"), "/")
+	return parts[0]
+}
+
+func TestShareSecretIsGeneratedOnceAndKept(t *testing.T) {
+	dir := t.TempDir()
+	first, persistent := loadShareSecret("", dir)
+	if !persistent || len(first) != 64 {
+		t.Fatalf("generated secret = %q, persistent %v", first, persistent)
+	}
+	if again, _ := loadShareSecret("", dir); again != first {
+		t.Fatal("the generated secret changed on the next start")
+	}
+	info, err := os.Stat(filepath.Join(dir, shareSecretFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
+		t.Fatalf("secret file mode = %v", info.Mode().Perm())
+	}
+	if configured, _ := loadShareSecret("configured-secret-with-enough-length!!", dir); configured != "configured-secret-with-enough-length!!" {
+		t.Fatalf("SHARE_SIGNING_KEY ignored: %q", configured)
+	}
+	// The published example value is never used.
+	if example, _ := loadShareSecret("replace-with-at-least-32-random-bytes", dir); example != first {
+		t.Fatalf("example key was used: %q", example)
+	}
+	// An empty file, say from a crash, is replaced with a new key.
+	empty := t.TempDir()
+	if err := os.WriteFile(filepath.Join(empty, shareSecretFile), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if secret, persistent := loadShareSecret("", empty); !persistent || len(secret) != 64 {
+		t.Fatalf("empty key file = %q, %v", secret, persistent)
+	}
+}
+
+func TestLegacyTokenCopiesAreReencrypted(t *testing.T) {
+	shares := newTestShares(t, false)
+	shares.cryptKey = legacyShareCryptKeys[0]
+	old, err := shares.Create("owner", "notes.txt", strings.NewReader("hello"), time.Time{}, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := shareToken(t, old)
+
+	shares.cryptKey = sha256.Sum256([]byte("a new private key"))
+	shares.persistentKey = true
+	stored := shares.repo.(*memoryShares).records[old.ID].TokenCipher
+	if plain, legacy, err := shares.decryptToken(stored); err != nil || !legacy || plain != token {
+		t.Fatalf("legacy decrypt = %q, %v, %v", plain, legacy, err)
+	}
+	shares.reencryptLegacyTokens()
+	stored = shares.repo.(*memoryShares).records[old.ID].TokenCipher
+	if _, err := openToken(legacyShareCryptKeys[0], stored); err == nil {
+		t.Fatal("token copy still opens with the public legacy key")
+	}
+	if plain, legacy, err := shares.decryptToken(stored); err != nil || legacy || plain != token {
+		t.Fatalf("re-encrypted decrypt = %q, %v, %v", plain, legacy, err)
+	}
+	items, _, _, err := shares.List("owner")
+	if err != nil || len(items) != 1 || !strings.HasSuffix(items[0].URL, token) {
+		t.Fatalf("list after re-encryption = %#v, %v", items, err)
+	}
+}
+
+func TestUnlockCookieFollowsThePassword(t *testing.T) {
+	shares := newTestShares(t, false)
+	item, err := shares.Create("owner", "notes.txt", strings.NewReader("hello"), time.Time{}, "long password", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := shareToken(t, item)
+	record, err := shares.Public(token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cookie := shares.UnlockCookie(token, record, time.Now().Add(time.Hour))
+	if !shares.ValidUnlockCookie(cookie, token, record) {
+		t.Fatal("fresh cookie refused")
+	}
+	if shares.ValidUnlockCookie(cookie, strings.Repeat("A", 43), record) {
+		t.Fatal("cookie accepted for another link")
+	}
+	if shares.ValidUnlockCookie(shares.UnlockCookie(token, record, time.Now().Add(-time.Second)), token, record) {
+		t.Fatal("expired cookie accepted")
+	}
+	other := &sharesService{secret: []byte("another key")}
+	if other.ValidUnlockCookie(cookie, token, record) {
+		t.Fatal("cookie accepted under another key")
+	}
+	// A new password ends earlier unlocks.
+	password := "another password"
+	if _, err := shares.Update("owner", item.ID, record.ExpiresAt, &password, nil); err != nil {
+		t.Fatal(err)
+	}
+	changed, _ := shares.Public(token)
+	if shares.ValidUnlockCookie(cookie, token, changed) {
+		t.Fatal("cookie survived a password change")
+	}
+	removed := ""
+	if _, err := shares.Update("owner", item.ID, record.ExpiresAt, &removed, nil); err != nil {
+		t.Fatal(err)
+	}
+	open, _ := shares.Public(token)
+	if shares.ValidUnlockCookie(shares.UnlockCookie(token, open, time.Now().Add(time.Hour)), token, open) {
+		t.Fatal("a share without a password accepted an unlock cookie")
+	}
+}
+
+func TestSharePasswordsIgnoreSurroundingSpaces(t *testing.T) {
+	shares := newTestShares(t, false)
+	item, err := shares.Create("owner", "notes.txt", strings.NewReader("hello"), time.Time{}, "  long password  ", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := shareToken(t, item)
+	for _, attempt := range []string{"  long password  ", "long password", "long password\n"} {
+		if _, err := shares.VerifyPassword(token, attempt); err != nil {
+			t.Errorf("password %q refused: %v", attempt, err)
+		}
+	}
+	if _, err := shares.VerifyPassword(token, "long  password"); !errors.Is(err, ErrSharePassword) {
+		t.Fatalf("different password error = %v", err)
+	}
+}
+
+func TestValidShareToken(t *testing.T) {
+	token, _ := randomURLToken(shareTokenBytes)
+	if !ValidShareToken(token) {
+		t.Fatalf("generated token %q refused", token)
+	}
+	for _, bad := range []string{"", token[:42], token + "A", strings.Repeat("A", 42) + "=", strings.Repeat("A", 42) + "/", strings.Repeat("A", 1<<20)} {
+		if ValidShareToken(bad) {
+			t.Errorf("token of length %d accepted: %.50q", len(bad), bad)
+		}
+	}
+	shares := newTestShares(t, false)
+	if _, err := shares.Public(strings.Repeat("A", 1<<20)); !errors.Is(err, ErrShareNotFound) {
+		t.Fatalf("huge token error = %v", err)
+	}
+}
+
+func TestLockedViewHidesTheFile(t *testing.T) {
+	record := &model.ShareRecord{ID: "rec1", Filename: "secret plan.pdf", MIMEType: "application/pdf", Size: 1234, Downloads: 7, PasswordHash: "$2a$x", ExpiresAt: time.Now().Add(time.Hour)}
+	body, _ := json.Marshal(LockedView(record))
+	for _, leak := range []string{"secret plan", "application/pdf", "1234", "rec1", "downloads"} {
+		if strings.Contains(string(body), leak) {
+			t.Fatalf("locked view %s reveals %q", body, leak)
+		}
+	}
+	if !strings.Contains(string(body), `"locked":true`) || !strings.Contains(string(body), `"passwordProtected":true`) {
+		t.Fatalf("locked view = %s", body)
+	}
+	if view := PublicView(record); view.Filename != record.Filename || view.Locked {
+		t.Fatalf("public view = %#v", view)
+	}
+}
+
+func TestFileCountIsCapped(t *testing.T) {
+	shares := newTestShares(t, false)
+	shares.cfg.ShareFreeMaxFiles = 2
+	shares.cfg.ShareFreeStorageBytes = 1 << 20
+	if _, err := shares.Create("owner", "a.txt", strings.NewReader("a"), time.Time{}, "", false); err != nil {
+		t.Fatal(err)
+	}
+	// An upload in progress holds a file slot too.
+	if _, err := shares.StartUpload("owner", "1.2.3.4", model.StartShareUploadRequest{Filename: "b.txt", Size: 1}, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := shares.StartUpload("owner", "1.2.3.4", model.StartShareUploadRequest{Filename: "c.txt", Size: 1}, time.Time{}); !errors.Is(err, ErrShareFileLimit) {
+		t.Fatalf("over the file cap error = %v", err)
+	}
+	if _, err := shares.Create("owner", "b.txt", strings.NewReader("b"), time.Time{}, "", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := shares.Create("owner", "c.txt", strings.NewReader("c"), time.Time{}, "", false); !errors.Is(err, ErrShareFileLimit) {
+		t.Fatalf("third file error = %v", err)
+	}
+	_, usage, limits, err := shares.List("owner")
+	if err != nil || usage.Files != 2 || usage.UsedBytes != 2*shareMinFileBytes || limits.Current.MaxFiles != 2 {
+		t.Fatalf("usage = %#v, limits %#v, %v", usage, limits.Current, err)
+	}
+}
+
+func TestListShowsEveryFileUpToTheLargestCap(t *testing.T) {
+	shares := newTestShares(t, false)
+	shares.cfg.ShareFreeMaxFiles, shares.cfg.ShareProMaxFiles = 3, 5
+	repo := shares.repo.(*memoryShares)
+	for index := 0; index < 7; index++ {
+		_, _ = repo.Create(model.ShareRecord{OwnerID: "owner", StorageKey: "k", Filename: "a.txt", Size: 1, ExpiresAt: time.Now().Add(time.Hour)})
+	}
+	if items, _, _, err := shares.List("owner"); err != nil || len(items) != 5 {
+		t.Fatalf("listed %d items, %v", len(items), err)
+	}
+}
+
+func TestUploadSessionsCantBeHeldForever(t *testing.T) {
+	shares := newTestShares(t, true)
+	session, err := shares.StartUpload("owner", "1.2.3.4", model.StartShareUploadRequest{Filename: "big.zip", Size: 1 << 20}, time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := shares.sessions[session.ID]
+	long := time.Now().Add(-time.Hour)
+	stored.touched = long
+
+	// A few bytes are not progress.
+	if _, err := shares.WriteUploadChunk("owner", session.ID, 0, strings.NewReader("PK")); err != nil {
+		t.Fatal(err)
+	}
+	if !stored.touched.Equal(long) {
+		t.Fatal("two bytes counted as activity")
+	}
+	if _, err := shares.WriteUploadChunk("owner", session.ID, 2, strings.NewReader(strings.Repeat("x", int(shareUploadProgress)))); err != nil {
+		t.Fatal(err)
+	}
+	if stored.touched.Equal(long) {
+		t.Fatal("64 KB of new data did not count as activity")
+	}
+	// Resending the same bytes is not progress either.
+	stored.touched = long
+	if _, err := shares.WriteUploadChunk("owner", session.ID, 0, strings.NewReader("PK"+strings.Repeat("x", int(shareUploadProgress)))); err != nil {
+		t.Fatal(err)
+	}
+	if !stored.touched.Equal(long) {
+		t.Fatal("resent bytes counted as activity")
+	}
+
+	// However active, a session ends after its lifetime.
+	stored.started = time.Now().Add(-shareUploadMaxLifetime - time.Minute)
+	if _, err := shares.WriteUploadChunk("owner", session.ID, stored.received, strings.NewReader("more")); !errors.Is(err, ErrShareUploadExpired) {
+		t.Fatalf("old session error = %v", err)
+	}
+	if _, err := os.Stat(stored.tempPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expired upload file kept: %v", err)
+	}
+
+	other, _ := shares.StartUpload("owner", "1.2.3.4", model.StartShareUploadRequest{Filename: "b.zip", Size: 10}, time.Time{})
+	shares.sessions[other.ID].started = time.Now().Add(-shareUploadMaxLifetime - time.Minute)
+	shares.sessionsMu.Lock()
+	shares.pruneUploadsLocked(time.Now())
+	shares.sessionsMu.Unlock()
+	if _, ok := shares.sessions[other.ID]; ok {
+		t.Fatal("prune kept a session past its lifetime")
+	}
+}
+
+func TestUploadsPerAddressAreCapped(t *testing.T) {
+	shares := newTestShares(t, true)
+	for index := 0; index < shareMaxVisitorUploads; index++ {
+		user := string(rune('a' + index/shareMaxUserUploads))
+		if _, err := shares.StartUpload(user, "1.2.3.4", model.StartShareUploadRequest{Filename: "a.zip", Size: 10}, time.Time{}); err != nil {
+			t.Fatalf("upload %d: %v", index, err)
+		}
+	}
+	if _, err := shares.StartUpload("z", "1.2.3.4", model.StartShareUploadRequest{Filename: "a.zip", Size: 10}, time.Time{}); !errors.Is(err, ErrShareBusy) {
+		t.Fatalf("upload over the address cap error = %v", err)
+	}
+	if _, err := shares.StartUpload("z", "5.6.7.8", model.StartShareUploadRequest{Filename: "a.zip", Size: 10}, time.Time{}); err != nil {
+		t.Fatalf("another address was capped: %v", err)
+	}
+}
+
+func TestEditedExpiryCountsFromUpload(t *testing.T) {
+	free := newTestShares(t, false)
+	item, err := free.Create("owner", "a.txt", strings.NewReader("hello"), time.Time{}, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := free.repo.(*memoryShares)
+	record := repo.records[item.ID]
+	record.Created = time.Now().Add(-48 * time.Hour)
+	record.ExpiresAt = time.Now().Add(12 * time.Hour)
+	repo.records[item.ID] = record
+
+	var expiry *ErrShareExpiry
+	if _, err := free.Update("owner", item.ID, time.Now().Add(72*time.Hour), nil, nil); !errors.As(err, &expiry) {
+		t.Fatalf("extending past three days after upload error = %v", err)
+	}
+	if _, err := free.Update("owner", item.ID, time.Now().Add(23*time.Hour), nil, nil); err != nil {
+		t.Fatalf("extending within three days of upload refused: %v", err)
+	}
+	// Keeping the current expiry always works, even after the plan shrank.
+	record = repo.records[item.ID]
+	record.Created = time.Now().Add(-10 * 24 * time.Hour)
+	repo.records[item.ID] = record
+	if _, err := free.Update("owner", item.ID, record.ExpiresAt, nil, nil); err != nil {
+		t.Fatalf("keeping the expiry refused: %v", err)
+	}
+	if _, err := free.Update("owner", item.ID, time.Now().Add(time.Hour), nil, nil); err != nil {
+		t.Fatalf("shortening refused: %v", err)
+	}
+}
+
+func TestFileTypes(t *testing.T) {
+	shares := newTestShares(t, true)
+	cases := []struct{ name, body, want string }{
+		{"Makefile", "build:\n\tgo build ./...\n", "text/plain"},
+		{"LICENSE", "MIT License", "text/plain"},
+		{"notes.txt", "<p>First paragraph</p>", "text/plain"},
+		{"notes.md", "<!-- comment -->\n# Title", "text/plain"},
+		{"snippet.txt", "<script>alert(1)</script>", "text/plain"},
+		{"feed.rss", "<?xml version=\"1.0\"?><rss></rss>", "text/plain"},
+		{"blob", "\x00\x01\x02\x03binary", "application/octet-stream"},
+		{"page.html", "<p>hello</p>", "text/html"},
+	}
+	for _, test := range cases {
+		item, err := shares.Create("owner", test.name, strings.NewReader(test.body), time.Time{}, "", false)
+		if err != nil || !strings.HasPrefix(item.MIMEType, test.want) {
+			t.Errorf("%s = %#v, %v; want %s", test.name, item, err, test.want)
+		}
+	}
+	for _, name := range []string{
+		"setup.exe", "setup.exe.", "setup.exe . ", "run.hta", "doc.scr", "a.vbs", "a.js", "a.jar", "link.lnk", "disk.iso",
+		"disk.img", "disk.vhdx", "app.msix", "a.reg", "a.ps1", "a.bat", "a.cmd", "a.com", "a.url", "help.chm", "a.svg",
+		"a.svgz", "a.xhtml", "data.xml", "page.mht", "a.msi", "a.dll", "photo‮gpj.scr",
+	} {
+		if _, err := shares.Create("owner", name, strings.NewReader("MZ data"), time.Time{}, "", false); !errors.Is(err, ErrShareType) {
+			t.Errorf("%q error = %v", name, err)
+		}
+	}
+	if got := sanitizeFilename("invoice‮fdp.exe . "); got != "invoicefdp.exe" {
+		t.Fatalf("sanitized name = %q", got)
+	}
+}
+
+func TestOrphanSweepRemovesOnlyOldUnknownFiles(t *testing.T) {
+	shares := newTestShares(t, true)
+	item, err := shares.Create("owner", "kept.txt", strings.NewReader("hello"), time.Time{}, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	known := shares.repo.(*memoryShares).records[item.ID].StorageKey
+	session, err := shares.StartUpload("owner", "1.2.3.4", model.StartShareUploadRequest{Filename: "b.zip", Size: 10}, time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	active := filepath.Base(shares.sessions[session.ID].tempPath)
+	old := time.Now().Add(-shareOrphanAge - time.Hour)
+	write := func(name string, modified time.Time) string {
+		path := filepath.Join(shares.storageDir, name)
+		if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, modified, modified); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	orphan := write(strings.Repeat("ab", 24), old)
+	recent := write(strings.Repeat("cd", 24), time.Now())
+	staleUpload := write(".upload-stale", old)
+	unrelated := write("data.db", old)
+	write(known, old)
+	write(active, old)
+	if err := os.Mkdir(filepath.Join(shares.storageDir, strings.Repeat("ef", 24)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := shares.SweepOrphans()
+	if err != nil || removed != 2 {
+		t.Fatalf("sweep removed %d, %v", removed, err)
+	}
+	for _, path := range []string{orphan, staleUpload} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s kept", filepath.Base(path))
+		}
+	}
+	for _, path := range []string{recent, unrelated, filepath.Join(shares.storageDir, known), filepath.Join(shares.storageDir, active), filepath.Join(shares.storageDir, strings.Repeat("ef", 24))} {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("%s removed: %v", filepath.Base(path), err)
+		}
+	}
+
+	shares.RemoveStoredFile("../data.db")
+	shares.RemoveStoredFile("data.db")
+	if _, err := os.Stat(unrelated); err != nil {
+		t.Fatal("RemoveStoredFile touched a name it never creates")
+	}
+	shares.RemoveStoredFile(known)
+	if _, err := os.Stat(filepath.Join(shares.storageDir, known)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("RemoveStoredFile kept a share's file")
+	}
+}

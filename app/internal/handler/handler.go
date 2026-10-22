@@ -17,8 +17,10 @@ type Handler struct {
 	cfg            *config.Config
 	shareUploads   chan struct{}
 	shareDownloads chan struct{}
-	sharePasswords *sharePasswordGuard
-	shareUploaders *shareUploaderLimit
+	// shareVisitorSlots caps downloads per visitor within shareDownloads.
+	shareVisitorSlots *shareSlots
+	sharePasswords    *sharePasswordGuard
+	shareUploaders    *shareUploaderLimit
 }
 
 func (h *Handler) Register(router *router.Router[*core.RequestEvent]) {
@@ -123,5 +125,8 @@ func (h *Handler) Register(router *router.Router[*core.RequestEvent]) {
 }
 
 func NewHandler(logger *slog.Logger, service service.I, cfg *config.Config) *Handler {
-	return &Handler{logger: logger, service: service, cfg: cfg, shareUploads: make(chan struct{}, 2), shareDownloads: make(chan struct{}, 32), sharePasswords: newSharePasswordGuard(), shareUploaders: newShareUploaderLimit(cfg.ShareFreeUploadersPerIP)}
+	return &Handler{
+		logger: logger, service: service, cfg: cfg, shareUploads: make(chan struct{}, 2), shareDownloads: make(chan struct{}, 32),
+		shareVisitorSlots: newShareSlots(shareVisitorDownloads), sharePasswords: newSharePasswordGuard(), shareUploaders: newShareUploaderLimit(cfg.ShareFreeUploadersPerIP),
+	}
 }

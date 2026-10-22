@@ -225,40 +225,68 @@ func (g *sharePasswordGuard) pruneLocked(now time.Time) {
 	}
 }
 
-// shareVisitorKey identifies a visitor for the password guard. Headers set by
-// a proxy are trusted only when the request came from a private address (the
-// nginx container); the API port is also reachable directly, and there anyone
-// could forge them. IPv6 addresses are grouped by /64, the block one
-// subscriber normally holds.
+// shareVisitorKey identifies a visitor for the password guard and the
+// upload and download limits. See shareVisitor.
 func shareVisitorKey(r *http.Request) string {
+	key, _ := shareVisitor(r)
+	return key
+}
+
+// shareVisitor identifies a visitor. Headers set by a proxy are trusted only
+// when the request came from a private address (the nginx container); the API
+// port is also reachable directly, and there anyone could forge them. IPv6
+// addresses are grouped by /64, the block one subscriber normally holds.
+// internal reports a request from our own network that named no outside
+// client.
+func shareVisitor(r *http.Request) (key string, internal bool) {
 	remote := r.RemoteAddr
 	if host, _, err := net.SplitHostPort(remote); err == nil {
 		remote = host
 	}
 	address := net.ParseIP(remote)
-	if address != nil && (address.IsLoopback() || address.IsPrivate()) {
+	if internalAddress(address) {
 		if forwarded := forwardedClientIP(r); forwarded != nil {
 			address = forwarded
 		}
 	}
 	if address == nil {
-		return remote
+		return remote, false
 	}
+	internal = internalAddress(address)
 	if address.To4() == nil {
-		return address.Mask(net.CIDRMask(64, 128)).String() + "/64"
+		return address.Mask(net.CIDRMask(64, 128)).String() + "/64", internal
 	}
-	return address.String()
+	return address.String(), internal
+}
+
+func internalAddress(address net.IP) bool {
+	return address != nil && (address.IsLoopback() || address.IsPrivate())
 }
 
 // forwardedClientIP reads the client address nginx passes on. X-Real-IP is
-// overwritten by nginx; for X-Forwarded-For only the right-most entry, the
-// one nginx appended, can be trusted.
+// overwritten by nginx. When it is itself internal, for example the website's
+// server fetching a direct link for a visitor, X-Forwarded-For is read from
+// the right, past internal hops, up to the first outside address: every
+// entry right of it was added by our own proxies.
 func forwardedClientIP(r *http.Request) net.IP {
-	if address := net.ParseIP(strings.TrimSpace(r.Header.Get("X-Real-IP"))); address != nil {
-		return address
+	real := net.ParseIP(strings.TrimSpace(r.Header.Get("X-Real-IP")))
+	if real != nil && !internalAddress(real) {
+		return real
 	}
 	parts := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
-	return net.ParseIP(strings.TrimSpace(parts[len(parts)-1]))
+	for index := len(parts) - 1; index >= 0; index-- {
+		address := net.ParseIP(strings.TrimSpace(parts[index]))
+		if address == nil {
+			break
+		}
+		if !internalAddress(address) {
+			return address
+		}
+		if real == nil {
+			real = address
+		}
+	}
+	return real
 }
 
 // shareUploaderLimit caps how many different Free accounts may upload cloud

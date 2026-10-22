@@ -1,11 +1,6 @@
 package handler
 
 import (
-	"crypto/hmac"
-	"crypto/sha256"
-	"crypto/subtle"
-	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,7 +18,10 @@ import (
 	"gitlab.yurtal.tech/company/pocketbase-app-template/pkg/disposable"
 )
 
-const publicSharesPath = "/api/v1/public/shares/"
+const (
+	publicSharesPath  = "/api/v1/public/shares/"
+	shareUnlockCookie = "goport_cloud_share"
+)
 
 func (h *Handler) ListSharesHandler(e *core.RequestEvent) error {
 	items, usage, limits, err := h.service.Shares().List(e.Auth.Id)
@@ -87,7 +85,7 @@ func (h *Handler) StartShareUploadHandler(e *core.RequestEvent) error {
 	if _, allowed, err := h.shareUploadAllowed(e); !allowed {
 		return err
 	}
-	session, err := h.service.Shares().StartUpload(e.Auth.Id, *request, expiresAt)
+	session, err := h.service.Shares().StartUpload(e.Auth.Id, shareVisitorKey(e.Request), *request, expiresAt)
 	if err != nil {
 		return h.shareError(e, err)
 	}
@@ -187,17 +185,21 @@ func (h *Handler) DeleteShareHandler(e *core.RequestEvent) error {
 	return h.NewSuccessResponse(e, http.StatusOK, map[string]string{"message": "File deleted"})
 }
 
+// PublicShareHandler describes a share for its public page. Until the
+// password is entered it says only that the file is locked.
 func (h *Handler) PublicShareHandler(e *core.RequestEvent) error {
 	h.publicShareHeaders(e.Response, e.Request)
 	token := e.Request.PathValue("token")
-	item, _, err := h.service.Shares().Public(token)
+	record, err := h.service.Shares().Public(token)
 	if err != nil {
 		return h.publicShareError(e, err)
 	}
-	if item.PasswordProtected {
-		item.RetryAfter = waitSeconds(h.sharePasswords.status(token, shareVisitorKey(e.Request)))
+	if record.PasswordHash != "" && !h.shareUnlocked(e.Request, token, record) {
+		view := service.LockedView(record)
+		view.RetryAfter = waitSeconds(h.sharePasswords.status(token, shareVisitorKey(e.Request)))
+		return h.NewSuccessResponse(e, http.StatusOK, view)
 	}
-	return h.NewSuccessResponse(e, http.StatusOK, item)
+	return h.NewSuccessResponse(e, http.StatusOK, service.PublicView(record))
 }
 
 func (h *Handler) PublicShareOptionsHandler(e *core.RequestEvent) error {
@@ -231,6 +233,14 @@ func (h *Handler) UnlockShareHandler(e *core.RequestEvent) error {
 		return h.NewErrorResponse(e, http.StatusBadRequest, "invalid request body")
 	}
 	token := e.Request.PathValue("token")
+	// The link must exist before the password guard keeps any state for it.
+	record, err := h.service.Shares().Public(token)
+	if err != nil {
+		return h.publicShareError(e, err)
+	}
+	if record.PasswordHash == "" {
+		return h.NewSuccessResponse(e, http.StatusOK, map[string]bool{"unlocked": true})
+	}
 	visitor := shareVisitorKey(e.Request)
 	if wait, reason := h.sharePasswords.begin(token, visitor); wait > 0 {
 		return h.sharePasswordPaused(e, wait, reason)
@@ -248,7 +258,7 @@ func (h *Handler) UnlockShareHandler(e *core.RequestEvent) error {
 		}
 	}()
 
-	record, err := h.service.Shares().VerifyPassword(token, request.Password)
+	record, err = h.service.Shares().VerifyPassword(token, request.Password)
 	switch {
 	case errors.Is(err, service.ErrSharePassword):
 		outcome = shareAttemptWrong
@@ -264,12 +274,26 @@ func (h *Handler) UnlockShareHandler(e *core.RequestEvent) error {
 	}
 	outcome = shareAttemptCorrect
 	finish()
+	// The password may have been removed meanwhile; then there is nothing to unlock.
+	if record.PasswordHash == "" {
+		return h.NewSuccessResponse(e, http.StatusOK, map[string]bool{"unlocked": true})
+	}
 	expires := time.Now().Add(12 * time.Hour)
 	if record.ExpiresAt.Before(expires) {
 		expires = record.ExpiresAt
 	}
-	http.SetCookie(e.Response, &http.Cookie{Name: "goport_cloud_share", Value: h.shareCookie(token, expires), Path: publicSharesPath + token, Expires: expires, HttpOnly: true, Secure: requestIsHTTPS(e.Request), SameSite: http.SameSiteLaxMode})
+	http.SetCookie(e.Response, &http.Cookie{
+		Name: shareUnlockCookie, Value: h.service.Shares().UnlockCookie(token, record, expires), Path: publicSharesPath + token,
+		Expires: expires, HttpOnly: true, Secure: requestIsHTTPS(e.Request), SameSite: http.SameSiteLaxMode,
+	})
 	return h.NewSuccessResponse(e, http.StatusOK, map[string]bool{"unlocked": true})
+}
+
+// shareUnlocked reports whether the request carries a valid unlock cookie for
+// this share and its current password.
+func (h *Handler) shareUnlocked(r *http.Request, token string, record *model.ShareRecord) bool {
+	cookie, err := r.Cookie(shareUnlockCookie)
+	return err == nil && h.service.Shares().ValidUnlockCookie(cookie.Value, token, record)
 }
 
 func (h *Handler) sharePasswordPaused(e *core.RequestEvent, wait time.Duration, reason shareLockReason) error {
@@ -287,30 +311,21 @@ func (h *Handler) sharePasswordPaused(e *core.RequestEvent, wait time.Duration, 
 
 func (h *Handler) ShareContentHandler(e *core.RequestEvent) error {
 	h.publicShareHeaders(e.Response, e.Request)
-	select {
-	case h.shareDownloads <- struct{}{}:
-		defer func() { <-h.shareDownloads }()
-	default:
-		return h.NewErrorResponse(e, http.StatusTooManyRequests, "Too many downloads are in progress. Try again shortly.")
-	}
 	token := e.Request.PathValue("token")
-	item, record, err := h.service.Shares().Public(token)
+	record, err := h.service.Shares().Public(token)
 	if err != nil {
 		return h.publicShareError(e, err)
 	}
-	if record.PasswordHash != "" && !h.validShareCookie(e.Request, token) {
+	if record.PasswordHash != "" && !h.shareUnlocked(e.Request, token, record) {
 		return h.NewErrorResponse(e, http.StatusUnauthorized, "password required")
 	}
-	preview := e.Request.URL.Query().Get("preview") == "1" && item.Previewable
-	return h.serveShareFile(e, token, preview, countsAsDownload(e.Request))
-}
-
-// countsAsDownload reports whether a request delivers the file from the
-// start. Previews count as well as downloads, since both cost the same
-// traffic; follow-up range requests from a PDF viewer do not.
-func countsAsDownload(r *http.Request) bool {
-	rangeHeader := r.Header.Get("Range")
-	return r.Method == http.MethodGet && (rangeHeader == "" || strings.HasPrefix(rangeHeader, "bytes=0-"))
+	inline := e.Request.URL.Query().Get("preview") == "1" && service.SafePreview(record.MIMEType)
+	// A shared web page shows only inside the share page's frame. Opened on
+	// its own it downloads, so the API host can't be used to host pages.
+	if inline && service.IsHTMLType(record.MIMEType) && e.Request.Header.Get("Sec-Fetch-Dest") != "iframe" {
+		inline = false
+	}
+	return h.serveShareFile(e, token, inline)
 }
 
 // ShareRawHandler serves a direct link: the file itself, with no share page.
@@ -319,24 +334,25 @@ func countsAsDownload(r *http.Request) bool {
 // the share page instead.
 func (h *Handler) ShareRawHandler(e *core.RequestEvent) error {
 	h.publicShareHeaders(e.Response, e.Request)
-	select {
-	case h.shareDownloads <- struct{}{}:
-		defer func() { <-h.shareDownloads }()
-	default:
-		return h.NewErrorResponse(e, http.StatusTooManyRequests, "Too many downloads are in progress. Try again shortly.")
-	}
 	token := e.Request.PathValue("token")
-	item, record, err := h.service.Shares().Public(token)
+	record, err := h.service.Shares().Public(token)
 	if err != nil {
 		return h.publicShareError(e, err)
 	}
 	if !h.service.Shares().DirectAllowed(record) {
 		return e.JSON(http.StatusConflict, map[string]string{"state": "page", "error": "This file opens on its share page."})
 	}
-	return h.serveShareFile(e, token, item.Previewable, countsAsDownload(e.Request))
+	return h.serveShareFile(e, token, service.SafePreview(record.MIMEType))
 }
 
-func (h *Handler) serveShareFile(e *core.RequestEvent, token string, inline, countDownload bool) error {
+func (h *Handler) serveShareFile(e *core.RequestEvent, token string, inline bool) error {
+	if e.Request.Method != http.MethodHead {
+		release, ok := h.takeDownloadSlot(e.Request)
+		if !ok {
+			return h.NewErrorResponse(e, http.StatusTooManyRequests, "Too many downloads are in progress. Try again shortly.")
+		}
+		defer release()
+	}
 	file, record, err := h.service.Shares().Open(token)
 	if err != nil {
 		return h.publicShareError(e, err)
@@ -357,11 +373,34 @@ func (h *Handler) serveShareFile(e *core.RequestEvent, token string, inline, cou
 	e.Response.Header().Set("Content-Disposition", contentDisposition(disposition, record.Filename))
 	// Revoking or deleting must take effect at once, so nothing is cached.
 	e.Response.Header().Set("Cache-Control", "private, no-store")
-	if countDownload {
-		h.service.Shares().CountDownload(record.ID)
-	}
-	http.ServeContent(e.Response, e.Request, record.Filename, info.ModTime(), file)
+	// Previews count as well as downloads, since both cost the same traffic.
+	writer := newShareDownloadWriter(e.Response, e.Request.Method, func() { h.service.Shares().CountDownload(record.ID) })
+	http.ServeContent(writer, e.Request, record.Filename, info.ModTime(), file)
 	return nil
+}
+
+// takeDownloadSlot reserves one of the visitor's download slots and one of
+// the server's. A request from our own network that names no outside client,
+// such as the website fetching a direct link, uses only the server's.
+func (h *Handler) takeDownloadSlot(r *http.Request) (func(), bool) {
+	release := func() {}
+	if visitor, internal := shareVisitor(r); !internal {
+		visitorRelease, ok := h.shareVisitorSlots.acquire(r.Context(), visitor, shareSlotWait)
+		if !ok {
+			return nil, false
+		}
+		release = visitorRelease
+	}
+	select {
+	case h.shareDownloads <- struct{}{}:
+		return func() {
+			<-h.shareDownloads
+			release()
+		}, true
+	default:
+		release()
+		return nil, false
+	}
 }
 
 func (h *Handler) shareError(e *core.RequestEvent, err error) error {
@@ -372,6 +411,8 @@ func (h *Handler) shareError(e *core.RequestEvent, err error) error {
 		return h.NewErrorResponse(e, http.StatusRequestEntityTooLarge, "The file exceeds your plan's upload limit.")
 	case errors.Is(err, service.ErrShareQuota):
 		return h.NewErrorResponse(e, http.StatusInsufficientStorage, "Your storage is full. Delete files or upgrade to Pro for more space.")
+	case errors.Is(err, service.ErrShareFileLimit):
+		return h.NewErrorResponse(e, http.StatusInsufficientStorage, "You have as many files as your plan allows. Delete files or upgrade to Pro to keep more.")
 	case errors.Is(err, service.ErrShareType):
 		return h.NewErrorResponse(e, http.StatusUnsupportedMediaType, "This file type is not allowed.")
 	case errors.Is(err, service.ErrShareEmpty):
@@ -384,6 +425,8 @@ func (h *Handler) shareError(e *core.RequestEvent, err error) error {
 		return h.NewErrorResponse(e, http.StatusBadRequest, "Direct links open the file itself, so they can't ask for a password.")
 	case errors.Is(err, service.ErrShareUploadNotFound):
 		return h.NewErrorResponse(e, http.StatusNotFound, "This upload was interrupted. Start it again.")
+	case errors.Is(err, service.ErrShareUploadExpired):
+		return h.NewErrorResponse(e, http.StatusNotFound, "Uploads must finish within 2 hours. Start it again.")
 	case errors.Is(err, service.ErrShareUploadIncomplete):
 		return h.NewErrorResponse(e, http.StatusConflict, "The upload hasn't finished yet.")
 	case errors.Is(err, service.ErrShareExpired):
@@ -425,6 +468,10 @@ func (h *Handler) publicShareHeaders(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", origin)
 		w.Header().Set("Access-Control-Allow-Credentials", "true")
 		w.Header().Set("Access-Control-Expose-Headers", "Retry-After, Content-Length, Content-Range")
+	} else {
+		// PocketBase's CORS middleware allows every origin. Only the site
+		// may read share responses from a script.
+		w.Header().Del("Access-Control-Allow-Origin")
 	}
 }
 
@@ -464,48 +511,6 @@ func parseShareExpiration(value string) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("expiration must use RFC3339 format")
 	}
 	return parsed, nil
-}
-
-func (h *Handler) shareCookie(token string, expires time.Time) string {
-	payload := strconv.FormatInt(expires.Unix(), 10) + "." + token
-	mac := hmac.New(sha256.New, []byte(h.shareSecret()))
-	_, _ = mac.Write([]byte(payload))
-	return base64.RawURLEncoding.EncodeToString([]byte(payload)) + "." + hex.EncodeToString(mac.Sum(nil))
-}
-
-func (h *Handler) validShareCookie(r *http.Request, token string) bool {
-	cookie, err := r.Cookie("goport_cloud_share")
-	if err != nil {
-		return false
-	}
-	parts := strings.Split(cookie.Value, ".")
-	if len(parts) != 2 {
-		return false
-	}
-	raw, err := base64.RawURLEncoding.DecodeString(parts[0])
-	if err != nil {
-		return false
-	}
-	payload := string(raw)
-	segments := strings.SplitN(payload, ".", 2)
-	if len(segments) != 2 || segments[1] != token {
-		return false
-	}
-	expiry, err := strconv.ParseInt(segments[0], 10, 64)
-	if err != nil || time.Now().Unix() >= expiry {
-		return false
-	}
-	mac := hmac.New(sha256.New, []byte(h.shareSecret()))
-	_, _ = mac.Write(raw)
-	want := hex.EncodeToString(mac.Sum(nil))
-	return subtle.ConstantTimeCompare([]byte(want), []byte(parts[1])) == 1
-}
-
-func (h *Handler) shareSecret() string {
-	if h.cfg.ShareSigningKey != "" {
-		return h.cfg.ShareSigningKey
-	}
-	return "goport-development-share-key-change-in-production"
 }
 
 func contentDisposition(kind, filename string) string {

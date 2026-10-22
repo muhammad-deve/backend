@@ -18,12 +18,13 @@ func newTestShares(t *testing.T, pro bool) *sharesService {
 	return &sharesService{
 		cfg: &config.Config{
 			AppURL: "https://goport.test", ShareFreeMaxUploadBytes: 64, ShareProMaxUploadBytes: 1 << 30,
-			ShareFreeStorageBytes: 100, ShareProStorageBytes: 1 << 31, ShareTotalStorageBytes: 1 << 40,
+			ShareFreeStorageBytes: 6000, ShareProStorageBytes: 1 << 31, ShareTotalStorageBytes: 1 << 40,
+			ShareFreeMaxFiles: 100, ShareProMaxFiles: 1000,
 			ShareFreeDefaultRetentionHours: 24, ShareFreeMaxRetentionHours: 72, ShareFreeMaxDownloads: 3,
 			ShareProDefaultRetentionHours: 168, ShareProMaxRetentionHours: 720,
 		},
 		repo: &memoryShares{records: make(map[string]model.ShareRecord)}, billing: fakeShareBilling{pro: pro},
-		storageDir: t.TempDir(), cryptKey: [32]byte{4, 5, 6}, uploads: make(chan struct{}, 2),
+		storageDir: t.TempDir(), secret: []byte("test secret"), cryptKey: [32]byte{4, 5, 6}, uploads: make(chan struct{}, 2),
 		sessions: make(map[string]*shareUploadSession),
 	}
 }
@@ -31,7 +32,7 @@ func newTestShares(t *testing.T, pro bool) *sharesService {
 func TestChunkedUploadResumesAndCompletes(t *testing.T) {
 	shares := newTestShares(t, false)
 	body := "%PDF-1.7 chunked upload body"
-	session, err := shares.StartUpload("owner", model.StartShareUploadRequest{Filename: "notes.pdf", Size: int64(len(body))}, time.Time{})
+	session, err := shares.StartUpload("owner", "1.2.3.4", model.StartShareUploadRequest{Filename: "notes.pdf", Size: int64(len(body))}, time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,44 +80,49 @@ func TestChunkedUploadResumesAndCompletes(t *testing.T) {
 
 func TestChunkedUploadChecksPlanBeforeSendingBytes(t *testing.T) {
 	free := newTestShares(t, false)
-	if _, err := free.StartUpload("owner", model.StartShareUploadRequest{Filename: "big.zip", Size: 65}, time.Time{}); !errors.Is(err, ErrShareTooLarge) {
+	if _, err := free.StartUpload("owner", "1.2.3.4", model.StartShareUploadRequest{Filename: "big.zip", Size: 65}, time.Time{}); !errors.Is(err, ErrShareTooLarge) {
 		t.Fatalf("over the free file limit error = %v", err)
 	}
-	if _, err := free.StartUpload("owner", model.StartShareUploadRequest{Filename: "cert.pdf", Size: 10, Direct: true}, time.Time{}); !errors.Is(err, ErrShareDirectPro) {
+	if _, err := free.StartUpload("owner", "1.2.3.4", model.StartShareUploadRequest{Filename: "cert.pdf", Size: 10, Direct: true}, time.Time{}); !errors.Is(err, ErrShareDirectPro) {
 		t.Fatalf("free direct link error = %v", err)
 	}
-	if _, err := free.StartUpload("owner", model.StartShareUploadRequest{Filename: "logo.svg", Size: 10}, time.Time{}); !errors.Is(err, ErrShareType) {
+	if _, err := free.StartUpload("owner", "1.2.3.4", model.StartShareUploadRequest{Filename: "logo.svg", Size: 10}, time.Time{}); !errors.Is(err, ErrShareType) {
 		t.Fatalf("svg upload error = %v", err)
 	}
 	// Uploads in progress count against the quota.
-	if _, err := free.StartUpload("owner", model.StartShareUploadRequest{Filename: "a.zip", Size: 60}, time.Time{}); err != nil {
+	if _, err := free.StartUpload("owner", "1.2.3.4", model.StartShareUploadRequest{Filename: "a.zip", Size: 60}, time.Time{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := free.StartUpload("owner", model.StartShareUploadRequest{Filename: "b.zip", Size: 60}, time.Time{}); !errors.Is(err, ErrShareQuota) {
+	if _, err := free.StartUpload("owner", "1.2.3.4", model.StartShareUploadRequest{Filename: "b.zip", Size: 60}, time.Time{}); !errors.Is(err, ErrShareQuota) {
 		t.Fatalf("reserved quota error = %v", err)
 	}
 
 	pro := newTestShares(t, true)
-	if _, err := pro.StartUpload("owner", model.StartShareUploadRequest{Filename: "big.zip", Size: 500 << 20}, time.Time{}); err != nil {
+	if _, err := pro.StartUpload("owner", "1.2.3.4", model.StartShareUploadRequest{Filename: "big.zip", Size: 500 << 20}, time.Time{}); err != nil {
 		t.Fatalf("pro large upload refused: %v", err)
 	}
-	if _, err := pro.StartUpload("owner", model.StartShareUploadRequest{Filename: "cert.pdf", Size: 10, Direct: true, Password: "long password"}, time.Time{}); !errors.Is(err, ErrShareDirectPassword) {
+	if _, err := pro.StartUpload("owner", "1.2.3.4", model.StartShareUploadRequest{Filename: "cert.pdf", Size: 10, Direct: true, Password: "long password"}, time.Time{}); !errors.Is(err, ErrShareDirectPassword) {
 		t.Fatalf("direct link with password error = %v", err)
 	}
 }
 
-func TestChunkedUploadRejectsDisguisedFiles(t *testing.T) {
+func TestChunkedUploadStoresDisguisedPagesAsText(t *testing.T) {
 	shares := newTestShares(t, false)
 	body := "<!DOCTYPE html><html><script>alert(1)</script></html>"
-	session, err := shares.StartUpload("owner", model.StartShareUploadRequest{Filename: "invoice.pdf", Size: int64(len(body))}, time.Time{})
+	session, err := shares.StartUpload("owner", "1.2.3.4", model.StartShareUploadRequest{Filename: "invoice.pdf", Size: int64(len(body))}, time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := shares.WriteUploadChunk("owner", session.ID, 0, strings.NewReader(body)); !errors.Is(err, ErrShareType) {
-		t.Fatalf("html disguised as pdf error = %v", err)
+	if _, err := shares.WriteUploadChunk("owner", session.ID, 0, strings.NewReader(body)); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := shares.CompleteUpload("owner", session.ID); !errors.Is(err, ErrShareUploadNotFound) {
-		t.Fatalf("rejected upload still open: %v", err)
+	item, err := shares.CompleteUpload("owner", session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Served as text with nosniff, a page under another name never renders.
+	if IsHTMLType(item.MIMEType) || !strings.HasPrefix(item.MIMEType, "text/plain") {
+		t.Fatalf("html disguised as pdf stored as %q", item.MIMEType)
 	}
 }
 
@@ -130,7 +136,7 @@ func TestDirectLinksArePro(t *testing.T) {
 		t.Fatalf("direct item = %#v", item)
 	}
 	token := strings.Split(strings.TrimPrefix(item.URL, "https://goport.test/f/"), "/")[0]
-	_, record, err := pro.Public(token)
+	record, err := pro.Public(token)
 	if err != nil || !pro.DirectAllowed(record) {
 		t.Fatalf("direct link not served: %v", err)
 	}
@@ -151,7 +157,7 @@ func TestDirectLinksArePro(t *testing.T) {
 	item, _ = lapsed.Create("owner", "cert.pdf", strings.NewReader("%PDF-1.7 cert"), time.Time{}, "", true)
 	lapsed.billing = fakeShareBilling{pro: false}
 	token = strings.Split(strings.TrimPrefix(item.URL, "https://goport.test/f/"), "/")[0]
-	_, record, _ = lapsed.Public(token)
+	record, _ = lapsed.Public(token)
 	if lapsed.DirectAllowed(record) {
 		t.Fatal("direct link still served after Pro ended")
 	}
@@ -181,14 +187,14 @@ func TestRestoreRevokedShare(t *testing.T) {
 	if err := shares.Restore("owner", item.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := shares.Public(token); err != nil {
+	if _, err := shares.Public(token); err != nil {
 		t.Fatalf("restored link still unavailable: %v", err)
 	}
 }
 
 func TestIdleUploadsArePruned(t *testing.T) {
 	shares := newTestShares(t, false)
-	session, err := shares.StartUpload("owner", model.StartShareUploadRequest{Filename: "a.zip", Size: 10}, time.Time{})
+	session, err := shares.StartUpload("owner", "1.2.3.4", model.StartShareUploadRequest{Filename: "a.zip", Size: 10}, time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,7 +237,7 @@ func TestFreeFilesStopAfterTheirDownloadLimit(t *testing.T) {
 	for range 3 {
 		free.CountDownload(item.ID)
 	}
-	if _, _, err := free.Public(token); !errors.Is(err, ErrShareDownloadLimit) {
+	if _, err := free.Public(token); !errors.Is(err, ErrShareDownloadLimit) {
 		t.Fatalf("after the limit error = %v", err)
 	}
 
@@ -241,19 +247,19 @@ func TestFreeFilesStopAfterTheirDownloadLimit(t *testing.T) {
 	for range 10 {
 		pro.CountDownload(item.ID)
 	}
-	if _, _, err := pro.Public(token); err != nil || item.DownloadLimit != 0 {
+	if _, err := pro.Public(token); err != nil || item.DownloadLimit != 0 {
 		t.Fatalf("pro file limited: %v, limit %d", err, item.DownloadLimit)
 	}
 }
 
 func TestTotalStorageCapProtectsTheServer(t *testing.T) {
 	shares := newTestShares(t, true)
-	shares.cfg.ShareTotalStorageBytes = 50
-	if _, err := shares.StartUpload("owner", model.StartShareUploadRequest{Filename: "a.zip", Size: 40}, time.Time{}); err != nil {
+	shares.cfg.ShareTotalStorageBytes = 6000
+	if _, err := shares.StartUpload("owner", "1.2.3.4", model.StartShareUploadRequest{Filename: "a.zip", Size: 40}, time.Time{}); err != nil {
 		t.Fatal(err)
 	}
 	// The upload in progress counts toward the total for everyone.
-	if _, err := shares.StartUpload("someone-else", model.StartShareUploadRequest{Filename: "b.zip", Size: 20}, time.Time{}); !errors.Is(err, ErrShareFull) {
+	if _, err := shares.StartUpload("someone-else", "1.2.3.4", model.StartShareUploadRequest{Filename: "b.zip", Size: 20}, time.Time{}); !errors.Is(err, ErrShareFull) {
 		t.Fatalf("over the total cap error = %v", err)
 	}
 }
@@ -261,7 +267,7 @@ func TestTotalStorageCapProtectsTheServer(t *testing.T) {
 func TestExpiryFollowsThePlan(t *testing.T) {
 	free := newTestShares(t, false)
 	var expiry *ErrShareExpiry
-	if _, err := free.StartUpload("owner", model.StartShareUploadRequest{Filename: "a.pdf", Size: 10}, time.Now().Add(5*24*time.Hour)); !errors.As(err, &expiry) || !strings.Contains(expiry.Message, "3 days") {
+	if _, err := free.StartUpload("owner", "1.2.3.4", model.StartShareUploadRequest{Filename: "a.pdf", Size: 10}, time.Now().Add(5*24*time.Hour)); !errors.As(err, &expiry) || !strings.Contains(expiry.Message, "3 days") {
 		t.Fatalf("free five-day expiry error = %v", err)
 	}
 	item, err := free.Create("owner", "a.txt", strings.NewReader("hello"), time.Time{}, "", false)
@@ -273,7 +279,7 @@ func TestExpiryFollowsThePlan(t *testing.T) {
 	}
 
 	pro := newTestShares(t, true)
-	if _, err := pro.StartUpload("owner", model.StartShareUploadRequest{Filename: "a.pdf", Size: 10}, time.Now().Add(20*24*time.Hour)); err != nil {
+	if _, err := pro.StartUpload("owner", "1.2.3.4", model.StartShareUploadRequest{Filename: "a.pdf", Size: 10}, time.Now().Add(20*24*time.Hour)); err != nil {
 		t.Fatalf("pro twenty-day expiry refused: %v", err)
 	}
 }
@@ -293,10 +299,12 @@ func TestHTMLFilesAreAcceptedOnlyUnderHTMLNames(t *testing.T) {
 	if err != nil || !IsHTMLType(item.MIMEType) {
 		t.Fatalf("fragment = %#v, %v", item, err)
 	}
-	// HTML under any other name is still refused, so it can't dodge the sandbox.
-	for _, name := range []string{"notes.txt", "invoice.pdf", "photo.png"} {
-		if _, err := shares.Create("owner", name, strings.NewReader(page), time.Time{}, "", false); !errors.Is(err, ErrShareType) {
-			t.Errorf("html named %s error = %v", name, err)
+	// HTML under any other name is kept as plain text, so it never renders
+	// outside the sandbox.
+	for _, name := range []string{"notes.txt", "invoice.pdf", "photo.png", "README"} {
+		item, err := shares.Create("owner", name, strings.NewReader(page), time.Time{}, "", false)
+		if err != nil || IsHTMLType(item.MIMEType) || !strings.HasPrefix(item.MIMEType, "text/plain") {
+			t.Errorf("html named %s = %#v, %v", name, item, err)
 		}
 	}
 	if _, err := shares.Create("owner", "logo.svg", strings.NewReader("<svg></svg>"), time.Time{}, "", false); !errors.Is(err, ErrShareType) {
