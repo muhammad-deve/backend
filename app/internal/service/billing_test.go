@@ -656,3 +656,45 @@ func TestTestSubscriptionsGiveProOnlyToTestersInTestMode(t *testing.T) {
 		t.Fatal("a live subscription must give Pro")
 	}
 }
+
+func TestCheckoutSkipsTrialForReturningCustomers(t *testing.T) {
+	trialed := model.BillingSubscriptionRecord{
+		UserID: "user_2", ExternalID: "7001", PlanKey: model.PlanProMonthly, Status: "expired",
+		TrialEndsAt: time.Now().Add(-60 * 24 * time.Hour), EndsAt: time.Now().Add(-30 * 24 * time.Hour),
+	}
+	tests := []struct {
+		name          string
+		subscriptions []model.BillingSubscriptionRecord
+		noTrial       string
+		want          string
+	}{
+		{name: "first subscription keeps the trial", want: "991"},
+		{name: "returning customer gets no trial", subscriptions: []model.BillingSubscriptionRecord{trialed}, noTrial: "995", want: "995"},
+		{name: "no-trial variant not set keeps the old variant", subscriptions: []model.BillingSubscriptionRecord{trialed}, want: "991"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := &fakeLemonSqueezyClient{checkoutURL: "https://goport.lemonsqueezy.com/checkout/test"}
+			service := testModeBilling(&fakeBillingRepository{subscriptions: test.subscriptions}, client)
+			service.cfg.LemonSqueezyProMonthlyNoTrialVariantID = test.noTrial
+			if _, err := service.CreateCheckout(context.Background(), checkoutUser("user_2", "tester@example.com"), "monthly"); err != nil {
+				t.Fatalf("CreateCheckout: %v", err)
+			}
+			if client.checkoutInput.VariantID != test.want {
+				t.Fatalf("variant = %q, want %q", client.checkoutInput.VariantID, test.want)
+			}
+		})
+	}
+}
+
+func TestPlanForNoTrialVariants(t *testing.T) {
+	service := &billingService{cfg: &config.Config{
+		LemonSqueezyProMonthlyVariantID: "991", LemonSqueezyProYearlyVariantID: "1999",
+		LemonSqueezyProMonthlyNoTrialVariantID: "995", LemonSqueezyProYearlyNoTrialVariantID: "1995",
+	}}
+	for variant, want := range map[string]string{"991": model.PlanProMonthly, "995": model.PlanProMonthly, "1999": model.PlanProYearly, "1995": model.PlanProYearly, "": "", "42": ""} {
+		if got := service.planForVariant(variant); got != want {
+			t.Errorf("planForVariant(%q) = %q, want %q", variant, got, want)
+		}
+	}
+}

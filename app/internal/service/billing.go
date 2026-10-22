@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -99,6 +100,11 @@ func (s *billingService) CreateCheckout(ctx context.Context, user *core.Record, 
 	if limits.IsPro {
 		return nil, ErrAlreadySubscribed
 	}
+	subscriptions, err := s.repo.ListSubscriptions(user.Id)
+	if err != nil {
+		return nil, err
+	}
+	variantID = s.checkoutVariant(plan, variantID, subscriptions)
 
 	redirectURL := strings.TrimRight(s.cfg.AppURL, "/") + "/dashboard?checkout=success#billing"
 	checkoutURL, err := s.client.CreateCheckout(ctx, lemonCheckoutInput{
@@ -135,6 +141,7 @@ func (s *billingService) ChangeSubscriptionPlan(ctx context.Context, userID, pla
 	if !ok || variantID == "" {
 		return ErrBillingNotConfigured
 	}
+	variantID = s.checkoutVariant(plan, variantID, subscriptions)
 	attributes, err := s.client.UpdateSubscriptionVariant(ctx, subscription.ExternalID, variantID)
 	if err != nil {
 		return err
@@ -328,16 +335,37 @@ func (s *billingService) variantForPlan(plan string) (string, bool) {
 	}
 }
 
+// checkoutVariant returns the variant to sell for plan. Once the account has
+// had a free trial it uses the variant without one, so the trial can't be
+// started again. When that variant isn't configured it keeps variantID.
+func (s *billingService) checkoutVariant(plan, variantID string, subscriptions []model.BillingSubscriptionRecord) string {
+	if !s.trialConsumed(subscriptions) {
+		return variantID
+	}
+	noTrial := ""
+	switch strings.ToLower(strings.TrimSpace(plan)) {
+	case "monthly":
+		noTrial = strings.TrimSpace(s.cfg.LemonSqueezyProMonthlyNoTrialVariantID)
+	case "yearly":
+		noTrial = strings.TrimSpace(s.cfg.LemonSqueezyProYearlyNoTrialVariantID)
+	}
+	if noTrial == "" {
+		slog.Warn("no no-trial Lemon Squeezy variant is set; a returning customer gets the trial variant again", "plan", plan)
+		return variantID
+	}
+	return noTrial
+}
+
 func (s *billingService) planForVariant(variantID string) string {
-	switch strings.TrimSpace(variantID) {
-	case strings.TrimSpace(s.cfg.LemonSqueezyProMonthlyVariantID):
-		if variantID != "" {
-			return model.PlanProMonthly
-		}
-	case strings.TrimSpace(s.cfg.LemonSqueezyProYearlyVariantID):
-		if variantID != "" {
-			return model.PlanProYearly
-		}
+	variantID = strings.TrimSpace(variantID)
+	if variantID == "" {
+		return ""
+	}
+	switch variantID {
+	case strings.TrimSpace(s.cfg.LemonSqueezyProMonthlyVariantID), strings.TrimSpace(s.cfg.LemonSqueezyProMonthlyNoTrialVariantID):
+		return model.PlanProMonthly
+	case strings.TrimSpace(s.cfg.LemonSqueezyProYearlyVariantID), strings.TrimSpace(s.cfg.LemonSqueezyProYearlyNoTrialVariantID):
+		return model.PlanProYearly
 	}
 	return ""
 }
