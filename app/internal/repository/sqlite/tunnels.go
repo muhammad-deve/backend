@@ -46,10 +46,17 @@ func (r *Tunnels) ListOwned(userID string) ([]model.TunnelRecord, error) {
 	return tunnels, nil
 }
 
+// DeleteWithLogs deletes a tunnel and its lifetime totals. Its usage buckets
+// stay, detached from the tunnel (tunnel_id emptied), because monthly usage
+// is per account and must not drop when a tunnel is deleted.
 func (r *Tunnels) DeleteWithLogs(tunnelID string) error {
-	for _, collection := range []string{model.TunnelLogsCollection, model.TunnelUsageBucketsCollection} {
-		records, err := r.app.FindRecordsByFilter(
-			collection,
+	return r.app.RunInTransaction(func(tx core.App) error {
+		record, err := tx.FindRecordById(model.TunnelsCollection, tunnelID)
+		if err != nil {
+			return err
+		}
+		logs, err := tx.FindRecordsByFilter(
+			model.TunnelLogsCollection,
 			"tunnel_id = {:tunnel}",
 			"",
 			0,
@@ -59,18 +66,22 @@ func (r *Tunnels) DeleteWithLogs(tunnelID string) error {
 		if err != nil {
 			return err
 		}
-		for _, record := range records {
-			if err := r.app.Delete(record); err != nil {
+		for _, row := range logs {
+			if err := tx.Delete(row); err != nil {
 				return err
 			}
 		}
-	}
-
-	record, err := r.app.FindRecordById(model.TunnelsCollection, tunnelID)
-	if err != nil {
-		return err
-	}
-	return r.app.Delete(record)
+		_, err = tx.DB().NewQuery(`
+			UPDATE tunnel_usage_buckets
+			SET [[user]] = CASE WHEN [[user]] = '' THEN {:owner} ELSE [[user]] END,
+				tunnel_id = ''
+			WHERE tunnel_id = {:tunnel}
+		`).Bind(dbx.Params{"owner": record.GetString("user"), "tunnel": tunnelID}).Execute()
+		if err != nil {
+			return err
+		}
+		return tx.Delete(record)
+	})
 }
 
 func tunnelRecord(record *core.Record) *model.TunnelRecord {
