@@ -1,7 +1,6 @@
 package service
 
 import (
-	"crypto/rand"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -149,7 +148,11 @@ type tcpService struct {
 	// recordMu serialises read-modify-write saves of tunnel rows with the
 	// minutes_used increment, so a save from a stale copy can't undo it.
 	recordMu sync.Mutex
-	geo      *geoip.DB
+	// claimMu makes finding, deciding on and saving a subdomain one step.
+	claimMu sync.Mutex
+	// randomName draws a generated subdomain; tests replace it.
+	randomName func() (string, error)
+	geo        *geoip.DB
 	// handshakes caps connections that haven't finished registering.
 	handshakes *handshakeLimiter
 	// hopSecret is TUNNEL_HOP_SECRET; see tunnelHopHeader.
@@ -224,6 +227,7 @@ func NewTCPService(app core.App, tunnels repository.TunnelsI, usage repository.U
 		handshakes:    newHandshakeLimiter(maxPendingHandshakes, maxPendingHandshakesByIP),
 		hopSecret:     strings.TrimSpace(os.Getenv("TUNNEL_HOP_SECRET")),
 		proxy:         defaultProxyLimits(),
+		randomName:    func() (string, error) { return randomSubdomain(6) },
 	}
 }
 
@@ -604,24 +608,20 @@ func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (string, strin
 		return "", "", "", 0, false, refuse(fmt.Errorf("monthly traffic limit reached for Free (%d GB); upgrade to Pro for %d GB", limits.MonthlyBytes/(1024*1024*1024), model.ProMonthlyBytes/(1024*1024*1024)))
 	}
 	if req.Type == "share" && strings.TrimSpace(req.Resume) == "" {
-		subdomain, err := t.generateUniqueSubdomain()
-		if err != nil {
-			return "", "", "", 0, false, err
-		}
-		subdomain, tunnelID, err := t.saveTunnel(subdomain, false, userID, req.Port, req.Type)
+		subdomain, tunnelID, err := t.createRandomTunnel(userID, req.Port, req.Type)
 		return subdomain, tunnelID, userID, limits.MaxActiveTunnels, false, err
 	}
 
 	// A reconnecting CLI asks for the subdomain it already had, so a dropped
 	// connection does not move the public URL. A name that was claimed by someone
-	// else meanwhile, or a custom name the plan no longer covers, falls through to
-	// the normal flow below.
+	// else meanwhile, a custom name the plan no longer covers, or a saved name
+	// that breaks the naming rules falls through to the normal flow below.
 	if resume := strings.TrimSpace(req.Resume); resume != "" && !req.Reset {
 		record, err := t.findTunnelBySubdomain(resume)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return "", "", "", 0, false, err
 		}
-		if err == nil && record.GetString("user") == userID {
+		if err == nil && record.GetString("user") == userID && validateLegacySubdomain(resume) == nil {
 			isCustom := record.GetBool("is_custom")
 			if !isCustom || limits.CustomSubdomains || isGrandfathered(record) {
 				subdomain, tunnelID, err := t.saveTunnel(resume, isCustom, userID, req.Port, req.Type)
@@ -631,9 +631,13 @@ func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (string, strin
 	}
 
 	if strings.TrimSpace(req.Subdomain) != "" {
-		subdomain, err := normalizeRequestedSubdomain(req.Subdomain, t.domain)
-		if err != nil {
-			return "", "", "", 0, false, refuse(err)
+		subdomain := cleanRequestedSubdomain(req.Subdomain, t.domain)
+		if err := validateSubdomain(subdomain); err != nil {
+			// A name the account already holds keeps working after the rules
+			// for new names got stricter.
+			if validateLegacySubdomain(subdomain) != nil || !t.ownsName(subdomain, userID) {
+				return "", "", "", 0, false, refuse(err)
+			}
 		}
 		owned := t.ownsGrandfatheredName(subdomain, userID)
 		if !limits.CustomSubdomains && !owned {
@@ -651,7 +655,9 @@ func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (string, strin
 		if err == nil {
 			subdomain := record.GetString("subdomain")
 			isCustom := record.GetBool("is_custom")
-			if subdomain != "" && (!isCustom || limits.CustomSubdomains || isGrandfathered(record)) {
+			// A saved name that breaks the naming rules (rows once written
+			// straight through the REST API) gets a fresh random name instead.
+			if validateLegacySubdomain(subdomain) == nil && (!isCustom || limits.CustomSubdomains || isGrandfathered(record)) {
 				subdomain, tunnelID, err := t.saveTunnel(subdomain, isCustom, userID, req.Port, req.Type)
 				return subdomain, tunnelID, userID, limits.MaxActiveTunnels, needsPro(record), err
 			}
@@ -660,76 +666,8 @@ func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (string, strin
 		}
 	}
 
-	subdomain, err := t.generateUniqueSubdomain()
-	if err != nil {
-		return "", "", "", 0, false, err
-	}
-	subdomain, tunnelID, err := t.saveTunnel(subdomain, false, userID, req.Port, req.Type)
+	subdomain, tunnelID, err := t.createRandomTunnel(userID, req.Port, req.Type)
 	return subdomain, tunnelID, userID, limits.MaxActiveTunnels, false, err
-}
-
-func (t *tcpService) saveTunnel(subdomain string, isCustom bool, userID, localPort, protocol string) (string, string, error) {
-	// Every way a custom name is handed out (--custom, a reconnect, or a
-	// restart reusing the latest tunnel) comes through here, so a word added
-	// to blocked_words also stops names that were allowed before.
-	if isCustom && containsBlockedWord(subdomain, t.blockedWords()) {
-		return "", "", refuse(errBlockedSubdomain)
-	}
-
-	collection, err := t.app.FindCollectionByNameOrId(model.TunnelsCollection)
-	if err != nil {
-		return "", "", err
-	}
-
-	if existing, err := t.findTunnelBySubdomain(subdomain); err == nil {
-		// The live session map decides whether a subdomain is in use, not the
-		// is_current column, which can be left stale by an unclean shutdown.
-		// Checking it before any write also stops a second CLI from rewriting the
-		// connection metadata of a tunnel that is still online.
-		if t.hasLiveSession(subdomain) && !t.releaseDeadSession(subdomain, userID) {
-			return "", "", refuse(fmt.Errorf("subdomain %q is currently in use", subdomain))
-		}
-
-		owner := existing.GetString("user")
-		if owner != "" && owner != userID {
-			if err := t.tunnels.DeleteWithLogs(existing.Id); err != nil {
-				return "", "", err
-			}
-		} else {
-			t.recordMu.Lock()
-			defer t.recordMu.Unlock()
-			// Re-read under the lock: the liveness probe above can take seconds,
-			// and saving the old copy would undo minutes added meanwhile.
-			if fresh, err := t.findTunnelBySubdomain(subdomain); err == nil {
-				existing = fresh
-			}
-			existing.Set("user", userID)
-			existing.Set("is_custom", isCustom)
-			existing.Set("is_current", false)
-			existing.Set("local_port", strings.TrimSpace(localPort))
-			existing.Set("protocol", normalizedProtocol(protocol))
-			if err := t.app.Save(existing); err != nil {
-				return "", "", err
-			}
-			return subdomain, existing.Id, nil
-		}
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return "", "", err
-	}
-
-	record := core.NewRecord(collection)
-	record.Set("user", userID)
-	record.Set("subdomain", subdomain)
-	record.Set("is_custom", isCustom)
-	record.Set("is_current", false)
-	record.Set("local_port", strings.TrimSpace(localPort))
-	record.Set("protocol", normalizedProtocol(protocol))
-
-	if err := t.app.Save(record); err != nil {
-		return "", "", err
-	}
-
-	return subdomain, record.Id, nil
 }
 
 func normalizedProtocol(protocol string) string {
@@ -747,8 +685,11 @@ func (t *tcpService) StopTunnel(userID, subdomain string) error {
 
 	t.mu.Lock()
 	session := t.sessions[subdomain]
+	liveOwner := t.sessionUsers[subdomain]
 	t.mu.Unlock()
-	if session == nil || session.IsClosed() {
+	// The row says who owns the name; the session map says who is connected
+	// under it now. Only a session of the same account can be stopped.
+	if liveOwner != userID || session == nil || session.IsClosed() {
 		return ErrTunnelInactive
 	}
 
@@ -765,10 +706,8 @@ func (t *tcpService) DeleteTunnel(userID, subdomain string) error {
 		return ErrTunnelNotFound
 	}
 
-	t.mu.Lock()
-	session := t.sessions[subdomain]
-	t.mu.Unlock()
-	if record.IsCurrent || (session != nil && !session.IsClosed()) {
+	// isReserved also covers a registration still completing its handshake.
+	if record.IsCurrent || t.isReserved(subdomain) {
 		return ErrTunnelActive
 	}
 
@@ -971,102 +910,6 @@ func (t *tcpService) reserveSession(subdomain, tunnelID, userID string, maxActiv
 	t.nextSession++
 	t.sessionOrder[subdomain] = t.nextSession
 	return nil
-}
-
-func normalizeRequestedSubdomain(value, domain string) (string, error) {
-	subdomain := strings.ToLower(strings.TrimSpace(value))
-	domain = strings.ToLower(strings.TrimSpace(domain))
-
-	subdomain = strings.TrimPrefix(subdomain, "https://")
-	subdomain = strings.TrimPrefix(subdomain, "http://")
-	if i := strings.IndexAny(subdomain, "/:"); i >= 0 {
-		subdomain = subdomain[:i]
-	}
-	subdomain = strings.TrimSuffix(subdomain, ".")
-	if domain != "" {
-		subdomain = strings.TrimSuffix(subdomain, "."+domain)
-	}
-
-	if err := validateSubdomain(subdomain); err != nil {
-		return "", err
-	}
-	return subdomain, nil
-}
-
-func validateSubdomain(subdomain string) error {
-	if len(subdomain) == 0 || len(subdomain) > 63 {
-		return fmt.Errorf("subdomain must be 1-63 characters")
-	}
-	if subdomain[0] == '-' || subdomain[len(subdomain)-1] == '-' {
-		return fmt.Errorf("subdomain cannot start or end with '-'")
-	}
-	if isReservedSubdomain(subdomain) {
-		return fmt.Errorf("subdomain %q is reserved", subdomain)
-	}
-
-	for _, ch := range subdomain {
-		if ch >= 'a' && ch <= 'z' {
-			continue
-		}
-		if ch >= '0' && ch <= '9' {
-			continue
-		}
-		if ch == '-' {
-			continue
-		}
-		return fmt.Errorf("subdomain can only contain lowercase letters, numbers, and '-'")
-	}
-	return nil
-}
-
-func isReservedSubdomain(subdomain string) bool {
-	switch subdomain {
-	case "api", "admin", "back", "dashboard", "www":
-		return true
-	default:
-		return false
-	}
-}
-
-func (t *tcpService) generateUniqueSubdomain() (string, error) {
-	blocked := t.blockedWords()
-	for i := 0; i < 10; i++ {
-		subdomain, err := randomSubdomain(6)
-		if err != nil {
-			return "", err
-		}
-		// Random letters can spell a blocked word too; just draw again.
-		if containsBlockedWord(subdomain, blocked) {
-			continue
-		}
-
-		_, err = t.app.FindFirstRecordByFilter("tunnels", "subdomain = {:subdomain}", dbx.Params{
-			"subdomain": subdomain,
-		})
-		if errors.Is(err, sql.ErrNoRows) {
-			return subdomain, nil
-		}
-		if err != nil {
-			return "", err
-		}
-	}
-
-	return "", fmt.Errorf("failed to generate unique subdomain")
-}
-
-func randomSubdomain(length int) (string, error) {
-	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
-
-	bytes := make([]byte, length)
-	if _, err := rand.Read(bytes); err != nil {
-		return "", err
-	}
-
-	for i := range bytes {
-		bytes[i] = alphabet[int(bytes[i])%len(alphabet)]
-	}
-
-	return string(bytes), nil
 }
 
 func (t *tcpService) sessionWithinPlanLimit(subdomain, userID string, maxActive int) bool {
