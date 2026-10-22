@@ -8,8 +8,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/security"
+	"github.com/pocketbase/pocketbase/tools/types"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/model"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/pkg/disposable"
 )
@@ -26,6 +28,8 @@ type AccountI interface {
 	// ReleasePending clears what others may have attached to an unverified
 	// account before its owner signs in with a provider.
 	ReleasePending(user *core.Record, provider, providerID string) error
+	// PurgeStalePending deletes sign-ups that were never finished.
+	PurgeStalePending(olderThan time.Duration) (int, error)
 }
 
 type accountService struct {
@@ -33,6 +37,7 @@ type accountService struct {
 	email    EmailI
 	tokens   TokensI
 	limiter  *rateLimiter
+	targets  *targetLimiter
 	attempts *otpAttempts
 
 	// pending maps an email-change OTP id to the address it was sent to, so
@@ -53,6 +58,7 @@ func NewAccountService(app core.App, email EmailI, tokens TokensI, attempts *otp
 		email:    email,
 		tokens:   tokens,
 		limiter:  newRateLimiter(time.Hour, 5, 60*time.Second),
+		targets:  newTargetLimiter(24*time.Hour, emailChangeTargetsPerDay),
 		attempts: attempts,
 		pending:  make(map[string]pendingEmailChange),
 	}
@@ -111,6 +117,10 @@ func (s *accountService) RequestEmailChange(user *core.Record, req *model.Reques
 		return nil, ErrEmailTaken
 	}
 
+	// One account can't be used to mail codes to many addresses.
+	if allowed, retryAfter := s.targets.Allow(user.Id, email); !allowed {
+		return nil, &errRateLimited{retryAfter: retryAfter}
+	}
 	if allowed, retryAfter := s.limiter.Allow("email-change:" + user.Id + ":" + email); !allowed {
 		return nil, &errRateLimited{retryAfter: retryAfter}
 	}
@@ -211,4 +221,58 @@ func (s *accountService) ChangePassword(user *core.Record, req *model.ChangePass
 	}
 
 	return &model.ChangePasswordResponse{Token: token, Message: "Password changed"}, nil
+}
+
+// PurgeStalePending deletes unverified accounts older than olderThan that have
+// nothing attached: no linked sign-in, billing, tunnels, shares or used CLI
+// token. These are sign-ups that never got past the email code. It deletes at
+// most 500 per run.
+func (s *accountService) PurgeStalePending(olderThan time.Duration) (int, error) {
+	users, err := s.app.FindCollectionByNameOrId(model.UsersCollection)
+	if err != nil {
+		return 0, err
+	}
+	cutoff := types.NowDateTime().Add(-olderThan).String()
+
+	var ids []string
+	err = s.app.DB().NewQuery(`
+		SELECT u.id FROM users u
+		WHERE u.verified = FALSE AND u.created < {:cutoff}
+		AND NOT EXISTS (SELECT 1 FROM _externalAuths ea WHERE ea.recordRef = u.id AND ea.collectionRef = {:collection})
+		AND NOT EXISTS (SELECT 1 FROM billing_subscriptions b WHERE b.user = u.id)
+		AND NOT EXISTS (SELECT 1 FROM billing_transactions bt WHERE bt.user = u.id)
+		AND NOT EXISTS (SELECT 1 FROM tunnels tn WHERE tn.user = u.id)
+		AND NOT EXISTS (SELECT 1 FROM shares sh WHERE sh.owner = u.id)
+		AND NOT EXISTS (SELECT 1 FROM tokens tk WHERE tk.user_id = u.id AND COALESCE(tk.last_used, '') != '')
+		ORDER BY u.created
+		LIMIT 500`).Bind(dbx.Params{"cutoff": cutoff, "collection": users.Id}).Column(&ids)
+	if err != nil {
+		return 0, fmt.Errorf("find stale sign-ups: %w", err)
+	}
+
+	deleted := 0
+	for _, id := range ids {
+		user, err := s.app.FindRecordById(users, id)
+		if err != nil {
+			continue
+		}
+		// Re-check in case the sign-up finished since the query.
+		if user.Verified() {
+			continue
+		}
+		tokens, err := s.tokens.List(id)
+		if err != nil {
+			return deleted, err
+		}
+		for _, token := range tokens {
+			if err := s.tokens.Delete(id, token.ID); err != nil && !errors.Is(err, ErrTokenNotFound) {
+				return deleted, err
+			}
+		}
+		if err := s.app.Delete(user); err != nil {
+			return deleted, fmt.Errorf("delete stale sign-up %s: %w", id, err)
+		}
+		deleted++
+	}
+	return deleted, nil
 }

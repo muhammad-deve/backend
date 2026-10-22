@@ -158,3 +158,31 @@ func TestCheckOTPCodeRefusesWhenTriesAreUsed(t *testing.T) {
 		t.Fatalf("err = %v, want ErrTooManyCodeAttempts", err)
 	}
 }
+
+func TestTargetLimiter(t *testing.T) {
+	clock := newFakeClock()
+	limiter := newTargetLimiter(24*time.Hour, 2)
+	limiter.now = clock.now
+
+	if ok, _ := limiter.Allow("u", "a"); !ok {
+		t.Fatal("first target blocked")
+	}
+	clock.add(time.Hour)
+	if ok, _ := limiter.Allow("u", "b"); !ok {
+		t.Fatal("second target blocked")
+	}
+	if ok, _ := limiter.Allow("u", "a"); !ok {
+		t.Fatal("a known target must stay allowed")
+	}
+	ok, wait := limiter.Allow("u", "c")
+	if ok || wait != 23*time.Hour {
+		t.Fatalf("third target: ok=%v wait=%s", ok, wait)
+	}
+	if ok, _ := limiter.Allow("other", "c"); !ok {
+		t.Fatal("other keys must not be affected")
+	}
+	clock.add(23 * time.Hour)
+	if ok, _ := limiter.Allow("u", "c"); !ok {
+		t.Fatal("a target slot must free up after the window")
+	}
+}

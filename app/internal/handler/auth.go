@@ -34,6 +34,9 @@ func (h *Handler) SendOTPHandler(e *core.RequestEvent) error {
 			if _, ok := service.IsRateLimited(err); ok {
 				return h.limitedResponse(e, err)
 			}
+			if msg, ok := service.UserMessage(err); ok {
+				return h.NewErrorResponse(e, http.StatusBadRequest, msg)
+			}
 			h.logger.Error("failed to send OTP", "error", err, "email", req.Email)
 			return h.NewErrorResponse(e, http.StatusBadRequest, "Couldn't send the verification code. Please try again.")
 		}

@@ -2,6 +2,7 @@ package hook
 
 import (
 	"strings"
+	"time"
 
 	"github.com/pocketbase/pocketbase"
 	"github.com/pocketbase/pocketbase/core"
@@ -23,6 +24,36 @@ func (h *Hook) registerAuthHooks(app *pocketbase.PocketBase) {
 			h.logger.Error("failed to create default token", "error", err, "userId", e.Record.Id)
 		}
 		return e.Next()
+	})
+
+	// Names go into GoPort emails. Check a name changed through the REST API
+	// the same way as at sign-up, sized for the dashboard's two name fields.
+	app.OnRecordUpdateRequest(model.UsersCollection).BindFunc(func(e *core.RecordRequestEvent) error {
+		if e.HasSuperuserAuth() {
+			return e.Next()
+		}
+		name := e.Record.GetString("name")
+		if name == e.Record.Original().GetString("name") {
+			return e.Next()
+		}
+		clean, err := model.CleanName(name, model.MaxProfileNameLength)
+		if err != nil {
+			return e.BadRequestError(err.Error(), nil)
+		}
+		e.Record.Set("name", clean)
+		return e.Next()
+	})
+
+	// Delete sign-ups that never got past the email code, once a day.
+	app.Cron().MustAdd("goportPurgeStaleSignups", "40 3 * * *", func() {
+		deleted, err := h.service.Account().PurgeStalePending(7 * 24 * time.Hour)
+		if err != nil {
+			h.logger.Error("failed to purge stale sign-ups", "error", err, "deleted", deleted)
+			return
+		}
+		if deleted > 0 {
+			h.logger.Info("purged stale sign-ups", "deleted", deleted)
+		}
 	})
 
 	// Limit wrong passwords per IP and per account. Only failures count, so
@@ -50,6 +81,10 @@ func (h *Hook) registerAuthHooks(app *pocketbase.PocketBase) {
 		// createData would let the client choose the new account's email and
 		// so pre-claim someone else's address. The site never sends it.
 		e.CreateData = nil
+		if e.OAuth2User != nil {
+			// The provider name becomes the account name and goes into emails.
+			e.OAuth2User.Name = model.SafeName(e.OAuth2User.Name)
+		}
 
 		providerEmail := ""
 		if e.OAuth2User != nil {

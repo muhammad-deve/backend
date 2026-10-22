@@ -6,6 +6,7 @@ import (
 
 	"github.com/resend/resend-go/v2"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/config"
+	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/model"
 )
 
 type EmailI interface {
@@ -31,6 +32,7 @@ func NewEmailService(cfg *config.Config) EmailI {
 }
 
 func (s *emailService) SendOTP(toEmail, name, code string) error {
+	name = model.SafeName(name)
 	if s.client == nil {
 		return fmt.Errorf("email service is not configured: missing RESEND_API_KEY")
 	}
@@ -50,6 +52,7 @@ func (s *emailService) SendOTP(toEmail, name, code string) error {
 }
 
 func (s *emailService) SendEmailChanged(toEmail, name, newEmail string) error {
+	name = model.SafeName(name)
 	if s.client == nil {
 		return fmt.Errorf("email service is not configured: missing RESEND_API_KEY")
 	}

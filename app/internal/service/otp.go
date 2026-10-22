@@ -87,7 +87,10 @@ func (s *otpService) SendOTP(req *model.SendOTPRequest) (*model.SendOTPResponse,
 	if disposable.Email(email) {
 		return nil, ErrDisposableEmail
 	}
-	name := strings.TrimSpace(req.Name)
+	name, err := model.CleanName(req.Name, model.MaxNameLength)
+	if err != nil {
+		return nil, userError(err.Error())
+	}
 
 	usersCollection, err := s.app.FindCollectionByNameOrId(model.UsersCollection)
 	if err != nil {

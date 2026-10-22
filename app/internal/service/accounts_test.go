@@ -235,3 +235,102 @@ func TestConfirmEmailChangeNeedsAnEmailChangeCode(t *testing.T) {
 		t.Fatalf("old address must be told about the change, got %+v", notice)
 	}
 }
+
+func TestSendOTPChecksName(t *testing.T) {
+	f := newAccountsFixture(t)
+	_, err := f.otp.SendOTP(&model.SendOTPRequest{Email: "dev@example.com", Name: "Get paid at www.example.test"})
+	if msg, ok := UserMessage(err); !ok || msg != model.ErrNameInvalid.Error() {
+		t.Fatalf("link in name: err = %v", err)
+	}
+	_, err = f.otp.SendOTP(&model.SendOTPRequest{Email: "dev@example.com", Name: string(make([]byte, 61))})
+	if _, ok := UserMessage(err); !ok {
+		t.Fatalf("long name: err = %v", err)
+	}
+	if _, err := f.otp.SendOTP(&model.SendOTPRequest{Email: "dev@example.com", Name: "  Ada  "}); err != nil {
+		t.Fatalf("good name: %v", err)
+	}
+	user, err := f.app.FindAuthRecordByEmail(model.UsersCollection, "dev@example.com")
+	if err != nil || user.GetString("name") != "Ada" {
+		t.Fatalf("stored name = %q (%v)", user.GetString("name"), err)
+	}
+}
+
+func TestRequestEmailChangeLimitsTargets(t *testing.T) {
+	f := newAccountsFixture(t)
+	user := newTestUser(t, f.app, "dev@example.com", true)
+	for i := 0; i < emailChangeTargetsPerDay; i++ {
+		target := string(rune('a'+i)) + "@example.com"
+		if _, err := f.account.RequestEmailChange(user, &model.RequestEmailChangeRequest{Email: target}); err != nil {
+			t.Fatalf("target %d: %v", i+1, err)
+		}
+	}
+	_, err := f.account.RequestEmailChange(user, &model.RequestEmailChangeRequest{Email: "z@example.com"})
+	if _, ok := IsRateLimited(err); !ok {
+		t.Fatalf("sixth address: err = %v, want rate limit", err)
+	}
+}
+
+func TestPurgeStalePending(t *testing.T) {
+	f := newAccountsFixture(t)
+	old := time.Now().Add(-8 * 24 * time.Hour)
+	backdate := func(user *core.Record) {
+		t.Helper()
+		_, err := f.app.DB().NewQuery("UPDATE users SET created = {:created} WHERE id = {:id}").
+			Bind(dbx.Params{"created": old.UTC().Format("2006-01-02 15:04:05.000Z"), "id": user.Id}).Execute()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	withToken := func(user *core.Record) {
+		t.Helper()
+		if err := f.tokens.EnsureDefault(user.Id); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	stale := newTestUser(t, f.app, "stale@example.com", false)
+	withToken(stale)
+	backdate(stale)
+	fresh := newTestUser(t, f.app, "fresh@example.com", false)
+	verified := newTestUser(t, f.app, "verified@example.com", true)
+	backdate(verified)
+	linked := newTestUser(t, f.app, "linked@example.com", false)
+	linkProvider(t, f.app, linked, "google", "g-1")
+	backdate(linked)
+	used := newTestUser(t, f.app, "used@example.com", false)
+	withToken(used)
+	token := userTokens(t, f.app, used.Id)[0]
+	token.Set("last_used", time.Now().UTC())
+	if err := f.app.Save(token); err != nil {
+		t.Fatal(err)
+	}
+	backdate(used)
+	withTunnel := newTestUser(t, f.app, "tunnel@example.com", false)
+	backdate(withTunnel)
+	tunnels, _ := f.app.FindCollectionByNameOrId(model.TunnelsCollection)
+	tunnel := core.NewRecord(tunnels)
+	tunnel.Set("user", withTunnel.Id)
+	tunnel.Set("subdomain", "kept-tunnel")
+	if err := f.app.SaveNoValidate(tunnel); err != nil {
+		t.Fatal(err)
+	}
+
+	deleted, err := f.account.PurgeStalePending(7 * 24 * time.Hour)
+	if err != nil {
+		t.Fatalf("PurgeStalePending: %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("deleted = %d, want 1", deleted)
+	}
+	if _, err := f.app.FindRecordById(model.UsersCollection, stale.Id); err == nil {
+		t.Fatal("stale sign-up must be deleted")
+	}
+	if len(userTokens(t, f.app, stale.Id)) != 0 {
+		t.Fatal("its tokens must be deleted too")
+	}
+	for _, kept := range []*core.Record{fresh, verified, linked, used, withTunnel} {
+		if _, err := f.app.FindRecordById(model.UsersCollection, kept.Id); err != nil {
+			t.Fatalf("%s must be kept", kept.Email())
+		}
+	}
+}

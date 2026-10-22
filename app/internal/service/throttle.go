@@ -17,6 +17,8 @@ const (
 	defaultSendsPerIP   = 10
 	defaultSendsGlobal  = 300
 	maxWrongCodesPerOTP = 5
+	// An account may ask for email-change codes to this many addresses a day.
+	emailChangeTargetsPerDay = 5
 )
 
 // ThrottleI holds the per-IP and server-wide limits for the account endpoints.
@@ -167,4 +169,49 @@ func (a *otpAttempts) forget(id string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	delete(a.tries, id)
+}
+
+// targetLimiter caps how many different targets (such as email addresses)
+// one key may use within a window. Reusing a target is always allowed.
+type targetLimiter struct {
+	mu     sync.Mutex
+	seen   map[string]map[string]time.Time
+	window time.Duration
+	max    int
+	now    func() time.Time
+}
+
+func newTargetLimiter(window time.Duration, max int) *targetLimiter {
+	return &targetLimiter{seen: make(map[string]map[string]time.Time), window: window, max: max, now: time.Now}
+}
+
+// Allow records target for key unless key already used max other targets.
+func (l *targetLimiter) Allow(key, target string) (bool, time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	now := l.now()
+	targets := l.seen[key]
+	var oldest time.Time
+	for t, at := range targets {
+		if now.Sub(at) >= l.window {
+			delete(targets, t)
+			continue
+		}
+		if oldest.IsZero() || at.Before(oldest) {
+			oldest = at
+		}
+	}
+	if _, ok := targets[target]; ok {
+		return true, 0
+	}
+	if len(targets) >= l.max {
+		return false, l.window - now.Sub(oldest)
+	}
+	if targets == nil {
+		targets = make(map[string]time.Time)
+		l.seen[key] = targets
+	}
+	targets[target] = now
+	return true, 0
 }
