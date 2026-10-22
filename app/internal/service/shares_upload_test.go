@@ -105,18 +105,23 @@ func TestChunkedUploadChecksPlanBeforeSendingBytes(t *testing.T) {
 	}
 }
 
-func TestChunkedUploadRejectsDisguisedFiles(t *testing.T) {
+func TestChunkedUploadStoresDisguisedPagesAsText(t *testing.T) {
 	shares := newTestShares(t, false)
 	body := "<!DOCTYPE html><html><script>alert(1)</script></html>"
 	session, err := shares.StartUpload("owner", model.StartShareUploadRequest{Filename: "invoice.pdf", Size: int64(len(body))}, time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := shares.WriteUploadChunk("owner", session.ID, 0, strings.NewReader(body)); !errors.Is(err, ErrShareType) {
-		t.Fatalf("html disguised as pdf error = %v", err)
+	if _, err := shares.WriteUploadChunk("owner", session.ID, 0, strings.NewReader(body)); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := shares.CompleteUpload("owner", session.ID); !errors.Is(err, ErrShareUploadNotFound) {
-		t.Fatalf("rejected upload still open: %v", err)
+	item, err := shares.CompleteUpload("owner", session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Served as text with nosniff, a page under another name never renders.
+	if IsHTMLType(item.MIMEType) || !strings.HasPrefix(item.MIMEType, "text/plain") {
+		t.Fatalf("html disguised as pdf stored as %q", item.MIMEType)
 	}
 }
 
@@ -293,10 +298,12 @@ func TestHTMLFilesAreAcceptedOnlyUnderHTMLNames(t *testing.T) {
 	if err != nil || !IsHTMLType(item.MIMEType) {
 		t.Fatalf("fragment = %#v, %v", item, err)
 	}
-	// HTML under any other name is still refused, so it can't dodge the sandbox.
-	for _, name := range []string{"notes.txt", "invoice.pdf", "photo.png"} {
-		if _, err := shares.Create("owner", name, strings.NewReader(page), time.Time{}, "", false); !errors.Is(err, ErrShareType) {
-			t.Errorf("html named %s error = %v", name, err)
+	// HTML under any other name is kept as plain text, so it never renders
+	// outside the sandbox.
+	for _, name := range []string{"notes.txt", "invoice.pdf", "photo.png", "README"} {
+		item, err := shares.Create("owner", name, strings.NewReader(page), time.Time{}, "", false)
+		if err != nil || IsHTMLType(item.MIMEType) || !strings.HasPrefix(item.MIMEType, "text/plain") {
+			t.Errorf("html named %s = %#v, %v", name, item, err)
 		}
 	}
 	if _, err := shares.Create("owner", "logo.svg", strings.NewReader("<svg></svg>"), time.Time{}, "", false); !errors.Is(err, ErrShareType) {

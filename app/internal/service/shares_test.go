@@ -437,3 +437,35 @@ func TestLockedViewHidesTheFile(t *testing.T) {
 		t.Fatalf("public view = %#v", view)
 	}
 }
+
+func TestFileTypes(t *testing.T) {
+	shares := newTestShares(t, true)
+	cases := []struct{ name, body, want string }{
+		{"Makefile", "build:\n\tgo build ./...\n", "text/plain"},
+		{"LICENSE", "MIT License", "text/plain"},
+		{"notes.txt", "<p>First paragraph</p>", "text/plain"},
+		{"notes.md", "<!-- comment -->\n# Title", "text/plain"},
+		{"snippet.txt", "<script>alert(1)</script>", "text/plain"},
+		{"feed.rss", "<?xml version=\"1.0\"?><rss></rss>", "text/plain"},
+		{"blob", "\x00\x01\x02\x03binary", "application/octet-stream"},
+		{"page.html", "<p>hello</p>", "text/html"},
+	}
+	for _, test := range cases {
+		item, err := shares.Create("owner", test.name, strings.NewReader(test.body), time.Time{}, "", false)
+		if err != nil || !strings.HasPrefix(item.MIMEType, test.want) {
+			t.Errorf("%s = %#v, %v; want %s", test.name, item, err, test.want)
+		}
+	}
+	for _, name := range []string{
+		"setup.exe", "setup.exe.", "setup.exe . ", "run.hta", "doc.scr", "a.vbs", "a.js", "a.jar", "link.lnk", "disk.iso",
+		"disk.img", "disk.vhdx", "app.msix", "a.reg", "a.ps1", "a.bat", "a.cmd", "a.com", "a.url", "help.chm", "a.svg",
+		"a.svgz", "a.xhtml", "data.xml", "page.mht", "a.msi", "a.dll", "photo‮gpj.scr",
+	} {
+		if _, err := shares.Create("owner", name, strings.NewReader("MZ data"), time.Time{}, "", false); !errors.Is(err, ErrShareType) {
+			t.Errorf("%q error = %v", name, err)
+		}
+	}
+	if got := sanitizeFilename("invoice‮fdp.exe . "); got != "invoicefdp.exe" {
+		t.Fatalf("sanitized name = %q", got)
+	}
+}

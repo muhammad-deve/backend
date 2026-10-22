@@ -1037,48 +1037,79 @@ func hashOptionalPassword(password string) (string, error) {
 func sanitizeFilename(name string) string {
 	name = filepath.Base(strings.ReplaceAll(name, "\\", "/"))
 	name = strings.Map(func(r rune) rune {
-		if r < 32 || r == '\u007f' {
+		// Control characters, and direction marks that can make "gpj.exe"
+		// display as "exe.jpg".
+		if r < 32 || r == '\u007f' || r == '؜' || r == '‎' || r == '‏' ||
+			(r >= '‪' && r <= '‮') || (r >= '⁦' && r <= '⁩') {
 			return -1
 		}
 		return r
 	}, name)
-	name = strings.TrimSpace(name)
+	// Windows drops trailing dots and spaces, so "setup.exe." saves as
+	// "setup.exe".
+	name = strings.TrimRight(strings.TrimSpace(name), ". ")
 	if len([]rune(name)) > 255 {
-		name = string([]rune(name)[:255])
+		name = strings.TrimRight(string([]rune(name)[:255]), ". ")
 	}
 	return name
 }
 
+// blockedExtensions are refused outright: scripts, executables, installers,
+// shortcuts, disk images that can carry them, and markup that browsers run
+// (SVG, XML, XHTML, MHTML). HTML is allowed because it is always sandboxed.
+var blockedExtensions = map[string]bool{
+	".apk": true, ".appx": true, ".appxbundle": true, ".application": true, ".bat": true,
+	".chm": true, ".cmd": true, ".com": true, ".cpl": true, ".dll": true,
+	".exe": true, ".gadget": true, ".hta": true, ".img": true, ".inf": true,
+	".iso": true, ".jar": true, ".js": true, ".jse": true, ".lnk": true,
+	".mht": true, ".mhtml": true, ".mjs": true, ".msc": true, ".msi": true,
+	".msix": true, ".msixbundle": true, ".msp": true, ".pif": true, ".ps1": true,
+	".psm1": true, ".reg": true, ".scf": true, ".scr": true, ".sh": true,
+	".svg": true, ".svgz": true, ".url": true, ".vbe": true, ".vbs": true,
+	".vhd": true, ".vhdx": true, ".wsf": true, ".wsh": true, ".xht": true,
+	".xhtml": true, ".xml": true, ".xsl": true,
+}
+
+// shareExtension is a name's extension as Windows reads it, ignoring
+// trailing dots and spaces.
+func shareExtension(name string) string {
+	return strings.ToLower(filepath.Ext(strings.TrimRight(name, ". ")))
+}
+
+// allowedUpload refuses dangerous extensions. Names without an extension,
+// such as Makefile or LICENSE, are allowed.
 func allowedUpload(name string) bool {
-	switch strings.ToLower(filepath.Ext(name)) {
-	case ".svg", ".js", ".mjs", ".exe", ".dll", ".com", ".bat", ".cmd", ".ps1", ".sh", ".msi", ".apk":
-		return false
-	}
-	return filepath.Ext(name) != ""
+	return !blockedExtensions[shareExtension(name)]
 }
 
 func isHTMLName(name string) bool {
-	switch strings.ToLower(filepath.Ext(name)) {
+	switch shareExtension(name) {
 	case ".html", ".htm":
 		return true
 	}
 	return false
 }
 
-// detectShareType sniffs a file's type. An .html file is always stored as
-// HTML when its content is text, since a page that starts with an unusual tag
-// sniffs as plain text.
+// detectShareType sniffs how a file is stored and served. Text under an .html
+// or .htm name is a web page, served in a sandbox. Any other text, including
+// text that merely looks like markup, is plain text, which browsers show as
+// it is.
 func detectShareType(name string, head []byte) string {
 	sniffed := http.DetectContentType(head)
-	if isHTMLName(name) && strings.HasPrefix(sniffed, "text/") {
+	if !strings.HasPrefix(sniffed, "text/") {
+		return sniffed
+	}
+	if isHTMLName(name) {
 		return "text/html; charset=utf-8"
 	}
-	return sniffed
+	if strings.HasPrefix(sniffed, "text/plain") {
+		return sniffed
+	}
+	return "text/plain; charset=utf-8"
 }
 
 // allowedMIME refuses active formats. HTML is accepted only under an .html
-// or .htm name, because it is served in a sandbox (see isHTMLType); HTML
-// disguised as another type would bypass that.
+// or .htm name, because it is served in a sandbox (see IsHTMLType).
 func allowedMIME(name, value string) bool {
 	if !allowedUpload(name) {
 		return false
