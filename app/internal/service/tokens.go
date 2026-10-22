@@ -10,7 +10,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/pocketbase/dbx"
-	"github.com/pocketbase/pocketbase"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/types"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/model"
@@ -34,18 +33,20 @@ type TokensI interface {
 	Delete(userID, tokenID string) error
 	// EnsureDefault creates the "default" token for a user if they have none.
 	EnsureDefault(userID string) error
+	// Reset deletes every token of a user and creates a fresh default one.
+	Reset(userID string) error
 	// Verify resolves a token value to the account that owns it. It returns
 	// ErrInvalidToken when the token doesn't belong to any account.
 	Verify(token string) (*model.TokenOwner, error)
 }
 
 type tokensService struct {
-	app      *pocketbase.PocketBase
+	app      core.App
 	billing  BillingI
 	createMu sync.Mutex
 }
 
-func NewTokensService(app *pocketbase.PocketBase, billing BillingI) TokensI {
+func NewTokensService(app core.App, billing BillingI) TokensI {
 	return &tokensService{app: app, billing: billing}
 }
 
@@ -78,10 +79,10 @@ func (s *tokensService) List(userID string) ([]model.TokenItem, error) {
 func (s *tokensService) Create(userID, name string) (*model.TokenItem, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
-		return nil, fmt.Errorf("token name is required")
+		return nil, userError("Enter a token name.")
 	}
 	if len(name) > 50 {
-		return nil, fmt.Errorf("token name must be 50 characters or fewer")
+		return nil, userError("Token name must be 50 characters or fewer.")
 	}
 
 	s.createMu.Lock()
@@ -144,6 +145,19 @@ func (s *tokensService) Delete(userID, tokenID string) error {
 		return ErrTokenNotFound
 	}
 	return s.app.Delete(record)
+}
+
+func (s *tokensService) Reset(userID string) error {
+	tokens, err := s.List(userID)
+	if err != nil {
+		return err
+	}
+	for _, token := range tokens {
+		if err := s.Delete(userID, token.ID); err != nil && !errors.Is(err, ErrTokenNotFound) {
+			return err
+		}
+	}
+	return s.EnsureDefault(userID)
 }
 
 func (s *tokensService) EnsureDefault(userID string) error {

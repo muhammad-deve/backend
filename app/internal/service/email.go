@@ -6,10 +6,13 @@ import (
 
 	"github.com/resend/resend-go/v2"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/config"
+	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/model"
 )
 
 type EmailI interface {
 	SendOTP(toEmail, name, code string) error
+	// SendEmailChanged tells the old address that the account email changed.
+	SendEmailChanged(toEmail, name, newEmail string) error
 }
 
 type emailService struct {
@@ -29,6 +32,7 @@ func NewEmailService(cfg *config.Config) EmailI {
 }
 
 func (s *emailService) SendOTP(toEmail, name, code string) error {
+	name = model.SafeName(name)
 	if s.client == nil {
 		return fmt.Errorf("email service is not configured: missing RESEND_API_KEY")
 	}
@@ -45,6 +49,88 @@ func (s *emailService) SendOTP(toEmail, name, code string) error {
 		return fmt.Errorf("failed to send OTP email: %w", err)
 	}
 	return nil
+}
+
+func (s *emailService) SendEmailChanged(toEmail, name, newEmail string) error {
+	name = model.SafeName(name)
+	if s.client == nil {
+		return fmt.Errorf("email service is not configured: missing RESEND_API_KEY")
+	}
+
+	params := &resend.SendEmailRequest{
+		From:    s.cfg.MailFrom,
+		To:      []string{toEmail},
+		ReplyTo: strings.TrimSpace(s.cfg.SupportEmail),
+		Subject: fmt.Sprintf("Your %s email was changed", s.cfg.AppName),
+		Html:    s.emailChangedHTML(name, newEmail),
+		Text:    s.emailChangedText(name, newEmail),
+	}
+	if _, err := s.client.Emails.Send(params); err != nil {
+		return fmt.Errorf("failed to send email-change notice: %w", err)
+	}
+	return nil
+}
+
+func (s *emailService) emailChangedText(name, newEmail string) string {
+	greeting := "Hi"
+	if name != "" {
+		greeting = "Hi " + name
+	}
+	return fmt.Sprintf(
+		"%s,\n\nYour %s email was changed to %s.\n\n"+
+			"If this wasn't you, reply to this email and we'll help you get your account back.\n\n— The %s team",
+		greeting, s.cfg.AppName, newEmail, s.cfg.AppName,
+	)
+}
+
+// emailChangedHTML uses the same dark layout as the code email.
+func (s *emailService) emailChangedHTML(name, newEmail string) string {
+	greeting := "Hi"
+	if name != "" {
+		greeting = "Hi " + escapeHTML(name)
+	}
+	appName := escapeHTML(s.cfg.AppName)
+	appURL := s.cfg.AppURL
+
+	return fmt.Sprintf(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="dark">
+<title>Your %[1]s email was changed</title>
+</head>
+<body style="margin:0;padding:0;background-color:#070707;color:#ffffff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+  <table role="presentation" width="100%%" cellpadding="0" cellspacing="0" style="background-color:#070707;padding:40px 16px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="100%%" cellpadding="0" cellspacing="0" style="max-width:480px;background-color:#121212;border:1px solid #1f1f1f;border-radius:16px;overflow:hidden;">
+          <tr>
+            <td style="padding:32px 32px 8px 32px;" align="center">
+              <div style="font-size:26px;font-weight:700;letter-spacing:-0.5px;color:#ffffff;">
+                Go<span style="color:#3ee68b;">Port</span>
+              </div>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:16px 32px 32px 32px;color:#ffffff;font-size:16px;line-height:1.5;">
+              <p style="margin:0 0 8px 0;">%[2]s,</p>
+              <p style="margin:0 0 16px 0;color:#a3a3a3;">Your %[1]s email was changed to <strong style="color:#ffffff;">%[3]s</strong>.</p>
+              <p style="margin:0;color:#a3a3a3;">If this wasn't you, reply to this email and we'll help you get your account back.</p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:20px 32px;background-color:#0c0c0c;border-top:1px solid #1f1f1f;color:#6b6b6b;font-size:12px;" align="center">
+              <a href="%[4]s" style="color:#3ee68b;text-decoration:none;">%[5]s</a>
+              <span style="color:#3a3a3a;"> &bull; </span> Secure tunnels for developers
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`, appName, greeting, escapeHTML(newEmail), appURL, escapeHTML(stripScheme(appURL)))
 }
 
 // otpText is the plain-text fallback for clients that don't render HTML.

@@ -7,12 +7,7 @@ import (
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/repository"
 )
 
-type AuthorizationI interface {
-	AmoCRMTokenExchange(req *model.AmoCRMTokenExchangeRequest) (*model.AmoCRMTokenExchangeResponse, error)
-}
-
 type I interface {
-	Authorization() AuthorizationI
 	TCP() TCPI
 	OTP() OTPI
 	Account() AccountI
@@ -22,10 +17,10 @@ type I interface {
 	Tokens() TokensI
 	Billing() BillingI
 	Shares() SharesI
+	Throttle() ThrottleI
 }
 
 type service struct {
-	AuthorizationI
 	tcpService       TCPI
 	otpService       OTPI
 	accountService   AccountI
@@ -35,18 +30,19 @@ type service struct {
 	tokensService    TokensI
 	billingService   BillingI
 	sharesService    SharesI
+	throttle         ThrottleI
 }
 
-func (s *service) Authorization() AuthorizationI { return s.AuthorizationI }
-func (s *service) TCP() TCPI                     { return s.tcpService }
-func (s *service) OTP() OTPI                     { return s.otpService }
-func (s *service) Account() AccountI             { return s.accountService }
-func (s *service) Email() EmailI                 { return s.emailService }
-func (s *service) Dashboard() DashboardI         { return s.dashboardService }
-func (s *service) Usage() UsageI                 { return s.usageService }
-func (s *service) Tokens() TokensI               { return s.tokensService }
-func (s *service) Billing() BillingI             { return s.billingService }
-func (s *service) Shares() SharesI               { return s.sharesService }
+func (s *service) TCP() TCPI             { return s.tcpService }
+func (s *service) OTP() OTPI             { return s.otpService }
+func (s *service) Account() AccountI     { return s.accountService }
+func (s *service) Email() EmailI         { return s.emailService }
+func (s *service) Dashboard() DashboardI { return s.dashboardService }
+func (s *service) Usage() UsageI         { return s.usageService }
+func (s *service) Tokens() TokensI       { return s.tokensService }
+func (s *service) Billing() BillingI     { return s.billingService }
+func (s *service) Shares() SharesI       { return s.sharesService }
+func (s *service) Throttle() ThrottleI   { return s.throttle }
 
 func NewService(app *pocketbase.PocketBase, cfg *config.Config) I {
 	emailService := NewEmailService(cfg)
@@ -55,16 +51,19 @@ func NewService(app *pocketbase.PocketBase, cfg *config.Config) I {
 	sharesService := NewSharesService(cfg, repositories.Shares(), billingService, app.DataDir())
 	tokensService := NewTokensService(app, billingService)
 	usageService := NewUsageService(repositories.Tunnels(), repositories.Usage())
+	// OTP ids are shared by the signup, reset and email-change flows, so they
+	// share one wrong-code counter.
+	attempts := newOTPAttempts(maxWrongCodesPerOTP, 2*model.OTPExpiry)
 	return &service{
-		AuthorizationI:   NewAuthorizationS(app),
 		tcpService:       NewTCPService(app, repositories.Tunnels(), repositories.Usage(), billingService, tokensService),
-		otpService:       NewOTPService(app, emailService),
-		accountService:   NewAccountService(app, emailService),
+		otpService:       NewOTPService(app, emailService, tokensService, attempts),
+		accountService:   NewAccountService(app, emailService, tokensService, attempts),
 		emailService:     emailService,
 		dashboardService: NewDashboardService(tokensService, repositories.Tunnels(), repositories.Usage(), billingService),
 		usageService:     usageService,
 		tokensService:    tokensService,
 		billingService:   billingService,
 		sharesService:    sharesService,
+		throttle:         NewThrottle(cfg.AuthCodeSendsPerIP, cfg.AuthCodeSendsPerHour),
 	}
 }

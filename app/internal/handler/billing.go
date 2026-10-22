@@ -26,6 +26,8 @@ func (h *Handler) CreateCheckoutHandler(e *core.RequestEvent) error {
 		switch {
 		case errors.Is(err, service.ErrInvalidBillingPlan):
 			return h.NewErrorResponse(e, http.StatusBadRequest, "Choose a monthly or yearly Pro plan.")
+		case errors.Is(err, service.ErrUpgradesClosed):
+			return h.NewErrorResponse(e, http.StatusForbidden, "Pro upgrades aren't open yet. Check back soon.")
 		case errors.Is(err, service.ErrAlreadySubscribed):
 			return h.NewErrorResponse(e, http.StatusConflict, err.Error())
 		case errors.Is(err, service.ErrBillingNotConfigured):
@@ -112,6 +114,10 @@ func (h *Handler) LemonSqueezyWebhookHandler(e *core.RequestEvent) error {
 	}
 	if err := h.service.Billing().ProcessWebhook(e.Request.Context(), body, e.Request.Header.Get("X-Signature")); err != nil {
 		switch {
+		case errors.Is(err, service.ErrWebhookIgnored):
+			// Answer 200 so Lemon Squeezy doesn't retry an event we keep out.
+			h.logger.Warn("ignored Lemon Squeezy test-mode webhook; the account is not in LEMON_SQUEEZY_TEST_EMAILS", "error", err)
+			return h.NewSuccessResponse(e, http.StatusOK, map[string]string{"message": "webhook ignored"})
 		case errors.Is(err, service.ErrInvalidWebhookSignature):
 			return h.NewErrorResponse(e, http.StatusUnauthorized, "invalid webhook signature")
 		case errors.Is(err, service.ErrBillingNotConfigured):

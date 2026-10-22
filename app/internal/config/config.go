@@ -15,6 +15,7 @@ type Config struct {
 	MailFrom                        string `env:"MAIL_FROM" env-default:"GoPort <noreply@contact.goport.uz>"`
 	AppName                         string `env:"APP_NAME" env-default:"GoPort"`
 	AppURL                          string `env:"APP_URL" env-default:"https://goport.uz"`
+	SupportEmail                    string `env:"SUPPORT_EMAIL" env-default:"support@contact.goport.uz"`
 	GoogleOAuthID                   string `env:"GOOGLE_OAUTH_ID"`
 	GoogleOAuthSecret               string `env:"GOOGLE_OAUTH_SECRET"`
 	LemonSqueezyKey                 string `env:"LEMON_SQUEEZY_KEY"`
@@ -43,6 +44,16 @@ type Config struct {
 	ShareProDefaultRetentionHours  int   `env:"SHARE_PRO_DEFAULT_RETENTION_HOURS" env-default:"168"`
 	ShareProMaxRetentionHours      int   `env:"SHARE_PRO_MAX_RETENTION_HOURS" env-default:"720"`
 	ShareProMaxFiles               int64 `env:"SHARE_PRO_MAX_FILES" env-default:"1000"`
+	// Emails with a code (sign-up, password reset, email change) per client
+	// IP and for the whole server, per hour.
+	AuthCodeSendsPerIP   int `env:"AUTH_CODE_SENDS_PER_IP" env-default:"10"`
+	AuthCodeSendsPerHour int `env:"AUTH_CODE_SENDS_PER_HOUR" env-default:"300"`
+	// In Lemon Squeezy test mode only these accounts (comma-separated
+	// emails) may upgrade.
+	LemonSqueezyTestEmails string `env:"LEMON_SQUEEZY_TEST_EMAILS"`
+	// Variants without a free trial, used once an account has had a trial.
+	LemonSqueezyProMonthlyNoTrialVariantID string `env:"LEMON_SQUEEZY_PRO_MONTHLY_NO_TRIAL_VARIANT_ID"`
+	LemonSqueezyProYearlyNoTrialVariantID  string `env:"LEMON_SQUEEZY_PRO_YEARLY_NO_TRIAL_VARIANT_ID"`
 }
 
 var instance *Config
@@ -74,6 +85,12 @@ func GetConfig() *Config {
 			log.Print("no .env file found, using OS environment and defaults")
 		}
 
+		if instance.LemonSqueezyProMonthlyNoTrialVariantID == "" || instance.LemonSqueezyProYearlyNoTrialVariantID == "" {
+			log.Print("WARNING: LEMON_SQUEEZY_PRO_MONTHLY_NO_TRIAL_VARIANT_ID / LEMON_SQUEEZY_PRO_YEARLY_NO_TRIAL_VARIANT_ID are not both set; returning customers can start another free trial")
+		}
+		if instance.LemonSqueezyTestMode {
+			log.Print("WARNING: ==== LEMON_SQUEEZY_TEST_MODE is ON. Checkouts use Lemon Squeezy test mode and only LEMON_SQUEEZY_TEST_EMAILS can upgrade to Pro. Set LEMON_SQUEEZY_TEST_MODE=false to take real payments. ====")
+		}
 		if instance.ResendAPIKey == "" {
 			log.Print("WARNING: RESEND_API_KEY is empty; OTP emails will not be sent")
 		}

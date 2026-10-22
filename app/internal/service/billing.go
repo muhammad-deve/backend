@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -29,6 +30,12 @@ var (
 	ErrWebhookStoreMismatch    = errors.New("webhook belongs to a different Lemon Squeezy store")
 	ErrWebhookUserNotFound     = errors.New("webhook could not be matched to a GoPort user")
 	ErrProRequired             = errors.New("this feature requires an active GoPort Pro subscription")
+	// ErrUpgradesClosed is returned in Lemon Squeezy test mode to accounts
+	// outside LEMON_SQUEEZY_TEST_EMAILS.
+	ErrUpgradesClosed = errors.New("Pro upgrades aren't open yet")
+	// ErrWebhookIgnored is returned for a test-mode event about an account
+	// outside LEMON_SQUEEZY_TEST_EMAILS. Nothing is stored.
+	ErrWebhookIgnored = errors.New("test-mode webhook for an account that may not test billing")
 )
 
 type BillingI interface {
@@ -58,7 +65,7 @@ func NewBillingService(cfg *config.Config, repo repository.BillingI) BillingI {
 }
 
 func (s *billingService) Plan(userID string) (model.PlanLimits, error) {
-	subscriptions, err := s.repo.ListSubscriptions(userID)
+	subscriptions, err := s.listUsableSubscriptions(userID)
 	if err != nil {
 		return model.PlanLimits{}, err
 	}
@@ -78,6 +85,10 @@ func (s *billingService) CreateCheckout(ctx context.Context, user *core.Record, 
 	if !ok {
 		return nil, ErrInvalidBillingPlan
 	}
+	// Test checkouts take test cards, so only listed testers may use them.
+	if s.cfg.LemonSqueezyTestMode && !s.isTester(user.Email()) {
+		return nil, ErrUpgradesClosed
+	}
 	if !s.apiConfigured() || variantID == "" {
 		return nil, ErrBillingNotConfigured
 	}
@@ -89,6 +100,11 @@ func (s *billingService) CreateCheckout(ctx context.Context, user *core.Record, 
 	if limits.IsPro {
 		return nil, ErrAlreadySubscribed
 	}
+	subscriptions, err := s.repo.ListSubscriptions(user.Id)
+	if err != nil {
+		return nil, err
+	}
+	variantID = s.checkoutVariant(plan, variantID, subscriptions)
 
 	redirectURL := strings.TrimRight(s.cfg.AppURL, "/") + "/dashboard?checkout=success#billing"
 	checkoutURL, err := s.client.CreateCheckout(ctx, lemonCheckoutInput{
@@ -110,7 +126,7 @@ func (s *billingService) ChangeSubscriptionPlan(ctx context.Context, userID, pla
 	if !s.apiConfigured() {
 		return ErrBillingNotConfigured
 	}
-	subscriptions, err := s.repo.ListSubscriptions(userID)
+	subscriptions, err := s.listUsableSubscriptions(userID)
 	if err != nil {
 		return err
 	}
@@ -125,6 +141,7 @@ func (s *billingService) ChangeSubscriptionPlan(ctx context.Context, userID, pla
 	if !ok || variantID == "" {
 		return ErrBillingNotConfigured
 	}
+	variantID = s.checkoutVariant(plan, variantID, subscriptions)
 	attributes, err := s.client.UpdateSubscriptionVariant(ctx, subscription.ExternalID, variantID)
 	if err != nil {
 		return err
@@ -136,7 +153,7 @@ func (s *billingService) CancelSubscription(ctx context.Context, userID string) 
 	if !s.apiConfigured() {
 		return ErrBillingNotConfigured
 	}
-	subscriptions, err := s.repo.ListSubscriptions(userID)
+	subscriptions, err := s.listUsableSubscriptions(userID)
 	if err != nil {
 		return err
 	}
@@ -205,7 +222,11 @@ func (s *billingService) trialConsumed(subscriptions []model.BillingSubscription
 }
 
 func (s *billingService) Get(userID string) (*model.BillingData, error) {
-	subscriptions, err := s.repo.ListSubscriptions(userID)
+	allSubscriptions, err := s.repo.ListSubscriptions(userID)
+	if err != nil {
+		return nil, err
+	}
+	subscriptions, err := s.usableSubscriptions(userID, allSubscriptions)
 	if err != nil {
 		return nil, err
 	}
@@ -235,7 +256,7 @@ func (s *billingService) Get(userID string) (*model.BillingData, error) {
 		AvailablePlans:     availablePlans,
 		Plan:               limits,
 		Transactions:       make([]model.BillingTransaction, 0, len(transactions)),
-		TrialUsed:          s.trialConsumed(subscriptions),
+		TrialUsed:          s.trialConsumed(allSubscriptions),
 	}
 
 	selected := s.preferredSubscription(subscriptions)
@@ -314,27 +335,142 @@ func (s *billingService) variantForPlan(plan string) (string, bool) {
 	}
 }
 
+// checkoutVariant returns the variant to sell for plan. Once the account has
+// had a free trial it uses the variant without one, so the trial can't be
+// started again. When that variant isn't configured it keeps variantID.
+func (s *billingService) checkoutVariant(plan, variantID string, subscriptions []model.BillingSubscriptionRecord) string {
+	if !s.trialConsumed(subscriptions) {
+		return variantID
+	}
+	noTrial := ""
+	switch strings.ToLower(strings.TrimSpace(plan)) {
+	case "monthly":
+		noTrial = strings.TrimSpace(s.cfg.LemonSqueezyProMonthlyNoTrialVariantID)
+	case "yearly":
+		noTrial = strings.TrimSpace(s.cfg.LemonSqueezyProYearlyNoTrialVariantID)
+	}
+	if noTrial == "" {
+		slog.Warn("no no-trial Lemon Squeezy variant is set; a returning customer gets the trial variant again", "plan", plan)
+		return variantID
+	}
+	return noTrial
+}
+
 func (s *billingService) planForVariant(variantID string) string {
-	switch strings.TrimSpace(variantID) {
-	case strings.TrimSpace(s.cfg.LemonSqueezyProMonthlyVariantID):
-		if variantID != "" {
-			return model.PlanProMonthly
-		}
-	case strings.TrimSpace(s.cfg.LemonSqueezyProYearlyVariantID):
-		if variantID != "" {
-			return model.PlanProYearly
-		}
+	variantID = strings.TrimSpace(variantID)
+	if variantID == "" {
+		return ""
+	}
+	switch variantID {
+	case strings.TrimSpace(s.cfg.LemonSqueezyProMonthlyVariantID), strings.TrimSpace(s.cfg.LemonSqueezyProMonthlyNoTrialVariantID):
+		return model.PlanProMonthly
+	case strings.TrimSpace(s.cfg.LemonSqueezyProYearlyVariantID), strings.TrimSpace(s.cfg.LemonSqueezyProYearlyNoTrialVariantID):
+		return model.PlanProYearly
 	}
 	return ""
 }
+
+// isTester reports whether email is listed in LEMON_SQUEEZY_TEST_EMAILS.
+func (s *billingService) isTester(email string) bool {
+	email = strings.ToLower(strings.TrimSpace(email))
+	if email == "" {
+		return false
+	}
+	for _, listed := range strings.Split(s.cfg.LemonSqueezyTestEmails, ",") {
+		if strings.ToLower(strings.TrimSpace(listed)) == email {
+			return true
+		}
+	}
+	return false
+}
+
+// testModeCutoff splits test-mode subscriptions. Rows stored before it keep
+// giving Pro: the owner chose to block new free upgrades, not to take away
+// what people already have. Rows stored at or after it count only for
+// LEMON_SQUEEZY_TEST_EMAILS, and only while test mode is on.
+var testModeCutoff = time.Date(2026, time.October, 23, 0, 0, 0, 0, time.UTC)
+
+// storedBeforeCutoff reports whether a row was stored before testModeCutoff.
+// Rows with no stored time predate the field and count as earlier.
+func storedBeforeCutoff(subscription model.BillingSubscriptionRecord) bool {
+	return subscription.Created.IsZero() || subscription.Created.Before(testModeCutoff)
+}
+
+// testBillingAllowed reports whether a test-mode subscription or payment may
+// count for the account: only in test mode, and only for listed testers.
+func (s *billingService) testBillingAllowed(userID string) (bool, error) {
+	if !s.cfg.LemonSqueezyTestMode {
+		return false, nil
+	}
+	email, err := s.repo.UserEmail(userID)
+	if err != nil {
+		if isRecordNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return s.isTester(email), nil
+}
+
+func (s *billingService) listUsableSubscriptions(userID string) ([]model.BillingSubscriptionRecord, error) {
+	subscriptions, err := s.repo.ListSubscriptions(userID)
+	if err != nil {
+		return nil, err
+	}
+	return s.usableSubscriptions(userID, subscriptions)
+}
+
+// usableSubscriptions drops test-mode subscriptions stored since the cutoff
+// that must not give Pro: all of them in live mode, and those of non-testers
+// in test mode. Rows stored before the cutoff always stay.
+func (s *billingService) usableSubscriptions(userID string, subscriptions []model.BillingSubscriptionRecord) ([]model.BillingSubscriptionRecord, error) {
+	restricted := false
+	for _, subscription := range subscriptions {
+		if subscription.TestMode && !storedBeforeCutoff(subscription) {
+			restricted = true
+			break
+		}
+	}
+	if !restricted {
+		return subscriptions, nil
+	}
+	allowed, err := s.testBillingAllowed(userID)
+	if err != nil {
+		return nil, err
+	}
+	if allowed {
+		return subscriptions, nil
+	}
+	usable := make([]model.BillingSubscriptionRecord, 0, len(subscriptions))
+	for _, subscription := range subscriptions {
+		if !subscription.TestMode || storedBeforeCutoff(subscription) {
+			usable = append(usable, subscription)
+		}
+	}
+	return usable, nil
+}
+
+// unpaidGrace is how long an unpaid or paused subscription keeps Pro after
+// its paid period ends.
+const unpaidGrace = 3 * 24 * time.Hour
 
 func (s *billingService) subscriptionGrantsPro(subscription model.BillingSubscriptionRecord, now time.Time) bool {
 	if subscription.PlanKey != model.PlanProMonthly && subscription.PlanKey != model.PlanProYearly {
 		return false
 	}
 	switch subscription.Status {
-	case "on_trial", "active", "paused", "past_due", "unpaid":
+	case "on_trial", "active", "past_due":
+		// past_due is Lemon Squeezy's retry window; it ends as unpaid or
+		// expired.
 		return true
+	case "unpaid", "paused":
+		// No payment is coming in. Keep Pro to the end of the paid period
+		// plus a short grace, then fall back to Free.
+		periodEnd := subscription.RenewsAt
+		if periodEnd.IsZero() {
+			periodEnd = subscription.EndsAt
+		}
+		return !periodEnd.IsZero() && now.Before(periodEnd.Add(unpaidGrace))
 	case "cancelled":
 		return !subscription.EndsAt.IsZero() && now.Before(subscription.EndsAt)
 	default:

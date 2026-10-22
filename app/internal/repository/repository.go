@@ -32,6 +32,7 @@ type BillingI interface {
 	ListTransactions(userID string, limit int) ([]model.BillingTransactionRecord, error)
 	UserExists(userID string) (bool, error)
 	FindUserIDByEmail(email string) (string, error)
+	UserEmail(userID string) (string, error)
 }
 
 type SharesI interface {
