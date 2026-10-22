@@ -474,9 +474,16 @@ func (t *tcpService) handleConnection(conn net.Conn, ip string) {
 	go refuseCLIStreams(session, subdomain)
 
 	t.mu.Lock()
-	t.sessions[subdomain] = session
-	t.onlineSince[subdomain] = time.Now()
+	// Stop() may have dropped the reservation meanwhile.
+	stillOwned := t.owners[subdomain] == conn
+	if stillOwned {
+		t.sessions[subdomain] = session
+		t.onlineSince[subdomain] = time.Now()
+	}
 	t.mu.Unlock()
+	if !stillOwned {
+		return
+	}
 
 	<-session.CloseChan()
 }

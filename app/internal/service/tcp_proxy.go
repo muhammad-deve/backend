@@ -240,8 +240,8 @@ func (x *tunnelExchange) serveHTTP() {
 }
 
 // readResponse reads the CLI's response head, capped at maxResponseHead
-// bytes. The returned reader carries the rest of the
-// stream (the body, or the upgraded connection).
+// bytes. The returned reader carries the rest of the stream (the body, or
+// the upgraded connection).
 func (x *tunnelExchange) readResponse(outReq *http.Request) (*http.Response, *bufio.Reader, error) {
 	limit := &headLimitReader{r: x.stream, left: x.limits.maxResponseHead}
 	head := bufio.NewReader(limit)

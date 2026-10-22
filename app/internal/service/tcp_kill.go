@@ -26,7 +26,7 @@ const revokedTokenHold = time.Minute
 
 func stopKey(userID, subdomain string) string { return userID + "\x00" + subdomain }
 
-// markStopped refuses subdomain to userID for stopHold. Must hold t.mu.
+// markStoppedLocked refuses subdomain to userID for stopHold. Must hold t.mu.
 func (t *tcpService) markStoppedLocked(userID, subdomain string, now time.Time) {
 	for key, until := range t.stopped {
 		if !now.Before(until) {
