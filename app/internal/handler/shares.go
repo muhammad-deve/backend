@@ -311,12 +311,6 @@ func (h *Handler) sharePasswordPaused(e *core.RequestEvent, wait time.Duration, 
 
 func (h *Handler) ShareContentHandler(e *core.RequestEvent) error {
 	h.publicShareHeaders(e.Response, e.Request)
-	select {
-	case h.shareDownloads <- struct{}{}:
-		defer func() { <-h.shareDownloads }()
-	default:
-		return h.NewErrorResponse(e, http.StatusTooManyRequests, "Too many downloads are in progress. Try again shortly.")
-	}
 	token := e.Request.PathValue("token")
 	record, err := h.service.Shares().Public(token)
 	if err != nil {
@@ -325,16 +319,13 @@ func (h *Handler) ShareContentHandler(e *core.RequestEvent) error {
 	if record.PasswordHash != "" && !h.shareUnlocked(e.Request, token, record) {
 		return h.NewErrorResponse(e, http.StatusUnauthorized, "password required")
 	}
-	preview := e.Request.URL.Query().Get("preview") == "1" && service.SafePreview(record.MIMEType)
-	return h.serveShareFile(e, token, preview, countsAsDownload(e.Request))
-}
-
-// countsAsDownload reports whether a request delivers the file from the
-// start. Previews count as well as downloads, since both cost the same
-// traffic; follow-up range requests from a PDF viewer do not.
-func countsAsDownload(r *http.Request) bool {
-	rangeHeader := r.Header.Get("Range")
-	return r.Method == http.MethodGet && (rangeHeader == "" || strings.HasPrefix(rangeHeader, "bytes=0-"))
+	inline := e.Request.URL.Query().Get("preview") == "1" && service.SafePreview(record.MIMEType)
+	// A shared web page shows only inside the share page's frame. Opened on
+	// its own it downloads, so the API host can't be used to host pages.
+	if inline && service.IsHTMLType(record.MIMEType) && e.Request.Header.Get("Sec-Fetch-Dest") != "iframe" {
+		inline = false
+	}
+	return h.serveShareFile(e, token, inline)
 }
 
 // ShareRawHandler serves a direct link: the file itself, with no share page.
@@ -343,12 +334,6 @@ func countsAsDownload(r *http.Request) bool {
 // the share page instead.
 func (h *Handler) ShareRawHandler(e *core.RequestEvent) error {
 	h.publicShareHeaders(e.Response, e.Request)
-	select {
-	case h.shareDownloads <- struct{}{}:
-		defer func() { <-h.shareDownloads }()
-	default:
-		return h.NewErrorResponse(e, http.StatusTooManyRequests, "Too many downloads are in progress. Try again shortly.")
-	}
 	token := e.Request.PathValue("token")
 	record, err := h.service.Shares().Public(token)
 	if err != nil {
@@ -357,10 +342,17 @@ func (h *Handler) ShareRawHandler(e *core.RequestEvent) error {
 	if !h.service.Shares().DirectAllowed(record) {
 		return e.JSON(http.StatusConflict, map[string]string{"state": "page", "error": "This file opens on its share page."})
 	}
-	return h.serveShareFile(e, token, service.SafePreview(record.MIMEType), countsAsDownload(e.Request))
+	return h.serveShareFile(e, token, service.SafePreview(record.MIMEType))
 }
 
-func (h *Handler) serveShareFile(e *core.RequestEvent, token string, inline, countDownload bool) error {
+func (h *Handler) serveShareFile(e *core.RequestEvent, token string, inline bool) error {
+	if e.Request.Method != http.MethodHead {
+		release, ok := h.takeDownloadSlot(e.Request)
+		if !ok {
+			return h.NewErrorResponse(e, http.StatusTooManyRequests, "Too many downloads are in progress. Try again shortly.")
+		}
+		defer release()
+	}
 	file, record, err := h.service.Shares().Open(token)
 	if err != nil {
 		return h.publicShareError(e, err)
@@ -381,11 +373,34 @@ func (h *Handler) serveShareFile(e *core.RequestEvent, token string, inline, cou
 	e.Response.Header().Set("Content-Disposition", contentDisposition(disposition, record.Filename))
 	// Revoking or deleting must take effect at once, so nothing is cached.
 	e.Response.Header().Set("Cache-Control", "private, no-store")
-	if countDownload {
-		h.service.Shares().CountDownload(record.ID)
-	}
-	http.ServeContent(e.Response, e.Request, record.Filename, info.ModTime(), file)
+	// Previews count as well as downloads, since both cost the same traffic.
+	writer := newShareDownloadWriter(e.Response, e.Request.Method, func() { h.service.Shares().CountDownload(record.ID) })
+	http.ServeContent(writer, e.Request, record.Filename, info.ModTime(), file)
 	return nil
+}
+
+// takeDownloadSlot reserves one of the visitor's download slots and one of
+// the server's. A request from our own network that names no outside client,
+// such as the website fetching a direct link, uses only the server's.
+func (h *Handler) takeDownloadSlot(r *http.Request) (func(), bool) {
+	release := func() {}
+	if visitor, internal := shareVisitor(r); !internal {
+		visitorRelease, ok := h.shareVisitorSlots.acquire(r.Context(), visitor, shareSlotWait)
+		if !ok {
+			return nil, false
+		}
+		release = visitorRelease
+	}
+	select {
+	case h.shareDownloads <- struct{}{}:
+		return func() {
+			<-h.shareDownloads
+			release()
+		}, true
+	default:
+		release()
+		return nil, false
+	}
 }
 
 func (h *Handler) shareError(e *core.RequestEvent, err error) error {
@@ -449,6 +464,10 @@ func (h *Handler) publicShareHeaders(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", origin)
 		w.Header().Set("Access-Control-Allow-Credentials", "true")
 		w.Header().Set("Access-Control-Expose-Headers", "Retry-After, Content-Length, Content-Range")
+	} else {
+		// PocketBase's CORS middleware allows every origin. Only the site
+		// may read share responses from a script.
+		w.Header().Del("Access-Control-Allow-Origin")
 	}
 }
 
