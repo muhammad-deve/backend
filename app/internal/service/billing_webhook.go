@@ -139,6 +139,9 @@ func (s *billingService) processSubscriptionWebhook(externalID, customUserID str
 	if err != nil {
 		return err
 	}
+	if err := s.checkTestModeUser(userID, attributes.TestMode); err != nil {
+		return err
+	}
 	return s.repo.UpsertSubscription(model.BillingSubscriptionRecord{
 		UserID:            userID,
 		ExternalID:        externalID,
@@ -169,6 +172,9 @@ func (s *billingService) processInvoiceWebhook(externalID, customUserID string, 
 	subscriptionID := attributes.SubscriptionID.String()
 	userID, err := s.resolveWebhookUser(customUserID, subscriptionID, attributes.UserEmail)
 	if err != nil {
+		return err
+	}
+	if err := s.checkTestModeUser(userID, attributes.TestMode); err != nil {
 		return err
 	}
 
@@ -209,6 +215,9 @@ func (s *billingService) processOrderWebhook(externalID, customUserID string, ra
 	}
 	userID, err := s.resolveWebhookUser(customUserID, "", attributes.UserEmail)
 	if err != nil {
+		return err
+	}
+	if err := s.checkTestModeUser(userID, attributes.TestMode); err != nil {
 		return err
 	}
 
@@ -268,6 +277,22 @@ func (s *billingService) resolveWebhookUser(customUserID, externalSubscriptionID
 		return "", ErrWebhookUserNotFound
 	}
 	return "", err
+}
+
+// checkTestModeUser refuses a test-mode event for an account that may not
+// test billing, however it was matched (custom user id or email).
+func (s *billingService) checkTestModeUser(userID string, testMode bool) error {
+	if !testMode {
+		return nil
+	}
+	allowed, err := s.testBillingAllowed(userID)
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return fmt.Errorf("%w (user %s)", ErrWebhookIgnored, userID)
+	}
+	return nil
 }
 
 func (s *billingService) validateWebhookSource(storeID string, testMode bool) error {

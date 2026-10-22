@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pocketbase/pocketbase/core"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/config"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/model"
 )
@@ -72,7 +73,8 @@ func TestSubscriptionGrantsPro(t *testing.T) {
 
 func TestProcessInvoiceWebhookStoresTransaction(t *testing.T) {
 	repo := &fakeBillingRepository{
-		users: map[string]bool{"user_123": true},
+		users:  map[string]bool{"user_123": true},
+		emails: map[string]string{"user_123": "dev@example.com"},
 		subscriptions: []model.BillingSubscriptionRecord{{
 			UserID: "user_123", ExternalID: "7001", PlanKey: model.PlanProMonthly, Status: "active",
 		}},
@@ -81,6 +83,7 @@ func TestProcessInvoiceWebhookStoresTransaction(t *testing.T) {
 		LemonSqueezyStoreID:       "470781",
 		LemonSqueezyWebhookSecret: "webhook-secret",
 		LemonSqueezyTestMode:      true,
+		LemonSqueezyTestEmails:    "dev@example.com",
 	}
 	service := &billingService{cfg: cfg, repo: repo, now: time.Now}
 	body := []byte(`{
@@ -136,12 +139,13 @@ func TestProcessWebhookRejectsSubscriptionOwnerMismatch(t *testing.T) {
 }
 
 func TestProcessSubscriptionWebhook(t *testing.T) {
-	repo := &fakeBillingRepository{users: map[string]bool{"user_123": true}}
+	repo := &fakeBillingRepository{users: map[string]bool{"user_123": true}, emails: map[string]string{"user_123": "dev@example.com"}}
 	cfg := &config.Config{
 		LemonSqueezyStoreID:             "470781",
 		LemonSqueezyProMonthlyVariantID: "991",
 		LemonSqueezyWebhookSecret:       "webhook-secret",
 		LemonSqueezyTestMode:            true,
+		LemonSqueezyTestEmails:          " Other@example.com , DEV@example.com ",
 	}
 	service := &billingService{cfg: cfg, repo: repo, now: time.Now}
 	body := []byte(`{
@@ -284,14 +288,14 @@ func TestLemonSqueezySubscriptionMutations(t *testing.T) {
 
 func TestBillingServiceChangesMonthlyToYearly(t *testing.T) {
 	now := time.Date(2026, time.September, 14, 12, 0, 0, 0, time.UTC)
-	repo := &fakeBillingRepository{subscriptions: []model.BillingSubscriptionRecord{{
+	repo := &fakeBillingRepository{emails: map[string]string{"user_123": "dev@example.com"}, subscriptions: []model.BillingSubscriptionRecord{{
 		UserID: "user_123", ExternalID: "7001", VariantID: "991", PlanKey: model.PlanProMonthly, Status: "active", TestMode: true,
 	}}}
 	client := &fakeLemonSqueezyClient{updateAttributes: lemonSubscriptionAttributes{
 		VariantID: json.Number("1999"), Status: "active", RenewsAt: "2027-09-14T00:00:00Z", UpdatedAt: "2026-09-14T12:00:00Z", TestMode: true,
 	}}
 	service := &billingService{
-		cfg:  &config.Config{LemonSqueezyKey: "api-key", LemonSqueezyStoreID: "470781", LemonSqueezyAPIURL: "https://api.lemonsqueezy.test", LemonSqueezyProMonthlyVariantID: "991", LemonSqueezyProYearlyVariantID: "1999"},
+		cfg:  &config.Config{LemonSqueezyKey: "api-key", LemonSqueezyStoreID: "470781", LemonSqueezyAPIURL: "https://api.lemonsqueezy.test", LemonSqueezyProMonthlyVariantID: "991", LemonSqueezyProYearlyVariantID: "1999", LemonSqueezyTestMode: true, LemonSqueezyTestEmails: "dev@example.com"},
 		repo: repo, client: client, now: func() time.Time { return now },
 	}
 
@@ -310,14 +314,14 @@ func TestBillingServiceChangesMonthlyToYearly(t *testing.T) {
 func TestBillingServiceSchedulesCancellation(t *testing.T) {
 	now := time.Date(2026, time.September, 14, 12, 0, 0, 0, time.UTC)
 	endsAt := now.Add(30 * 24 * time.Hour)
-	repo := &fakeBillingRepository{subscriptions: []model.BillingSubscriptionRecord{{
+	repo := &fakeBillingRepository{emails: map[string]string{"user_123": "dev@example.com"}, subscriptions: []model.BillingSubscriptionRecord{{
 		UserID: "user_123", ExternalID: "7001", PlanKey: model.PlanProMonthly, Status: "active", TestMode: true,
 	}}}
 	client := &fakeLemonSqueezyClient{cancelAttributes: lemonSubscriptionAttributes{
 		Status: "cancelled", EndsAt: endsAt.Format(time.RFC3339), UpdatedAt: now.Format(time.RFC3339), TestMode: true,
 	}}
 	service := &billingService{
-		cfg:  &config.Config{LemonSqueezyKey: "api-key", LemonSqueezyStoreID: "470781", LemonSqueezyAPIURL: "https://api.lemonsqueezy.test"},
+		cfg:  &config.Config{LemonSqueezyKey: "api-key", LemonSqueezyStoreID: "470781", LemonSqueezyAPIURL: "https://api.lemonsqueezy.test", LemonSqueezyTestMode: true, LemonSqueezyTestEmails: "dev@example.com"},
 		repo: repo, client: client, now: func() time.Time { return now },
 	}
 
@@ -358,11 +362,14 @@ func webhookSignature(body []byte, secret string) string {
 
 type fakeBillingRepository struct {
 	users         map[string]bool
+	emails        map[string]string // user id -> email
 	subscriptions []model.BillingSubscriptionRecord
 	transactions  []model.BillingTransactionRecord
 }
 
 type fakeLemonSqueezyClient struct {
+	checkoutURL             string
+	checkoutInput           lemonCheckoutInput
 	cancelAttributes        lemonSubscriptionAttributes
 	updateAttributes        lemonSubscriptionAttributes
 	getAttributes           lemonSubscriptionAttributes
@@ -377,8 +384,12 @@ func (c *fakeLemonSqueezyClient) GetSubscription(_ context.Context, subscription
 	return c.getAttributes, nil
 }
 
-func (c *fakeLemonSqueezyClient) CreateCheckout(context.Context, lemonCheckoutInput) (string, error) {
-	return "", errors.New("unexpected checkout call")
+func (c *fakeLemonSqueezyClient) CreateCheckout(_ context.Context, input lemonCheckoutInput) (string, error) {
+	if c.checkoutURL == "" {
+		return "", errors.New("unexpected checkout call")
+	}
+	c.checkoutInput = input
+	return c.checkoutURL, nil
 }
 
 func (c *fakeLemonSqueezyClient) CancelSubscription(_ context.Context, subscriptionID string) (lemonSubscriptionAttributes, error) {
@@ -424,9 +435,20 @@ func (r *fakeBillingRepository) UserExists(userID string) (bool, error) {
 }
 
 func (r *fakeBillingRepository) FindUserIDByEmail(email string) (string, error) {
+	for id, known := range r.emails {
+		if known == email {
+			return id, nil
+		}
+	}
 	return "", sql.ErrNoRows
 }
 
+func (r *fakeBillingRepository) UserEmail(userID string) (string, error) {
+	if email, ok := r.emails[userID]; ok {
+		return email, nil
+	}
+	return "", sql.ErrNoRows
+}
 
 func TestBillingServiceReportsTrialAlreadyUsed(t *testing.T) {
 	now := time.Date(2026, time.September, 22, 12, 0, 0, 0, time.UTC)
@@ -530,5 +552,107 @@ func TestBillingServicePortalRequiresSubscription(t *testing.T) {
 
 	if _, err := service.PortalURL(context.Background(), "user_123"); !errors.Is(err, ErrNoSubscription) {
 		t.Fatalf("PortalURL() error = %v, want ErrNoSubscription", err)
+	}
+}
+
+func testModeBilling(repo *fakeBillingRepository, client *fakeLemonSqueezyClient) *billingService {
+	return &billingService{
+		cfg: &config.Config{
+			LemonSqueezyKey: "api-key", LemonSqueezyStoreID: "470781", LemonSqueezyAPIURL: "https://api.lemonsqueezy.test",
+			LemonSqueezyProMonthlyVariantID: "991", LemonSqueezyProYearlyVariantID: "1999",
+			LemonSqueezyWebhookSecret: "webhook-secret", LemonSqueezyTestMode: true, LemonSqueezyTestEmails: "tester@example.com",
+		},
+		repo: repo, client: client, now: time.Now,
+	}
+}
+
+func checkoutUser(id, email string) *core.Record {
+	record := core.NewRecord(core.NewAuthCollection("users"))
+	record.Id = id
+	record.SetEmail(email)
+	return record
+}
+
+func TestCreateCheckoutInTestModeOnlyForTesters(t *testing.T) {
+	client := &fakeLemonSqueezyClient{checkoutURL: "https://goport.lemonsqueezy.com/checkout/test"}
+	service := testModeBilling(&fakeBillingRepository{}, client)
+
+	_, err := service.CreateCheckout(context.Background(), checkoutUser("user_1", "someone@example.com"), "monthly")
+	if !errors.Is(err, ErrUpgradesClosed) {
+		t.Fatalf("non-tester checkout error = %v, want ErrUpgradesClosed", err)
+	}
+	response, err := service.CreateCheckout(context.Background(), checkoutUser("user_2", "Tester@Example.com"), "monthly")
+	if err != nil {
+		t.Fatalf("tester checkout: %v", err)
+	}
+	if response.URL != client.checkoutURL || !client.checkoutInput.TestMode {
+		t.Fatalf("unexpected checkout: %#v %#v", response, client.checkoutInput)
+	}
+}
+
+func TestTestModeWebhooksSkipNonTesters(t *testing.T) {
+	repo := &fakeBillingRepository{
+		users:  map[string]bool{"user_1": true, "user_2": true},
+		emails: map[string]string{"user_1": "someone@example.com", "user_2": "tester@example.com"},
+	}
+	service := testModeBilling(repo, &fakeLemonSqueezyClient{})
+	send := func(body string) error {
+		return service.ProcessWebhook(context.Background(), []byte(body), webhookSignature([]byte(body), "webhook-secret"))
+	}
+
+	byID := `{"meta":{"event_name":"subscription_created","custom_data":{"user_id":"user_1"}},"data":{"type":"subscriptions","id":"7001","attributes":{"store_id":470781,"variant_id":991,"status":"active","test_mode":true}}}`
+	if err := send(byID); !errors.Is(err, ErrWebhookIgnored) {
+		t.Fatalf("custom user id: err = %v, want ErrWebhookIgnored", err)
+	}
+	byEmail := `{"meta":{"event_name":"subscription_created"},"data":{"type":"subscriptions","id":"7002","attributes":{"store_id":470781,"variant_id":991,"status":"active","user_email":"someone@example.com","test_mode":true}}}`
+	if err := send(byEmail); !errors.Is(err, ErrWebhookIgnored) {
+		t.Fatalf("email match: err = %v, want ErrWebhookIgnored", err)
+	}
+	order := `{"meta":{"event_name":"order_created"},"data":{"type":"orders","id":"9001","attributes":{"store_id":470781,"user_email":"someone@example.com","status":"paid","total":299,"test_mode":true,"first_order_item":{"variant_id":991}}}}`
+	if err := send(order); !errors.Is(err, ErrWebhookIgnored) {
+		t.Fatalf("order: err = %v, want ErrWebhookIgnored", err)
+	}
+	if len(repo.subscriptions) != 0 || len(repo.transactions) != 0 {
+		t.Fatal("ignored events must not be stored")
+	}
+
+	tester := `{"meta":{"event_name":"subscription_created","custom_data":{"user_id":"user_2"}},"data":{"type":"subscriptions","id":"7003","attributes":{"store_id":470781,"variant_id":991,"status":"active","test_mode":true}}}`
+	if err := send(tester); err != nil {
+		t.Fatalf("tester webhook: %v", err)
+	}
+	if len(repo.subscriptions) != 1 {
+		t.Fatal("a tester's subscription must be stored")
+	}
+}
+
+func TestTestSubscriptionsGiveProOnlyToTestersInTestMode(t *testing.T) {
+	sub := model.BillingSubscriptionRecord{UserID: "user_1", ExternalID: "7001", PlanKey: model.PlanProMonthly, Status: "active", TestMode: true}
+	repo := &fakeBillingRepository{
+		emails:        map[string]string{"user_1": "someone@example.com"},
+		subscriptions: []model.BillingSubscriptionRecord{sub},
+	}
+	service := testModeBilling(repo, &fakeLemonSqueezyClient{})
+
+	plan, err := service.Plan("user_1")
+	if err != nil || plan.IsPro {
+		t.Fatalf("non-tester with a test subscription: pro=%v err=%v", plan.IsPro, err)
+	}
+	data, err := service.Get("user_1")
+	if err != nil || data.IsPro || data.Subscription != nil {
+		t.Fatalf("Get for non-tester: %#v %v", data, err)
+	}
+
+	repo.emails["user_1"] = "tester@example.com"
+	if plan, _ := service.Plan("user_1"); !plan.IsPro {
+		t.Fatal("a tester's test subscription must give Pro in test mode")
+	}
+
+	service.cfg.LemonSqueezyTestMode = false
+	if plan, _ := service.Plan("user_1"); plan.IsPro {
+		t.Fatal("test subscriptions must never give Pro in live mode")
+	}
+	repo.subscriptions[0].TestMode = false
+	if plan, _ := service.Plan("user_1"); !plan.IsPro {
+		t.Fatal("a live subscription must give Pro")
 	}
 }

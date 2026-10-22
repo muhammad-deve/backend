@@ -29,6 +29,12 @@ var (
 	ErrWebhookStoreMismatch    = errors.New("webhook belongs to a different Lemon Squeezy store")
 	ErrWebhookUserNotFound     = errors.New("webhook could not be matched to a GoPort user")
 	ErrProRequired             = errors.New("this feature requires an active GoPort Pro subscription")
+	// ErrUpgradesClosed is returned in Lemon Squeezy test mode to accounts
+	// outside LEMON_SQUEEZY_TEST_EMAILS.
+	ErrUpgradesClosed = errors.New("Pro upgrades aren't open yet")
+	// ErrWebhookIgnored is returned for a test-mode event about an account
+	// outside LEMON_SQUEEZY_TEST_EMAILS. Nothing is stored.
+	ErrWebhookIgnored = errors.New("test-mode webhook for an account that may not test billing")
 )
 
 type BillingI interface {
@@ -58,7 +64,7 @@ func NewBillingService(cfg *config.Config, repo repository.BillingI) BillingI {
 }
 
 func (s *billingService) Plan(userID string) (model.PlanLimits, error) {
-	subscriptions, err := s.repo.ListSubscriptions(userID)
+	subscriptions, err := s.listUsableSubscriptions(userID)
 	if err != nil {
 		return model.PlanLimits{}, err
 	}
@@ -77,6 +83,10 @@ func (s *billingService) CreateCheckout(ctx context.Context, user *core.Record, 
 	variantID, ok := s.variantForPlan(plan)
 	if !ok {
 		return nil, ErrInvalidBillingPlan
+	}
+	// Test checkouts take test cards, so only listed testers may use them.
+	if s.cfg.LemonSqueezyTestMode && !s.isTester(user.Email()) {
+		return nil, ErrUpgradesClosed
 	}
 	if !s.apiConfigured() || variantID == "" {
 		return nil, ErrBillingNotConfigured
@@ -110,7 +120,7 @@ func (s *billingService) ChangeSubscriptionPlan(ctx context.Context, userID, pla
 	if !s.apiConfigured() {
 		return ErrBillingNotConfigured
 	}
-	subscriptions, err := s.repo.ListSubscriptions(userID)
+	subscriptions, err := s.listUsableSubscriptions(userID)
 	if err != nil {
 		return err
 	}
@@ -136,7 +146,7 @@ func (s *billingService) CancelSubscription(ctx context.Context, userID string) 
 	if !s.apiConfigured() {
 		return ErrBillingNotConfigured
 	}
-	subscriptions, err := s.repo.ListSubscriptions(userID)
+	subscriptions, err := s.listUsableSubscriptions(userID)
 	if err != nil {
 		return err
 	}
@@ -205,7 +215,11 @@ func (s *billingService) trialConsumed(subscriptions []model.BillingSubscription
 }
 
 func (s *billingService) Get(userID string) (*model.BillingData, error) {
-	subscriptions, err := s.repo.ListSubscriptions(userID)
+	allSubscriptions, err := s.repo.ListSubscriptions(userID)
+	if err != nil {
+		return nil, err
+	}
+	subscriptions, err := s.usableSubscriptions(userID, allSubscriptions)
 	if err != nil {
 		return nil, err
 	}
@@ -235,7 +249,7 @@ func (s *billingService) Get(userID string) (*model.BillingData, error) {
 		AvailablePlans:     availablePlans,
 		Plan:               limits,
 		Transactions:       make([]model.BillingTransaction, 0, len(transactions)),
-		TrialUsed:          s.trialConsumed(subscriptions),
+		TrialUsed:          s.trialConsumed(allSubscriptions),
 	}
 
 	selected := s.preferredSubscription(subscriptions)
@@ -326,6 +340,73 @@ func (s *billingService) planForVariant(variantID string) string {
 		}
 	}
 	return ""
+}
+
+// isTester reports whether email is listed in LEMON_SQUEEZY_TEST_EMAILS.
+func (s *billingService) isTester(email string) bool {
+	email = strings.ToLower(strings.TrimSpace(email))
+	if email == "" {
+		return false
+	}
+	for _, listed := range strings.Split(s.cfg.LemonSqueezyTestEmails, ",") {
+		if strings.ToLower(strings.TrimSpace(listed)) == email {
+			return true
+		}
+	}
+	return false
+}
+
+// testBillingAllowed reports whether a test-mode subscription or payment may
+// count for the account: only in test mode, and only for listed testers.
+func (s *billingService) testBillingAllowed(userID string) (bool, error) {
+	if !s.cfg.LemonSqueezyTestMode {
+		return false, nil
+	}
+	email, err := s.repo.UserEmail(userID)
+	if err != nil {
+		if isRecordNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return s.isTester(email), nil
+}
+
+func (s *billingService) listUsableSubscriptions(userID string) ([]model.BillingSubscriptionRecord, error) {
+	subscriptions, err := s.repo.ListSubscriptions(userID)
+	if err != nil {
+		return nil, err
+	}
+	return s.usableSubscriptions(userID, subscriptions)
+}
+
+// usableSubscriptions drops test-mode subscriptions that must not give Pro:
+// all of them in live mode, and those of non-testers in test mode.
+func (s *billingService) usableSubscriptions(userID string, subscriptions []model.BillingSubscriptionRecord) ([]model.BillingSubscriptionRecord, error) {
+	hasTest := false
+	for _, subscription := range subscriptions {
+		if subscription.TestMode {
+			hasTest = true
+			break
+		}
+	}
+	if !hasTest {
+		return subscriptions, nil
+	}
+	allowed, err := s.testBillingAllowed(userID)
+	if err != nil {
+		return nil, err
+	}
+	if allowed {
+		return subscriptions, nil
+	}
+	usable := make([]model.BillingSubscriptionRecord, 0, len(subscriptions))
+	for _, subscription := range subscriptions {
+		if !subscription.TestMode {
+			usable = append(usable, subscription)
+		}
+	}
+	return usable, nil
 }
 
 func (s *billingService) subscriptionGrantsPro(subscription model.BillingSubscriptionRecord, now time.Time) bool {

@@ -24,11 +24,13 @@ type Config struct {
 	LemonSqueezyProYearlyVariantID  string `env:"LEMON_SQUEEZY_PRO_YEARLY_VARIANT_ID"`
 	LemonSqueezyWebhookSecret       string `env:"LEMON_SQUEEZY_WEBHOOK_SECRET"`
 	LemonSqueezyTestMode            bool   `env:"LEMON_SQUEEZY_TEST_MODE" env-default:"true"`
-	LemonSqueezyAPIURL              string `env:"LEMON_SQUEEZY_API_URL" env-default:"https://api.lemonsqueezy.com/v1"`
-	LemonSqueezyMonthlyAmountCents  int64  `env:"LEMON_SQUEEZY_MONTHLY_AMOUNT_CENTS" env-default:"299"`
-	LemonSqueezyYearlyAmountCents   int64  `env:"LEMON_SQUEEZY_YEARLY_AMOUNT_CENTS" env-default:"1999"`
-	ShareStorageDir                 string `env:"SHARE_STORAGE_DIR" env-default:"./pb_data/shares"`
-	ShareSigningKey                 string `env:"SHARE_SIGNING_KEY"`
+	// In test mode only these accounts (comma-separated emails) may upgrade.
+	LemonSqueezyTestEmails         string `env:"LEMON_SQUEEZY_TEST_EMAILS"`
+	LemonSqueezyAPIURL             string `env:"LEMON_SQUEEZY_API_URL" env-default:"https://api.lemonsqueezy.com/v1"`
+	LemonSqueezyMonthlyAmountCents int64  `env:"LEMON_SQUEEZY_MONTHLY_AMOUNT_CENTS" env-default:"299"`
+	LemonSqueezyYearlyAmountCents  int64  `env:"LEMON_SQUEEZY_YEARLY_AMOUNT_CENTS" env-default:"1999"`
+	ShareStorageDir                string `env:"SHARE_STORAGE_DIR" env-default:"./pb_data/shares"`
+	ShareSigningKey                string `env:"SHARE_SIGNING_KEY"`
 	// Cloud file sharing. Free and Pro have separate limits; the total cap
 	// protects the shared server disk however many accounts exist.
 	ShareTotalStorageBytes         int64 `env:"SHARE_TOTAL_STORAGE_BYTES" env-default:"21474836480"`
@@ -82,6 +84,9 @@ func GetConfig() *Config {
 		}
 		if instance.LemonSqueezyKey == "" || instance.LemonSqueezyStoreID == "" || instance.LemonSqueezyWebhookSecret == "" {
 			log.Print("WARNING: Lemon Squeezy billing is not fully configured")
+		}
+		if instance.LemonSqueezyTestMode {
+			log.Print("WARNING: ==== LEMON_SQUEEZY_TEST_MODE is ON. Checkouts use Lemon Squeezy test mode and only LEMON_SQUEEZY_TEST_EMAILS can upgrade to Pro. Set LEMON_SQUEEZY_TEST_MODE=false to take real payments. ====")
 		}
 		if len(instance.ShareSigningKey) < 32 {
 			log.Print("WARNING: SHARE_SIGNING_KEY should contain at least 32 random bytes before enabling cloud sharing")

@@ -182,6 +182,14 @@ func (r *Billing) FindUserIDByEmail(email string) (string, error) {
 	return record.Id, nil
 }
 
+func (r *Billing) UserEmail(userID string) (string, error) {
+	record, err := r.app.FindRecordById(model.UsersCollection, userID)
+	if err != nil {
+		return "", err
+	}
+	return record.Email(), nil
+}
+
 func setSubscriptionFields(record *core.Record, subscription model.BillingSubscriptionRecord) {
 	record.Set("user", subscription.UserID)
 	record.Set("external_id", subscription.ExternalID)
