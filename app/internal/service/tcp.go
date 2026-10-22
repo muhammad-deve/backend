@@ -80,8 +80,33 @@ func tunnelSessionConfig() *yamux.Config {
 	cfg := yamux.DefaultConfig()
 	cfg.KeepAliveInterval = 20 * time.Second
 	cfg.ConnectionWriteTimeout = 30 * time.Second
+	// A stream the server closed is reset if the CLI hasn't closed its end a
+	// minute later, instead of holding its buffer for the default 5 minutes.
+	cfg.StreamCloseTimeout = time.Minute
 	cfg.LogOutput = log.Writer()
 	return cfg
+}
+
+// maxCLIOpenedStreams is how many streams a CLI may open before its session is
+// closed. Released CLIs never open one; the server opens a stream per request.
+const maxCLIOpenedStreams = 16
+
+// refuseCLIStreams accepts and closes streams the CLI opens, so they can't pile
+// up in yamux's accept backlog, and ends a session that keeps opening them.
+func refuseCLIStreams(session *yamux.Session, subdomain string) {
+	defer recoverPanic("tunnel stream refusal")
+	for opened := 1; ; opened++ {
+		stream, err := session.Accept()
+		if err != nil {
+			return
+		}
+		_ = stream.Close()
+		if opened >= maxCLIOpenedStreams {
+			log.Printf("tunnel %s: CLI opened %d streams of its own; closing the session", subdomain, opened)
+			_ = session.Close()
+			return
+		}
+	}
 }
 
 type tunnelRegistrationResponse struct {
@@ -129,6 +154,7 @@ type tcpService struct {
 	handshakes *handshakeLimiter
 	// hopSecret is TUNNEL_HOP_SECRET; see tunnelHopHeader.
 	hopSecret string
+	proxy     proxyLimits
 }
 
 // onlineDelta is connected time to add to one tunnel and its owner.
@@ -197,6 +223,7 @@ func NewTCPService(app core.App, tunnels repository.TunnelsI, usage repository.U
 		geo:           geoip.Open(""),
 		handshakes:    newHandshakeLimiter(maxPendingHandshakes, maxPendingHandshakesByIP),
 		hopSecret:     strings.TrimSpace(os.Getenv("TUNNEL_HOP_SECRET")),
+		proxy:         defaultProxyLimits(),
 	}
 }
 
@@ -420,6 +447,7 @@ func (t *tcpService) handleConnection(conn net.Conn, ip string) {
 		return
 	}
 	defer session.Close()
+	go refuseCLIStreams(session, subdomain)
 
 	t.mu.Lock()
 	t.sessions[subdomain] = session
@@ -1066,13 +1094,6 @@ func (t *tcpService) pendingBytesForUser(userID string, from time.Time) int64 {
 		}
 	}
 	return total
-}
-
-func maxInt64(a, b int64) int64 {
-	if a > b {
-		return a
-	}
-	return b
 }
 
 // recordTraffic keeps the completion timestamp with each delta so retries and
