@@ -1096,9 +1096,15 @@ func (t *tcpService) pendingBytesForUser(userID string, from time.Time) int64 {
 	return total
 }
 
-// recordTraffic keeps the completion timestamp with each delta so retries and
-// flushes around a bucket boundary cannot move traffic into the wrong period.
+// recordTraffic counts one finished request and the bytes it moved.
 func (t *tcpService) recordTraffic(tunnelID, subdomain, userID string, bytesTransferred int64) {
+	t.addTraffic(tunnelID, subdomain, userID, bytesTransferred, 1)
+}
+
+// addTraffic keeps the completion timestamp with each delta so retries and
+// flushes around a bucket boundary cannot move traffic into the wrong period.
+// Long transfers add their bytes as they go, with requests set to 0.
+func (t *tcpService) addTraffic(tunnelID, subdomain, userID string, bytesTransferred, requests int64) {
 	if tunnelID == "" || subdomain == "" || userID == "" {
 		return
 	}
@@ -1116,7 +1122,7 @@ func (t *tcpService) recordTraffic(tunnelID, subdomain, userID string, bytesTran
 		stat = &tunnelStat{}
 		t.stats[key] = stat
 	}
-	stat.requests++
+	stat.requests += requests
 	if bytesTransferred > 0 {
 		stat.bytes += bytesTransferred
 	}

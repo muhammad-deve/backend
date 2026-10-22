@@ -41,6 +41,10 @@ type proxyLimits struct {
 	// upgradeIdleTimeout ends a WebSocket after this long with no bytes
 	// either way, the same as nginx's proxy_read_timeout for tunnel hosts.
 	upgradeIdleTimeout time.Duration
+	// A response or WebSocket that is still moving records its traffic and
+	// checks the monthly quota every quotaCheckBytes or quotaCheckInterval.
+	quotaCheckBytes    int64
+	quotaCheckInterval time.Duration
 }
 
 func defaultProxyLimits() proxyLimits {
@@ -50,6 +54,8 @@ func defaultProxyLimits() proxyLimits {
 		responseTimeout:    5 * time.Minute,
 		idleTimeout:        10 * time.Minute,
 		upgradeIdleTimeout: time.Hour,
+		quotaCheckBytes:    4 << 20,
+		quotaCheckInterval: 30 * time.Second,
 	}
 }
 
@@ -138,10 +144,10 @@ func (t *tcpService) serveTunnel(w http.ResponseWriter, r *http.Request, subdoma
 		rc:        http.NewResponseController(w),
 		limits:    t.proxy,
 		stream:    newTunnelStream(stream, t.proxy.idleTimeout),
+		meter:     t.newMeter(tunnelID, subdomain, userID),
 		subdomain: subdomain,
-		tunnelID:  tunnelID,
-		userID:    userID,
 	}
+	defer x.meter.finish()
 	defer x.stream.Close()
 	// A visitor who goes away ends the exchange at once instead of leaving
 	// the stream and this goroutine waiting on the CLI.
@@ -165,9 +171,8 @@ type tunnelExchange struct {
 	rc        *http.ResponseController
 	limits    proxyLimits
 	stream    *tunnelStream
+	meter     *trafficMeter
 	subdomain string
-	tunnelID  string
-	userID    string
 }
 
 func (x *tunnelExchange) serveHTTP() {
@@ -179,6 +184,9 @@ func (x *tunnelExchange) serveHTTP() {
 	// here, and per response write in writeResponse.
 	if body != nil {
 		body.onRead = x.extendReadDeadline
+		// Runs after the writer below has finished, also when the exchange
+		// fails.
+		defer func() { x.meter.add(body.read.Load()) }()
 	} else {
 		_ = x.rc.SetReadDeadline(time.Time{})
 	}
@@ -228,13 +236,7 @@ func (x *tunnelExchange) serveHTTP() {
 		return
 	}
 	defer resp.Body.Close()
-
-	written := x.writeResponse(resp)
-	var sent int64
-	if body != nil {
-		sent = body.read.Load()
-	}
-	x.t.recordTraffic(x.tunnelID, x.subdomain, x.userID, written+sent)
+	x.writeResponse(resp)
 }
 
 // readResponse reads the CLI's response head, capped at maxResponseHead
@@ -253,10 +255,11 @@ func (x *tunnelExchange) readResponse(outReq *http.Request) (*http.Response, *bu
 	return resp, head, nil
 }
 
-// writeResponse sends resp to the visitor and returns the body bytes written.
-// Streamed responses (no Content-Length, chunked, or SSE) are flushed after
-// every read so events reach the browser as they happen.
-func (x *tunnelExchange) writeResponse(resp *http.Response) int64 {
+// writeResponse sends resp to the visitor. Streamed responses (no
+// Content-Length, chunked, or SSE) are flushed after every read so events
+// reach the browser as they happen. A response still running when the
+// account's monthly quota runs out is cut off.
+func (x *tunnelExchange) writeResponse(resp *http.Response) {
 	copyResponseHeaders(x.w.Header(), resp.Header, x.t.domain)
 	x.extendWriteDeadline()
 	x.w.WriteHeader(resp.StatusCode)
@@ -265,25 +268,32 @@ func (x *tunnelExchange) writeResponse(resp *http.Response) int64 {
 	if flush {
 		_ = x.rc.Flush()
 	}
-	var written int64
 	buf := make([]byte, 32<<10)
 	for {
 		n, readErr := resp.Body.Read(buf)
 		if n > 0 {
 			x.extendWriteDeadline()
 			if _, err := x.w.Write(buf[:n]); err != nil {
-				return written
+				return
 			}
-			written += int64(n)
 			if flush {
 				_ = x.rc.Flush()
 			}
+			if x.meter.add(int64(n)) && x.meter.overQuota() {
+				x.stream.abort()
+				// Drops the connection, so the visitor can't take the cut
+				// response for a complete one.
+				panic(http.ErrAbortHandler)
+			}
+		}
+		if readErr == io.EOF {
+			return
 		}
 		if readErr != nil {
-			if readErr != io.EOF && x.r.Context().Err() == nil && !errors.Is(readErr, errStreamAborted) {
+			if x.r.Context().Err() == nil && !errors.Is(readErr, errStreamAborted) {
 				log.Printf("tunnel %s: error copying response body: %v", x.subdomain, readErr)
 			}
-			return written
+			panic(http.ErrAbortHandler)
 		}
 	}
 }
@@ -317,8 +327,7 @@ func (x *tunnelExchange) serveUpgrade() {
 	}
 	if resp.StatusCode != http.StatusSwitchingProtocols {
 		defer resp.Body.Close()
-		written := x.writeResponse(resp)
-		x.t.recordTraffic(x.tunnelID, x.subdomain, x.userID, written)
+		x.writeResponse(resp)
 		return
 	}
 
@@ -341,16 +350,14 @@ func (x *tunnelExchange) serveUpgrade() {
 	// The relay watches idleness itself, across both directions.
 	x.stream.setReadTimeout(0)
 	x.stream.setWriteTimeout(0)
-	// An upgraded connection is counted once, when it closes, together with
-	// everything relayed over it.
-	moved := relayUpgraded(clientConn, clientSide.Reader, x.stream, tunnelSide, x.limits.upgradeIdleTimeout)
-	x.t.recordTraffic(x.tunnelID, x.subdomain, x.userID, moved)
+	// Bytes are recorded and the quota checked while the connection runs.
+	relayUpgraded(clientConn, clientSide.Reader, x.stream, tunnelSide, x.limits.upgradeIdleTimeout, x.meter)
 }
 
-// relayUpgraded copies both ways until either side ends or nothing moves for
-// idle, and returns the bytes relayed.
-func relayUpgraded(client net.Conn, fromClient io.Reader, stream *tunnelStream, fromTunnel io.Reader, idle time.Duration) int64 {
-	var moved, lastActive atomic.Int64
+// relayUpgraded copies both ways until either side ends, nothing moves for
+// idle, or the account runs out of monthly traffic.
+func relayUpgraded(client net.Conn, fromClient io.Reader, stream *tunnelStream, fromTunnel io.Reader, idle time.Duration, meter *trafficMeter) {
+	var lastActive atomic.Int64
 	lastActive.Store(time.Now().UnixNano())
 	var once sync.Once
 	stop := func() {
@@ -369,8 +376,10 @@ func relayUpgraded(client net.Conn, fromClient io.Reader, stream *tunnelStream, 
 				if _, werr := dst.Write(buf[:n]); werr != nil {
 					return
 				}
-				moved.Add(int64(n))
 				lastActive.Store(time.Now().UnixNano())
+				if meter.add(int64(n)) && meter.overQuota() {
+					return
+				}
 			}
 			if err != nil {
 				return
@@ -386,14 +395,16 @@ func relayUpgraded(client net.Conn, fromClient io.Reader, stream *tunnelStream, 
 	done := make(chan struct{})
 	go func() {
 		defer recoverPanic("tunnel upgrade watchdog")
-		ticker := time.NewTicker(idleCheckInterval(idle))
+		ticker := time.NewTicker(min(idleCheckInterval(idle), meter.interval))
 		defer ticker.Stop()
 		for {
 			select {
 			case <-done:
 				return
 			case now := <-ticker.C:
-				if now.Sub(time.Unix(0, lastActive.Load())) >= idle {
+				// The quota is checked even when this connection is quiet,
+				// since other tunnels of the account use it up too.
+				if now.Sub(time.Unix(0, lastActive.Load())) >= idle || (meter.due() && meter.overQuota()) {
 					stop()
 					return
 				}
@@ -402,7 +413,6 @@ func relayUpgraded(client net.Conn, fromClient io.Reader, stream *tunnelStream, 
 	}()
 	wg.Wait()
 	close(done)
-	return moved.Load()
 }
 
 // idleCheckInterval is how often an upgraded connection is checked for
