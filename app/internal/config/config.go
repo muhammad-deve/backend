@@ -15,6 +15,7 @@ type Config struct {
 	MailFrom                        string `env:"MAIL_FROM" env-default:"GoPort <noreply@contact.goport.uz>"`
 	AppName                         string `env:"APP_NAME" env-default:"GoPort"`
 	AppURL                          string `env:"APP_URL" env-default:"https://goport.uz"`
+	SupportEmail                    string `env:"SUPPORT_EMAIL" env-default:"support@contact.goport.uz"`
 	GoogleOAuthID                   string `env:"GOOGLE_OAUTH_ID"`
 	GoogleOAuthSecret               string `env:"GOOGLE_OAUTH_SECRET"`
 	LemonSqueezyKey                 string `env:"LEMON_SQUEEZY_KEY"`

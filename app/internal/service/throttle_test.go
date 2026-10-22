@@ -128,18 +128,18 @@ func TestCheckOTPCodeDeletesAfterTooManyWrongCodes(t *testing.T) {
 	otp := newTestOTP(t, app, user, user.Email(), "123456")
 	attempts := newOTPAttempts(maxWrongCodesPerOTP, time.Hour)
 
-	if _, err := checkOTPCode(app, attempts, otp.Id, "123456"); err != nil {
+	if _, err := checkOTPCode(app, attempts, otp.Id, "123456", nil); err != nil {
 		t.Fatalf("right code: %v", err)
 	}
 	for i := 0; i < maxWrongCodesPerOTP; i++ {
-		if _, err := checkOTPCode(app, attempts, otp.Id, "000000"); err == nil {
+		if _, err := checkOTPCode(app, attempts, otp.Id, "000000", nil); err == nil {
 			t.Fatalf("wrong code %d accepted", i+1)
 		}
 	}
 	if _, err := app.FindOTPById(otp.Id); err == nil {
 		t.Fatal("OTP must be deleted after too many wrong codes")
 	}
-	if _, err := checkOTPCode(app, attempts, otp.Id, "123456"); err == nil {
+	if _, err := checkOTPCode(app, attempts, otp.Id, "123456", nil); err == nil {
 		t.Fatal("right code must fail once the OTP is gone")
 	}
 }
@@ -153,7 +153,7 @@ func TestCheckOTPCodeRefusesWhenTriesAreUsed(t *testing.T) {
 		attempts.begin(otp.Id)
 	}
 
-	_, err := checkOTPCode(app, attempts, otp.Id, "123456")
+	_, err := checkOTPCode(app, attempts, otp.Id, "123456", nil)
 	if !errors.Is(err, ErrTooManyCodeAttempts) {
 		t.Fatalf("err = %v, want ErrTooManyCodeAttempts", err)
 	}

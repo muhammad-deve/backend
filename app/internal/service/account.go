@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pocketbase/pocketbase/core"
@@ -33,6 +34,17 @@ type accountService struct {
 	tokens   TokensI
 	limiter  *rateLimiter
 	attempts *otpAttempts
+
+	// pending maps an email-change OTP id to the address it was sent to, so
+	// only codes issued for an email change can confirm one.
+	pendingMu sync.Mutex
+	pending   map[string]pendingEmailChange
+}
+
+type pendingEmailChange struct {
+	userID string
+	email  string
+	at     time.Time
 }
 
 func NewAccountService(app core.App, email EmailI, tokens TokensI, attempts *otpAttempts) AccountI {
@@ -42,7 +54,33 @@ func NewAccountService(app core.App, email EmailI, tokens TokensI, attempts *otp
 		tokens:   tokens,
 		limiter:  newRateLimiter(time.Hour, 5, 60*time.Second),
 		attempts: attempts,
+		pending:  make(map[string]pendingEmailChange),
 	}
+}
+
+func (s *accountService) rememberChange(otpID, userID, email string) {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	now := time.Now()
+	for id, change := range s.pending {
+		if now.Sub(change.at) > model.OTPExpiry {
+			delete(s.pending, id)
+		}
+	}
+	s.pending[otpID] = pendingEmailChange{userID: userID, email: email, at: now}
+}
+
+func (s *accountService) pendingChange(otpID string) (pendingEmailChange, bool) {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	change, ok := s.pending[otpID]
+	return change, ok
+}
+
+func (s *accountService) forgetChange(otpID string) {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	delete(s.pending, otpID)
 }
 
 func (s *accountService) ReleasePending(user *core.Record, provider, providerID string) error {
@@ -93,24 +131,32 @@ func (s *accountService) RequestEmailChange(user *core.Record, req *model.Reques
 		}
 		return nil, err
 	}
+	s.rememberChange(otp.Id, user.Id, email)
 
 	return &model.SendOTPResponse{OtpID: otp.Id, Message: "Verification code sent"}, nil
 }
 
 func (s *accountService) ConfirmEmailChange(user *core.Record, req *model.ConfirmEmailChangeRequest) (*model.EmailChangeResponse, error) {
-	otp, err := checkOTPCode(s.app, s.attempts, req.OtpID, req.Code)
+	usersCollection, err := s.app.FindCollectionByNameOrId(model.UsersCollection)
+	if err != nil {
+		return nil, fmt.Errorf("users collection not found: %w", err)
+	}
+	// Only a code this user asked for an email change, sent to that new
+	// address, is accepted. Sign-up and reset codes go to the current address.
+	otp, err := checkOTPCode(s.app, s.attempts, req.OtpID, req.Code, func(otp *core.OTP) bool {
+		change, ok := s.pendingChange(otp.Id)
+		return ok &&
+			otp.CollectionRef() == usersCollection.Id &&
+			otp.RecordRef() == user.Id &&
+			change.userID == user.Id &&
+			sameEmail(otp.SentTo(), change.email) &&
+			!sameEmail(otp.SentTo(), user.Email())
+	})
 	if err != nil {
 		return nil, err
 	}
-	if otp.RecordRef() != user.Id {
-		return nil, fmt.Errorf("invalid or expired code")
-	}
 
 	newEmail := strings.ToLower(strings.TrimSpace(otp.SentTo()))
-	usersCollection, err := s.app.FindCollectionByNameOrId(model.UsersCollection)
-	if err != nil || otp.CollectionRef() != usersCollection.Id {
-		return nil, fmt.Errorf("invalid or expired code")
-	}
 	existing, lookupErr := s.app.FindAuthRecordByEmail(usersCollection, newEmail)
 	if lookupErr != nil && !errors.Is(lookupErr, sql.ErrNoRows) {
 		return nil, fmt.Errorf("failed to check email: %w", lookupErr)
@@ -119,13 +165,19 @@ func (s *accountService) ConfirmEmailChange(user *core.Record, req *model.Confir
 		return nil, ErrEmailTaken
 	}
 
+	oldEmail := user.Email()
 	user.SetEmail(newEmail)
 	user.SetVerified(true)
 	if err := s.app.Save(user); err != nil {
 		return nil, fmt.Errorf("failed to change email: %w", err)
 	}
+	s.forgetChange(otp.Id)
 	if delErr := s.app.Delete(otp); delErr != nil {
 		s.app.Logger().Error("failed to delete used email-change OTP", "error", delErr, "otpId", otp.Id)
+	}
+	// Tell the old address, in case the session was stolen.
+	if err := s.email.SendEmailChanged(oldEmail, user.GetString("name"), newEmail); err != nil {
+		s.app.Logger().Error("failed to send email-change notice", "error", err, "userId", user.Id)
 	}
 	token, err := user.NewAuthToken()
 	if err != nil {

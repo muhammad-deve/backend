@@ -56,6 +56,9 @@ func (h *Handler) VerifyOTPHandler(e *core.RequestEvent) error {
 
 	resp, err := h.service.OTP().VerifyOTP(req)
 	if err != nil {
+		if errors.Is(err, service.ErrEmailRegistered) {
+			return h.NewErrorResponse(e, http.StatusConflict, "This email is already registered. Please log in instead.")
+		}
 		return h.NewErrorResponse(e, http.StatusBadRequest, err.Error())
 	}
 

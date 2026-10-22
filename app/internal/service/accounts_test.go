@@ -41,6 +41,13 @@ func (r *recordingEmail) SendOTP(to, name, code string) error {
 	return nil
 }
 
+func (r *recordingEmail) SendEmailChanged(to, name, newEmail string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.sent = append(r.sent, sentEmail{kind: "changed", to: to, name: name, code: newEmail})
+	return nil
+}
+
 func (r *recordingEmail) last() sentEmail {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -148,5 +155,83 @@ func TestReleasePendingKeepsCurrentProvider(t *testing.T) {
 	}
 	if len(userTokens(t, f.app, user.Id)) != 1 {
 		t.Fatal("a default token must exist after release")
+	}
+}
+
+func TestResetPasswordRefusesCodesForOtherPurposes(t *testing.T) {
+	f := newAccountsFixture(t)
+	user := newTestUser(t, f.app, "dev@example.com", true)
+	pending := newTestUser(t, f.app, "new@example.com", false)
+
+	// An email-change code goes to the new address, not the account's.
+	change := newTestOTP(t, f.app, user, "attacker@example.com", "111111")
+	if _, err := f.otp.ResetPassword(&model.ResetPasswordRequest{OtpID: change.Id, Code: "111111", Password: "n3w-password"}); err == nil {
+		t.Fatal("an email-change code must not reset the password")
+	}
+	// A sign-up code belongs to an unverified account.
+	signup := newTestOTP(t, f.app, pending, pending.Email(), "222222")
+	if _, err := f.otp.ResetPassword(&model.ResetPasswordRequest{OtpID: signup.Id, Code: "222222", Password: "n3w-password"}); err == nil {
+		t.Fatal("a sign-up code must not reset a password")
+	}
+
+	sent, err := f.otp.ForgotPassword(&model.ForgotPasswordRequest{Email: "dev@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.otp.ResetPassword(&model.ResetPasswordRequest{OtpID: sent.OtpID, Code: f.email.last().code, Password: "n3w-password"}); err != nil {
+		t.Fatalf("reset code: %v", err)
+	}
+	user, _ = f.app.FindRecordById(model.UsersCollection, user.Id)
+	if !user.ValidatePassword("n3w-password") {
+		t.Fatal("password must change")
+	}
+}
+
+func TestVerifyOTPRefusesEmailChangeCode(t *testing.T) {
+	f := newAccountsFixture(t)
+	user := newTestUser(t, f.app, "dev@example.com", false)
+	change := newTestOTP(t, f.app, user, "other@example.com", "111111")
+	if _, err := f.otp.VerifyOTP(&model.VerifyOTPRequest{OtpID: change.Id, Code: "111111"}); err == nil {
+		t.Fatal("a code sent to another address must not verify a sign-up")
+	}
+}
+
+func TestConfirmEmailChangeNeedsAnEmailChangeCode(t *testing.T) {
+	f := newAccountsFixture(t)
+	user := newTestUser(t, f.app, "dev@example.com", true)
+
+	// A reset code for the current address must not confirm a change.
+	reset, err := f.otp.ForgotPassword(&model.ForgotPasswordRequest{Email: "dev@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.account.ConfirmEmailChange(user, &model.ConfirmEmailChangeRequest{OtpID: reset.OtpID, Code: f.email.last().code}); err == nil {
+		t.Fatal("a reset code must not confirm an email change")
+	}
+	// A code to another address that wasn't issued by an email change.
+	stray := newTestOTP(t, f.app, user, "stray@example.com", "333333")
+	if _, err := f.account.ConfirmEmailChange(user, &model.ConfirmEmailChangeRequest{OtpID: stray.Id, Code: "333333"}); err == nil {
+		t.Fatal("a code not issued for an email change must be refused")
+	}
+
+	sent, err := f.account.RequestEmailChange(user, &model.RequestEmailChangeRequest{Email: "new@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := f.email.last().code
+	other := newTestUser(t, f.app, "other@example.com", true)
+	if _, err := f.account.ConfirmEmailChange(other, &model.ConfirmEmailChangeRequest{OtpID: sent.OtpID, Code: code}); err == nil {
+		t.Fatal("another account must not use the code")
+	}
+	resp, err := f.account.ConfirmEmailChange(user, &model.ConfirmEmailChangeRequest{OtpID: sent.OtpID, Code: code})
+	if err != nil {
+		t.Fatalf("ConfirmEmailChange: %v", err)
+	}
+	if resp.Email != "new@example.com" {
+		t.Fatalf("email = %q", resp.Email)
+	}
+	notice := f.email.last()
+	if notice.kind != "changed" || notice.to != "dev@example.com" || notice.code != "new@example.com" {
+		t.Fatalf("old address must be told about the change, got %+v", notice)
 	}
 }
