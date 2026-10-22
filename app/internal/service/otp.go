@@ -60,14 +60,16 @@ type OTPI interface {
 type otpService struct {
 	app      core.App
 	email    EmailI
+	tokens   TokensI
 	limiter  *rateLimiter
 	attempts *otpAttempts
 }
 
-func NewOTPService(app core.App, email EmailI, attempts *otpAttempts) OTPI {
+func NewOTPService(app core.App, email EmailI, tokens TokensI, attempts *otpAttempts) OTPI {
 	return &otpService{
-		app:   app,
-		email: email,
+		app:    app,
+		email:  email,
+		tokens: tokens,
 		// Max 5 codes per email per hour, with a 60s cooldown between sends.
 		limiter:  newRateLimiter(time.Hour, 5, 60*time.Second),
 		attempts: attempts,
@@ -205,7 +207,13 @@ func (s *otpService) CompleteRegistration(req *model.CompleteRegistrationRequest
 	if user.Verified() {
 		return nil, ErrEmailRegistered
 	}
+	// The account may have existed before this sign-up, so drop anything
+	// someone else attached to it and end their sessions.
+	if err := releasePendingAccount(s.app, s.tokens, user, "", ""); err != nil {
+		return nil, fmt.Errorf("failed to prepare account: %w", err)
+	}
 	user.SetPassword(req.Password)
+	user.RefreshTokenKey()
 	user.SetVerified(true)
 	if err := s.app.Save(user); err != nil {
 		return nil, fmt.Errorf("failed to complete registration: %w", err)

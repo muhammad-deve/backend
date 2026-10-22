@@ -22,22 +22,31 @@ type AccountI interface {
 	RequestEmailChange(user *core.Record, req *model.RequestEmailChangeRequest) (*model.SendOTPResponse, error)
 	ConfirmEmailChange(user *core.Record, req *model.ConfirmEmailChangeRequest) (*model.EmailChangeResponse, error)
 	ChangePassword(user *core.Record, req *model.ChangePasswordRequest) (*model.ChangePasswordResponse, error)
+	// ReleasePending clears what others may have attached to an unverified
+	// account before its owner signs in with a provider.
+	ReleasePending(user *core.Record, provider, providerID string) error
 }
 
 type accountService struct {
 	app      core.App
 	email    EmailI
+	tokens   TokensI
 	limiter  *rateLimiter
 	attempts *otpAttempts
 }
 
-func NewAccountService(app core.App, email EmailI, attempts *otpAttempts) AccountI {
+func NewAccountService(app core.App, email EmailI, tokens TokensI, attempts *otpAttempts) AccountI {
 	return &accountService{
 		app:      app,
 		email:    email,
+		tokens:   tokens,
 		limiter:  newRateLimiter(time.Hour, 5, 60*time.Second),
 		attempts: attempts,
 	}
+}
+
+func (s *accountService) ReleasePending(user *core.Record, provider, providerID string) error {
+	return releasePendingAccount(s.app, s.tokens, user, provider, providerID)
 }
 
 func (s *accountService) RequestEmailChange(user *core.Record, req *model.RequestEmailChangeRequest) (*model.SendOTPResponse, error) {

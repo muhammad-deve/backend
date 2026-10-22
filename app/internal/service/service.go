@@ -64,8 +64,8 @@ func NewService(app *pocketbase.PocketBase, cfg *config.Config) I {
 	return &service{
 		AuthorizationI:   NewAuthorizationS(app),
 		tcpService:       NewTCPService(app, repositories.Tunnels(), repositories.Usage(), billingService, tokensService),
-		otpService:       NewOTPService(app, emailService, attempts),
-		accountService:   NewAccountService(app, emailService, attempts),
+		otpService:       NewOTPService(app, emailService, tokensService, attempts),
+		accountService:   NewAccountService(app, emailService, tokensService, attempts),
 		emailService:     emailService,
 		dashboardService: NewDashboardService(tokensService, repositories.Tunnels(), repositories.Usage(), billingService),
 		usageService:     usageService,
