@@ -437,13 +437,27 @@ func (s *billingService) usableSubscriptions(userID string, subscriptions []mode
 	return usable, nil
 }
 
+// unpaidGrace is how long an unpaid or paused subscription keeps Pro after
+// its paid period ends.
+const unpaidGrace = 3 * 24 * time.Hour
+
 func (s *billingService) subscriptionGrantsPro(subscription model.BillingSubscriptionRecord, now time.Time) bool {
 	if subscription.PlanKey != model.PlanProMonthly && subscription.PlanKey != model.PlanProYearly {
 		return false
 	}
 	switch subscription.Status {
-	case "on_trial", "active", "paused", "past_due", "unpaid":
+	case "on_trial", "active", "past_due":
+		// past_due is Lemon Squeezy's retry window; it ends as unpaid or
+		// expired.
 		return true
+	case "unpaid", "paused":
+		// No payment is coming in. Keep Pro to the end of the paid period
+		// plus a short grace, then fall back to Free.
+		periodEnd := subscription.RenewsAt
+		if periodEnd.IsZero() {
+			periodEnd = subscription.EndsAt
+		}
+		return !periodEnd.IsZero() && now.Before(periodEnd.Add(unpaidGrace))
 	case "cancelled":
 		return !subscription.EndsAt.IsZero() && now.Before(subscription.EndsAt)
 	default:

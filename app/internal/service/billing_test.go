@@ -38,18 +38,25 @@ func TestSubscriptionGrantsPro(t *testing.T) {
 	now := time.Date(2026, time.September, 12, 12, 0, 0, 0, time.UTC)
 	service := &billingService{now: func() time.Time { return now }}
 
+	day := 24 * time.Hour
 	tests := []struct {
 		name         string
 		status       string
 		plan         string
+		renewsAt     time.Time
 		endsAt       time.Time
 		wantEntitled bool
 	}{
 		{name: "active", status: "active", plan: model.PlanProMonthly, wantEntitled: true},
 		{name: "trial", status: "on_trial", plan: model.PlanProMonthly, wantEntitled: true},
-		{name: "paused", status: "paused", plan: model.PlanProMonthly, wantEntitled: true},
 		{name: "past due during dunning", status: "past_due", plan: model.PlanProYearly, wantEntitled: true},
-		{name: "unpaid during dunning", status: "unpaid", plan: model.PlanProYearly, wantEntitled: true},
+		{name: "paused within the paid period", status: "paused", plan: model.PlanProMonthly, renewsAt: now.Add(5 * day), wantEntitled: true},
+		{name: "paused within the grace", status: "paused", plan: model.PlanProMonthly, renewsAt: now.Add(-2 * day), wantEntitled: true},
+		{name: "paused after the grace", status: "paused", plan: model.PlanProMonthly, renewsAt: now.Add(-3*day - time.Second)},
+		{name: "paused without dates", status: "paused", plan: model.PlanProMonthly},
+		{name: "unpaid within the grace", status: "unpaid", plan: model.PlanProYearly, renewsAt: now.Add(-2 * day), wantEntitled: true},
+		{name: "unpaid after the grace", status: "unpaid", plan: model.PlanProYearly, renewsAt: now.Add(-4 * day)},
+		{name: "unpaid uses ends_at without renews_at", status: "unpaid", plan: model.PlanProYearly, endsAt: now.Add(-day), wantEntitled: true},
 		{name: "cancelled grace period", status: "cancelled", plan: model.PlanProMonthly, endsAt: now.Add(time.Hour), wantEntitled: true},
 		{name: "cancelled at end time", status: "cancelled", plan: model.PlanProMonthly, endsAt: now},
 		{name: "cancelled and ended", status: "cancelled", plan: model.PlanProMonthly, endsAt: now.Add(-time.Second)},
@@ -60,9 +67,10 @@ func TestSubscriptionGrantsPro(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			got := service.subscriptionGrantsPro(model.BillingSubscriptionRecord{
-				Status:  test.status,
-				PlanKey: test.plan,
-				EndsAt:  test.endsAt,
+				Status:   test.status,
+				PlanKey:  test.plan,
+				RenewsAt: test.renewsAt,
+				EndsAt:   test.endsAt,
 			}, now)
 			if got != test.wantEntitled {
 				t.Fatalf("subscriptionGrantsPro() = %v, want %v", got, test.wantEntitled)
