@@ -139,7 +139,7 @@ func (s *billingService) processSubscriptionWebhook(externalID, customUserID str
 	if err != nil {
 		return err
 	}
-	if err := s.checkTestModeUser(userID, attributes.TestMode); err != nil {
+	if err := s.checkTestModeUser(userID, attributes.TestMode, externalID, ""); err != nil {
 		return err
 	}
 	return s.repo.UpsertSubscription(model.BillingSubscriptionRecord{
@@ -174,7 +174,7 @@ func (s *billingService) processInvoiceWebhook(externalID, customUserID string, 
 	if err != nil {
 		return err
 	}
-	if err := s.checkTestModeUser(userID, attributes.TestMode); err != nil {
+	if err := s.checkTestModeUser(userID, attributes.TestMode, subscriptionID, ""); err != nil {
 		return err
 	}
 
@@ -217,7 +217,7 @@ func (s *billingService) processOrderWebhook(externalID, customUserID string, ra
 	if err != nil {
 		return err
 	}
-	if err := s.checkTestModeUser(userID, attributes.TestMode); err != nil {
+	if err := s.checkTestModeUser(userID, attributes.TestMode, "", externalID); err != nil {
 		return err
 	}
 
@@ -280,8 +280,10 @@ func (s *billingService) resolveWebhookUser(customUserID, externalSubscriptionID
 }
 
 // checkTestModeUser refuses a test-mode event for an account that may not
-// test billing, however it was matched (custom user id or email).
-func (s *billingService) checkTestModeUser(userID string, testMode bool) error {
+// test billing, however it was matched (custom user id or email). Events
+// about a subscription stored before testModeCutoff still go through, so
+// that row keeps up with renewals, cancellations and refunds.
+func (s *billingService) checkTestModeUser(userID string, testMode bool, subscriptionID, orderID string) error {
 	if !testMode {
 		return nil
 	}
@@ -289,10 +291,43 @@ func (s *billingService) checkTestModeUser(userID string, testMode bool) error {
 	if err != nil {
 		return err
 	}
-	if !allowed {
+	if allowed {
+		return nil
+	}
+	known, err := s.knownBeforeCutoff(userID, subscriptionID, orderID)
+	if err != nil {
+		return err
+	}
+	if !known {
 		return fmt.Errorf("%w (user %s)", ErrWebhookIgnored, userID)
 	}
 	return nil
+}
+
+// knownBeforeCutoff reports whether the event's subscription (by id, or by
+// order id) was stored before testModeCutoff.
+func (s *billingService) knownBeforeCutoff(userID, subscriptionID, orderID string) (bool, error) {
+	if subscriptionID != "" {
+		subscription, err := s.repo.FindSubscriptionByExternalID(subscriptionID)
+		if err == nil {
+			return storedBeforeCutoff(*subscription), nil
+		}
+		if !isRecordNotFound(err) {
+			return false, err
+		}
+	}
+	if orderID != "" {
+		subscriptions, err := s.repo.ListSubscriptions(userID)
+		if err != nil {
+			return false, err
+		}
+		for _, subscription := range subscriptions {
+			if subscription.OrderID == orderID && storedBeforeCutoff(subscription) {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }
 
 func (s *billingService) validateWebhookSource(storeID string, testMode bool) error {

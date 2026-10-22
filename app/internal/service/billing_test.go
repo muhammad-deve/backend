@@ -634,7 +634,10 @@ func TestTestModeWebhooksSkipNonTesters(t *testing.T) {
 }
 
 func TestTestSubscriptionsGiveProOnlyToTestersInTestMode(t *testing.T) {
-	sub := model.BillingSubscriptionRecord{UserID: "user_1", ExternalID: "7001", PlanKey: model.PlanProMonthly, Status: "active", TestMode: true}
+	sub := model.BillingSubscriptionRecord{
+		UserID: "user_1", ExternalID: "7001", PlanKey: model.PlanProMonthly, Status: "active", TestMode: true,
+		Created: testModeCutoff,
+	}
 	repo := &fakeBillingRepository{
 		emails:        map[string]string{"user_1": "someone@example.com"},
 		subscriptions: []model.BillingSubscriptionRecord{sub},
@@ -704,5 +707,71 @@ func TestPlanForNoTrialVariants(t *testing.T) {
 		if got := service.planForVariant(variant); got != want {
 			t.Errorf("planForVariant(%q) = %q, want %q", variant, got, want)
 		}
+	}
+}
+
+func TestTestSubscriptionsStoredBeforeCutoffKeepPro(t *testing.T) {
+	for name, created := range map[string]time.Time{
+		"stored before the field existed": {},
+		"stored just before the cutoff":   testModeCutoff.Add(-time.Second),
+	} {
+		t.Run(name, func(t *testing.T) {
+			repo := &fakeBillingRepository{
+				emails: map[string]string{"user_1": "someone@example.com"},
+				subscriptions: []model.BillingSubscriptionRecord{{
+					UserID: "user_1", ExternalID: "7001", PlanKey: model.PlanProMonthly, Status: "active", TestMode: true, Created: created,
+				}},
+			}
+			service := testModeBilling(repo, &fakeLemonSqueezyClient{})
+			if plan, err := service.Plan("user_1"); err != nil || !plan.IsPro {
+				t.Fatalf("test mode: pro=%v err=%v", plan.IsPro, err)
+			}
+			if data, err := service.Get("user_1"); err != nil || data.Subscription == nil {
+				t.Fatalf("Get must show the subscription: %#v %v", data, err)
+			}
+			service.cfg.LemonSqueezyTestMode = false
+			if plan, _ := service.Plan("user_1"); !plan.IsPro {
+				t.Fatal("live mode must keep it too")
+			}
+		})
+	}
+}
+
+func TestTestModeWebhooksKeepEarlierSubscriptionsCurrent(t *testing.T) {
+	repo := &fakeBillingRepository{
+		users:  map[string]bool{"user_1": true},
+		emails: map[string]string{"user_1": "someone@example.com"},
+		subscriptions: []model.BillingSubscriptionRecord{
+			{UserID: "user_1", ExternalID: "7001", OrderID: "9001", PlanKey: model.PlanProMonthly, Status: "active", TestMode: true},
+			{UserID: "user_1", ExternalID: "7002", OrderID: "9002", PlanKey: model.PlanProMonthly, Status: "active", TestMode: true, Created: testModeCutoff.Add(time.Hour)},
+		},
+	}
+	service := testModeBilling(repo, &fakeLemonSqueezyClient{})
+	send := func(body string) error {
+		return service.ProcessWebhook(context.Background(), []byte(body), webhookSignature([]byte(body), "webhook-secret"))
+	}
+
+	cancelled := `{"meta":{"event_name":"subscription_cancelled"},"data":{"type":"subscriptions","id":"7001","attributes":{"store_id":470781,"variant_id":991,"status":"cancelled","ends_at":"2026-11-01T00:00:00Z","test_mode":true}}}`
+	if err := send(cancelled); err != nil {
+		t.Fatalf("update to an earlier subscription: %v", err)
+	}
+	if last := repo.subscriptions[len(repo.subscriptions)-1]; last.ExternalID != "7001" || last.Status != "cancelled" {
+		t.Fatalf("earlier subscription not updated: %#v", last)
+	}
+	renewal := `{"meta":{"event_name":"subscription_payment_success"},"data":{"type":"subscription-invoices","id":"inv_1","attributes":{"store_id":470781,"subscription_id":7001,"billing_reason":"renewal","status":"paid","total":299,"test_mode":true}}}`
+	if err := send(renewal); err != nil {
+		t.Fatalf("renewal of an earlier subscription: %v", err)
+	}
+	refund := `{"meta":{"event_name":"order_refunded"},"data":{"type":"orders","id":"9001","attributes":{"store_id":470781,"user_email":"someone@example.com","status":"refunded","total":299,"test_mode":true,"first_order_item":{"variant_id":991}}}}`
+	if err := send(refund); err != nil {
+		t.Fatalf("refund of an earlier order: %v", err)
+	}
+	if len(repo.transactions) != 2 {
+		t.Fatalf("stored %d transactions, want 2", len(repo.transactions))
+	}
+
+	newer := `{"meta":{"event_name":"subscription_updated"},"data":{"type":"subscriptions","id":"7002","attributes":{"store_id":470781,"variant_id":991,"status":"active","test_mode":true}}}`
+	if err := send(newer); !errors.Is(err, ErrWebhookIgnored) {
+		t.Fatalf("subscription stored after the cutoff: err = %v, want ErrWebhookIgnored", err)
 	}
 }

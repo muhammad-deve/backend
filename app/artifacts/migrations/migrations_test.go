@@ -113,3 +113,81 @@ func TestUsersDeleteIsSuperuserOnly(t *testing.T) {
 		t.Fatal("the create rule must stay locked to Google sign-in")
 	}
 }
+
+func TestAddSubscriptionCreated(t *testing.T) {
+	app := newMigratedApp(t)
+	subscriptions, err := app.FindCollectionByNameOrId("billing_subscriptions")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if field := subscriptions.Fields.GetByName("created"); field == nil {
+		t.Fatal("billing_subscriptions must have a created field")
+	}
+
+	// Start again from the old schema with rows already stored.
+	subscriptions.Fields.RemoveByName("created")
+	if err := app.Save(subscriptions); err != nil {
+		t.Fatal(err)
+	}
+	user := saveUser(t, app, "dev@example.com", true)
+	saveSubscription := func(externalID, orderID string) {
+		t.Helper()
+		record := core.NewRecord(subscriptions)
+		record.Set("user", user.Id)
+		record.Set("external_id", externalID)
+		record.Set("order_id", orderID)
+		record.Set("status", "active")
+		record.Set("test_mode", true)
+		if err := app.Save(record); err != nil {
+			t.Fatal(err)
+		}
+	}
+	saveSubscription("sub_invoiced", "")
+	saveSubscription("sub_ordered", "order_1")
+	saveSubscription("sub_unknown", "")
+	transactions, _ := app.FindCollectionByNameOrId("billing_transactions")
+	saveTransaction := func(externalID, externalType, subscriptionID, chargedAt string) {
+		t.Helper()
+		record := core.NewRecord(transactions)
+		record.Set("user", user.Id)
+		record.Set("external_id", externalID)
+		record.Set("external_type", externalType)
+		record.Set("external_subscription_id", subscriptionID)
+		record.Set("status", "paid")
+		record.Set("charged_at", chargedAt)
+		if err := app.Save(record); err != nil {
+			t.Fatal(err)
+		}
+	}
+	saveTransaction("inv_2", "subscription-invoice", "sub_invoiced", "2026-10-24 10:00:00.000Z")
+	saveTransaction("inv_1", "subscription-invoice", "sub_invoiced", "2026-10-23 08:00:00.000Z")
+	saveTransaction("order_1", "order", "", "2026-10-01 12:00:00.000Z")
+
+	addSubscriptionCreated(app)
+	addSubscriptionCreated(app) // a second run must be harmless
+
+	created := func(externalID string) string {
+		t.Helper()
+		record, err := app.FindFirstRecordByFilter("billing_subscriptions", "external_id = {:id}", dbx.Params{"id": externalID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return record.GetDateTime("created").String()
+	}
+	if got := created("sub_invoiced"); got != "2026-10-23 08:00:00.000Z" {
+		t.Fatalf("invoiced subscription created = %q", got)
+	}
+	if got := created("sub_ordered"); got != "2026-10-01 12:00:00.000Z" {
+		t.Fatalf("ordered subscription created = %q", got)
+	}
+	if got := created("sub_unknown"); got != "" {
+		t.Fatalf("subscription without payments created = %q, want empty", got)
+	}
+
+	// New rows get the time they are stored.
+	subscriptions, _ = app.FindCollectionByNameOrId("billing_subscriptions")
+	saveSubscription("sub_new", "")
+	if created("sub_new") == "" {
+		t.Fatal("a new row must get a created time")
+	}
+}

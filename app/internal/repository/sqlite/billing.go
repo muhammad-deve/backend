@@ -243,6 +243,7 @@ func subscriptionFromRecord(record *core.Record) model.BillingSubscriptionRecord
 		TrialEndsAt:       record.GetDateTime("trial_ends_at").Time(),
 		ProviderUpdatedAt: record.GetDateTime("provider_updated_at").Time(),
 		TestMode:          record.GetBool("test_mode"),
+		Created:           record.GetDateTime("created").Time(),
 	}
 }
 

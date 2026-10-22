@@ -384,6 +384,18 @@ func (s *billingService) isTester(email string) bool {
 	return false
 }
 
+// testModeCutoff splits test-mode subscriptions. Rows stored before it keep
+// giving Pro: the owner chose to block new free upgrades, not to take away
+// what people already have. Rows stored at or after it count only for
+// LEMON_SQUEEZY_TEST_EMAILS, and only while test mode is on.
+var testModeCutoff = time.Date(2026, time.October, 23, 0, 0, 0, 0, time.UTC)
+
+// storedBeforeCutoff reports whether a row was stored before testModeCutoff.
+// Rows with no stored time predate the field and count as earlier.
+func storedBeforeCutoff(subscription model.BillingSubscriptionRecord) bool {
+	return subscription.Created.IsZero() || subscription.Created.Before(testModeCutoff)
+}
+
 // testBillingAllowed reports whether a test-mode subscription or payment may
 // count for the account: only in test mode, and only for listed testers.
 func (s *billingService) testBillingAllowed(userID string) (bool, error) {
@@ -408,17 +420,18 @@ func (s *billingService) listUsableSubscriptions(userID string) ([]model.Billing
 	return s.usableSubscriptions(userID, subscriptions)
 }
 
-// usableSubscriptions drops test-mode subscriptions that must not give Pro:
-// all of them in live mode, and those of non-testers in test mode.
+// usableSubscriptions drops test-mode subscriptions stored since the cutoff
+// that must not give Pro: all of them in live mode, and those of non-testers
+// in test mode. Rows stored before the cutoff always stay.
 func (s *billingService) usableSubscriptions(userID string, subscriptions []model.BillingSubscriptionRecord) ([]model.BillingSubscriptionRecord, error) {
-	hasTest := false
+	restricted := false
 	for _, subscription := range subscriptions {
-		if subscription.TestMode {
-			hasTest = true
+		if subscription.TestMode && !storedBeforeCutoff(subscription) {
+			restricted = true
 			break
 		}
 	}
-	if !hasTest {
+	if !restricted {
 		return subscriptions, nil
 	}
 	allowed, err := s.testBillingAllowed(userID)
@@ -430,7 +443,7 @@ func (s *billingService) usableSubscriptions(userID string, subscriptions []mode
 	}
 	usable := make([]model.BillingSubscriptionRecord, 0, len(subscriptions))
 	for _, subscription := range subscriptions {
-		if !subscription.TestMode {
+		if !subscription.TestMode || storedBeforeCutoff(subscription) {
 			usable = append(usable, subscription)
 		}
 	}

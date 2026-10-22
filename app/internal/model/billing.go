@@ -74,6 +74,9 @@ type BillingSubscriptionRecord struct {
 	TrialEndsAt       time.Time
 	ProviderUpdatedAt time.Time
 	TestMode          bool
+	// Created is when the row was stored; zero for rows stored before the
+	// field existed.
+	Created time.Time
 }
 
 type BillingTransactionRecord struct {
