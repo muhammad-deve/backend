@@ -66,6 +66,7 @@ func (h *Handler) Register(router *router.Router[*core.RequestEvent]) {
 			account.POST("/email/request", h.RequestEmailChangeHandler)
 			account.POST("/email/confirm", h.ConfirmEmailChangeHandler)
 			account.POST("/password", h.ChangePasswordHandler)
+			account.POST("/logout", h.LogoutHandler)
 		}
 
 		tokens := api.Group("/tokens")

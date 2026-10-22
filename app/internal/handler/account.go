@@ -88,3 +88,20 @@ func (h *Handler) ChangePasswordHandler(e *core.RequestEvent) error {
 
 	return h.NewSuccessResponse(e, http.StatusOK, resp)
 }
+
+// LogoutHandler ends every dashboard session of the signed-in account.
+// Session tokens are signed with the account's token key, so a new key makes
+// all of them invalid, including copies taken from a browser. CLI tokens are
+// separate and keep working.
+func (h *Handler) LogoutHandler(e *core.RequestEvent) error {
+	record := e.Auth
+	if record == nil {
+		return h.NewErrorResponse(e, http.StatusUnauthorized, "Sign in first.")
+	}
+	record.RefreshTokenKey()
+	if err := e.App.SaveNoValidate(record); err != nil {
+		e.App.Logger().Error("failed to end sessions on logout", "error", err, "userId", record.Id)
+		return h.NewErrorResponse(e, http.StatusInternalServerError, "Couldn't sign out. Please try again.")
+	}
+	return e.NoContent(http.StatusNoContent)
+}
