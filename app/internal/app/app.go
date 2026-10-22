@@ -1,6 +1,8 @@
 package app
 
 import (
+	"net/http"
+
 	"github.com/pocketbase/pocketbase"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/plugins/migratecmd"
@@ -36,7 +38,15 @@ func NewApp(config *config.Config) *pocketbase.PocketBase {
 		handlers.Register(e.Router)
 		hooks.Register(app)
 
-		return e.Next()
+		// e.Next() builds PocketBase's router into e.Server.Handler. Tunnel
+		// hosts are then served in front of it, so none of PocketBase's global
+		// middlewares (CORS, security headers, body limit, request log) touch
+		// tunnel traffic.
+		if err := e.Next(); err != nil {
+			return err
+		}
+		e.Server.Handler = tunnelFirst(services.TCP(), e.Server.Handler)
+		return nil
 	})
 
 	// On shutdown (every deploy) write out the tunnel traffic and connected
@@ -53,4 +63,14 @@ func NewApp(config *config.Config) *pocketbase.PocketBase {
 	})
 
 	return app
+}
+
+// tunnelFirst serves tunnel hosts and passes every other request to next.
+func tunnelFirst(tunnels service.TCPI, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if tunnels.ServeTunnel(w, r) {
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }

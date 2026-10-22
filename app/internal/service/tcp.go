@@ -1,10 +1,7 @@
 package service
 
 import (
-	"bufio"
-	"bytes"
 	"crypto/rand"
-	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -17,7 +14,6 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/yamux"
@@ -32,7 +28,9 @@ import (
 type TCPI interface {
 	Start() error
 	Stop()
-	HandleTunnelRequest(e *core.RequestEvent) (bool, error)
+	// ServeTunnel serves a request for a tunnel host and reports whether it
+	// did; requests for any other host are left to the caller.
+	ServeTunnel(w http.ResponseWriter, r *http.Request) bool
 	IsTunnelHost(host string) bool
 	StopTunnel(userID, subdomain string) error
 	DeleteTunnel(userID, subdomain string) error
@@ -129,6 +127,8 @@ type tcpService struct {
 	geo      *geoip.DB
 	// handshakes caps connections that haven't finished registering.
 	handshakes *handshakeLimiter
+	// hopSecret is TUNNEL_HOP_SECRET; see tunnelHopHeader.
+	hopSecret string
 }
 
 // onlineDelta is connected time to add to one tunnel and its owner.
@@ -196,6 +196,7 @@ func NewTCPService(app core.App, tunnels repository.TunnelsI, usage repository.U
 		onlineSince:   make(map[string]time.Time),
 		geo:           geoip.Open(""),
 		handshakes:    newHandshakeLimiter(maxPendingHandshakes, maxPendingHandshakesByIP),
+		hopSecret:     strings.TrimSpace(os.Getenv("TUNNEL_HOP_SECRET")),
 	}
 }
 
@@ -1001,140 +1002,6 @@ func randomSubdomain(length int) (string, error) {
 	return string(bytes), nil
 }
 
-// tunnelForwardedHeader marks a request that has already been routed through a
-// tunnel hop. The target of a tunnel may itself be a GoPort backend (for example
-// when exposing this very service for testing). Because the original public Host
-// header is preserved end-to-end, without this marker the forwarded request would
-// match the subdomain rule again on the target backend, find no session in its own
-// map, and fail with "tunnel is not connected".
-const tunnelForwardedHeader = "X-Goport-Tunnel"
-
-func (t *tcpService) HandleTunnelRequest(e *core.RequestEvent) (bool, error) {
-	// Already came out of a tunnel hop, so don't intercept it again.
-	if e.Request.Header.Get(tunnelForwardedHeader) != "" {
-		return false, nil
-	}
-
-	subdomain, ok := t.subdomainFromHost(e.Request.Host)
-	if !ok {
-		return false, nil
-	}
-
-	t.mu.Lock()
-	session := t.sessions[subdomain]
-	tunnelID := t.tunnelIDs[subdomain]
-	userID := t.sessionUsers[subdomain]
-	isCustom := t.sessionCustom[subdomain]
-	sessionType := t.sessionTypes[subdomain]
-	shareToken := t.shareTokens[subdomain]
-	shareExpiry := t.shareExpires[subdomain]
-	t.mu.Unlock()
-	if strings.HasPrefix(e.Request.URL.Path, "/s/") {
-		if sessionType != "share" || !sharePathMatches(e.Request.URL.Path, shareToken) {
-			http.NotFound(e.Response, e.Request)
-			return true, nil
-		}
-	} else if sessionType == "share" {
-		http.NotFound(e.Response, e.Request)
-		return true, nil
-	}
-	if !shareExpiry.IsZero() && !time.Now().Before(shareExpiry) {
-		http.Error(e.Response, "This share has expired.", http.StatusGone)
-		return true, nil
-	}
-
-	if session == nil || session.IsClosed() || tunnelID == "" {
-		http.Error(e.Response, "tunnel is not connected", http.StatusBadGateway)
-		return true, nil
-	}
-	limits, usedBytes, err := t.trafficAllowance(userID)
-	if err != nil {
-		http.Error(e.Response, "could not verify tunnel allowance", http.StatusServiceUnavailable)
-		return true, nil
-	}
-	if isCustom && !limits.CustomSubdomains {
-		http.Error(e.Response, "this custom subdomain requires an active GoPort Pro subscription", http.StatusPaymentRequired)
-		return true, nil
-	}
-	if !t.sessionWithinPlanLimit(subdomain, userID, limits.MaxActiveTunnels) {
-		http.Error(e.Response, "this tunnel is outside your current plan allowance; stop extra tunnels or upgrade to Pro", http.StatusPaymentRequired)
-		return true, nil
-	}
-	if usedBytes >= limits.MonthlyBytes {
-		http.Error(e.Response, "monthly traffic allowance reached", http.StatusTooManyRequests)
-		return true, nil
-	}
-
-	stream, err := session.Open()
-	if err != nil {
-		log.Printf("tunnel %s: failed to open stream: %v", subdomain, err)
-		http.Error(e.Response, "failed to open tunnel stream", http.StatusBadGateway)
-		return true, nil
-	}
-	defer stream.Close()
-
-	// Upgrade requests must keep their Connection and Upgrade headers all the
-	// way to the local application. Next.js uses this for the dev HMR socket.
-	upgradeRequest := isUpgradeRequest(e.Request)
-	outReq, err := buildForwardRequest(e.Request, upgradeRequest)
-	if err != nil {
-		log.Printf("tunnel %s: failed to build forward request: %v", subdomain, err)
-		http.Error(e.Response, "failed to prepare tunnel request", http.StatusBadGateway)
-		return true, nil
-	}
-
-	if err := outReq.Write(stream); err != nil {
-		log.Printf("tunnel %s: failed to write request to stream: %v", subdomain, err)
-		http.Error(e.Response, "failed to send request to tunnel", http.StatusBadGateway)
-		return true, nil
-	}
-
-	if upgradeRequest {
-		clientConn, _, err := http.NewResponseController(e.Response).Hijack()
-		if err != nil {
-			log.Printf("tunnel %s: failed to hijack upgrade connection: %v", subdomain, err)
-			_ = stream.Close()
-			return true, err
-		}
-		defer clientConn.Close()
-
-		// An upgraded connection is counted once, when it closes, together with
-		// everything relayed over it.
-		t.recordTraffic(tunnelID, subdomain, userID, copyTunnelStream(clientConn, stream))
-		return true, nil
-	}
-
-	resp, err := http.ReadResponse(bufio.NewReader(stream), outReq)
-	if err != nil {
-		log.Printf("tunnel %s: failed to read response from stream: %v", subdomain, err)
-		http.Error(e.Response, "failed to read tunnel response", http.StatusBadGateway)
-		return true, nil
-	}
-	defer resp.Body.Close()
-
-	copyHeaders(e.Response.Header(), resp.Header)
-	e.Response.WriteHeader(resp.StatusCode)
-	written, err := io.Copy(e.Response, resp.Body)
-	if err != nil && !isClosedErr(err) {
-		log.Printf("tunnel %s: error copying response body: %v", subdomain, err)
-		t.recordTraffic(tunnelID, subdomain, userID, written+maxInt64(outReq.ContentLength, 0))
-		return true, nil
-	}
-	t.recordTraffic(tunnelID, subdomain, userID, written+maxInt64(outReq.ContentLength, 0))
-	return true, nil
-}
-
-func sharePathMatches(requestPath, token string) bool {
-	if token == "" {
-		return false
-	}
-	prefix := "/s/" + token
-	if len(requestPath) < len(prefix) || subtle.ConstantTimeCompare([]byte(requestPath[:len(prefix)]), []byte(prefix)) != 1 {
-		return false
-	}
-	return len(requestPath) == len(prefix) || requestPath[len(prefix)] == '/'
-}
-
 func (t *tcpService) sessionWithinPlanLimit(subdomain, userID string, maxActive int) bool {
 	if maxActive <= 0 {
 		return false
@@ -1411,149 +1278,5 @@ func (t *tcpService) flushStats() {
 			stat.lastActive = delta.lastActive
 		}
 		t.statsMu.Unlock()
-	}
-}
-
-// buildForwardRequest reads the incoming request body and creates a fresh outbound
-// http.Request suitable for serializing over the tunnel stream with Request.Write.
-func buildForwardRequest(in *http.Request, preserveUpgradeHeaders bool) (*http.Request, error) {
-	var body io.Reader
-	var contentLength int64 = -1
-
-	if in.Body != nil && in.Body != http.NoBody {
-		buf, err := io.ReadAll(in.Body)
-		if err != nil {
-			return nil, fmt.Errorf("read body: %w", err)
-		}
-		_ = in.Body.Close()
-		body = bytes.NewReader(buf)
-		contentLength = int64(len(buf))
-	}
-
-	out, err := http.NewRequest(in.Method, in.URL.RequestURI(), body)
-	if err != nil {
-		return nil, err
-	}
-
-	// Copy request headers. Upgrade headers are only forwarded when this is an
-	// upgrade request; they are invalid on ordinary proxied requests.
-	for key, values := range in.Header {
-		if isHopByHopHeader(key) && !preserveUpgradeHeaders {
-			continue
-		}
-		// http.NewRequest may have set Content-Length from the body; skip duplicate.
-		if strings.EqualFold(key, "Content-Length") {
-			continue
-		}
-		for _, v := range values {
-			out.Header.Add(key, v)
-		}
-	}
-	out.Host = in.Host
-	// Mark the request as tunnel-forwarded so a target that is itself a GoPort
-	// backend serves it normally instead of re-intercepting it.
-	out.Header.Set(tunnelForwardedHeader, "1")
-	if contentLength >= 0 {
-		out.ContentLength = contentLength
-	}
-	if !preserveUpgradeHeaders {
-		out.Close = true
-		out.Header.Set("Connection", "close")
-	}
-
-	return out, nil
-}
-
-func isUpgradeRequest(req *http.Request) bool {
-	return strings.EqualFold(req.Header.Get("Upgrade"), "websocket") &&
-		strings.Contains(strings.ToLower(req.Header.Get("Connection")), "upgrade")
-}
-
-// copyTunnelStream relays an upgraded connection in both directions and reports
-// how many bytes moved. It returns as soon as either direction ends, so bytes
-// still in flight the other way can be missed; the total only feeds aggregate
-// usage figures.
-func copyTunnelStream(a, b net.Conn) int64 {
-	var transferred atomic.Int64
-
-	done := make(chan struct{}, 2)
-	go func() {
-		n, _ := io.Copy(a, b)
-		transferred.Add(n)
-		_ = closeWrite(a)
-		done <- struct{}{}
-	}()
-	go func() {
-		n, _ := io.Copy(b, a)
-		transferred.Add(n)
-		_ = closeWrite(b)
-		done <- struct{}{}
-	}()
-	<-done
-
-	return transferred.Load()
-}
-
-func closeWrite(conn net.Conn) error {
-	if writer, ok := conn.(interface{ CloseWrite() error }); ok {
-		return writer.CloseWrite()
-	}
-	return nil
-}
-
-func isClosedErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "use of closed network connection") ||
-		strings.Contains(msg, "broken pipe") ||
-		strings.Contains(msg, "connection reset by peer")
-}
-
-// IsTunnelHost reports whether host is a tunnel subdomain rather than the
-// site or API itself.
-func (t *tcpService) IsTunnelHost(host string) bool {
-	_, ok := t.subdomainFromHost(host)
-	return ok
-}
-
-func (t *tcpService) subdomainFromHost(host string) (string, bool) {
-	host = strings.ToLower(strings.TrimSpace(host))
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
-
-	domain := strings.ToLower(strings.TrimSpace(t.domain))
-	suffix := "." + domain
-	if host == domain || host == "www."+domain || host == "back."+domain || !strings.HasSuffix(host, suffix) {
-		return "", false
-	}
-
-	subdomain := strings.TrimSuffix(host, suffix)
-	if subdomain == "" || strings.Contains(subdomain, ".") {
-		return "", false
-	}
-
-	return subdomain, true
-}
-
-func copyHeaders(dst, src http.Header) {
-	for key, values := range src {
-		if isHopByHopHeader(key) {
-			continue
-		}
-		for _, value := range values {
-			dst.Add(key, value)
-		}
-	}
-}
-
-func isHopByHopHeader(key string) bool {
-	switch strings.ToLower(key) {
-	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade":
-		return true
-	default:
-		return false
 	}
 }
