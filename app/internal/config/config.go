@@ -83,17 +83,17 @@ func GetConfig() *Config {
 			log.Print("no .env file found, using OS environment and defaults")
 		}
 
-		if instance.ResendAPIKey == "" {
-			log.Print("WARNING: RESEND_API_KEY is empty; OTP emails will not be sent")
-		}
-		if instance.LemonSqueezyKey == "" || instance.LemonSqueezyStoreID == "" || instance.LemonSqueezyWebhookSecret == "" {
-			log.Print("WARNING: Lemon Squeezy billing is not fully configured")
-		}
 		if instance.LemonSqueezyProMonthlyNoTrialVariantID == "" || instance.LemonSqueezyProYearlyNoTrialVariantID == "" {
 			log.Print("WARNING: LEMON_SQUEEZY_PRO_MONTHLY_NO_TRIAL_VARIANT_ID / LEMON_SQUEEZY_PRO_YEARLY_NO_TRIAL_VARIANT_ID are not both set; returning customers can start another free trial")
 		}
 		if instance.LemonSqueezyTestMode {
 			log.Print("WARNING: ==== LEMON_SQUEEZY_TEST_MODE is ON. Checkouts use Lemon Squeezy test mode and only LEMON_SQUEEZY_TEST_EMAILS can upgrade to Pro. Set LEMON_SQUEEZY_TEST_MODE=false to take real payments. ====")
+		}
+		if instance.ResendAPIKey == "" {
+			log.Print("WARNING: RESEND_API_KEY is empty; OTP emails will not be sent")
+		}
+		if instance.LemonSqueezyKey == "" || instance.LemonSqueezyStoreID == "" || instance.LemonSqueezyWebhookSecret == "" {
+			log.Print("WARNING: Lemon Squeezy billing is not fully configured")
 		}
 		if len(instance.ShareSigningKey) < 32 {
 			log.Print("WARNING: SHARE_SIGNING_KEY should contain at least 32 random bytes before enabling cloud sharing")
