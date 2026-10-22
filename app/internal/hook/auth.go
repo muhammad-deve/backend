@@ -66,9 +66,10 @@ func (h *Hook) registerAuthHooks(app *pocketbase.PocketBase) {
 		}
 	})
 
-	// Limit wrong passwords per IP and per account. Only failures count, so
-	// someone else's attempts can lock an account for at most the window.
-	app.OnRecordAuthWithPasswordRequest(model.UsersCollection).BindFunc(func(e *core.RecordAuthWithPasswordRequestEvent) error {
+	// Limit wrong passwords per IP and per account, for every auth
+	// collection (superusers too). Only failures count, so someone else's
+	// attempts can lock an account for at most the window.
+	app.OnRecordAuthWithPasswordRequest().BindFunc(func(e *core.RecordAuthWithPasswordRequestEvent) error {
 		ip := handler.ClientIP(e.Request)
 		if err := h.service.Throttle().LoginAllowed(ip, e.Identity); err != nil {
 			seconds := 60
