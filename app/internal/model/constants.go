@@ -12,9 +12,6 @@ const (
 
 	// MinPasswordLength is the minimum number of characters in a password.
 	MinPasswordLength = 8
-
-	AmoCRMGrantTypeAuthorizationCode = "authorization_code"
-	AmoCRMGrantTypeRefreshToken      = "refresh_token"
 )
 
 // ValidatePassword enforces the password policy: at least MinPasswordLength
