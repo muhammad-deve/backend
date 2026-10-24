@@ -44,6 +44,7 @@ jobs:
             backup=~/goport-backups/backend-$(date -u +%Y%m%dT%H%M%SZ)
             if mkdir -p "$backup" && docker cp goport-backend:/app/pb_data/data.db "$backup/data.db"; then
               docker cp goport-backend:/app/pb_data/data.db-wal "$backup/data.db-wal" 2>/dev/null || true
+              docker cp goport-backend:/app/pb_data/share_signing.key "$backup/share_signing.key" 2>/dev/null || true
               echo "database copied to $backup"
               ls -1dt ~/goport-backups/backend-* | tail -n +11 | xargs -r rm -rf
             else
