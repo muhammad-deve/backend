@@ -165,8 +165,8 @@ type tcpService struct {
 	// handshakes caps connections that haven't finished registering.
 	handshakes *handshakeLimiter
 	// Registrations reaching the database, per IP and per token.
-	registrationsByIP    *otpRateLimiter
-	registrationsByToken *otpRateLimiter
+	registrationsByIP    *rateLimiter
+	registrationsByToken *rateLimiter
 	// hopSecret is TUNNEL_HOP_SECRET; see tunnelHopHeader.
 	hopSecret string
 	proxy     proxyLimits
@@ -240,8 +240,8 @@ func NewTCPService(app core.App, tunnels repository.TunnelsI, usage repository.U
 		onlineSince:          make(map[string]time.Time),
 		geo:                  geoip.Open(""),
 		handshakes:           newHandshakeLimiter(maxPendingHandshakes, maxPendingHandshakesByIP),
-		registrationsByIP:    newOTPRateLimiter(time.Minute, maxRegistrationsPerIP, 0),
-		registrationsByToken: newOTPRateLimiter(time.Minute, maxRegistrationsPerToken, 0),
+		registrationsByIP:    newRateLimiter(time.Minute, maxRegistrationsPerIP, 0),
+		registrationsByToken: newRateLimiter(time.Minute, maxRegistrationsPerToken, 0),
 		hopSecret:            strings.TrimSpace(os.Getenv("TUNNEL_HOP_SECRET")),
 		proxy:                defaultProxyLimits(),
 		randomName:           func() (string, error) { return randomSubdomain(6) },

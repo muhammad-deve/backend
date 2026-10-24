@@ -20,6 +20,7 @@ func (f fakeTokens) List(string) ([]model.TokenItem, error)          { return ni
 func (f fakeTokens) Create(string, string) (*model.TokenItem, error) { return nil, nil }
 func (f fakeTokens) Delete(string, string) error                     { return nil }
 func (f fakeTokens) EnsureDefault(string) error                      { return nil }
+func (f fakeTokens) Reset(string) error                              { return nil }
 func (f fakeTokens) Verify(token string) (*model.TokenOwner, error)  { return f.verify(token) }
 
 // registerOverPipe runs one registration through handleConnection, as a CLI

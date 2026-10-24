@@ -70,19 +70,23 @@ func TestUsageBucketOwnerBackfillAndRerun(t *testing.T) {
 		t.Fatalf("a bucket of an ownerless tunnel got user %q", got)
 	}
 
-	// Lookups by tunnel and sums by user must not scan the table.
-	for _, query := range []string{
-		"SELECT id FROM tunnel_usage_buckets WHERE tunnel_id = {:v} AND bucket_start = {:v}",
-		"SELECT SUM(bytes_transferred) FROM tunnel_usage_buckets WHERE [[user]] = {:v} AND bucket_start >= {:v}",
+	// Lookups by tunnel and sums by user must be able to use an index.
+	// INDEXED BY fails when the named index can't serve the query. (Which
+	// plan SQLite picks depends on table size: with two rows a scan wins.)
+	for index, where := range map[string]string{
+		"idx_tunnel_usage_lookup": "tunnel_id = {:v} AND bucket_start = {:v}",
+		"idx_tunnel_usage_user":   "[[user]] = {:v} AND bucket_start >= {:v}",
 	} {
+		query := "SELECT id FROM tunnel_usage_buckets INDEXED BY " + index + " WHERE " + where
 		var plan []struct {
 			Detail string `db:"detail"`
 		}
 		if err := app.DB().NewQuery("EXPLAIN QUERY PLAN " + query).Bind(dbx.Params{"v": "x"}).All(&plan); err != nil {
-			t.Fatal(err)
+			t.Errorf("%s: %v", query, err)
+			continue
 		}
-		if len(plan) == 0 || !strings.Contains(plan[0].Detail, "INDEX") {
-			t.Errorf("%s: plan %+v doesn't use an index", query, plan)
+		if len(plan) == 0 || !strings.Contains(plan[0].Detail, index) {
+			t.Errorf("%s: plan %+v doesn't use %s", query, plan, index)
 		}
 	}
 }

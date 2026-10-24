@@ -52,7 +52,7 @@ func TestRegistrationRateLimits(t *testing.T) {
 
 	t.Run("per token", func(t *testing.T) {
 		service := NewTCPService(nil, nil, nil, nil, deny).(*tcpService)
-		service.registrationsByToken = newOTPRateLimiter(time.Minute, 2, 0)
+		service.registrationsByToken = newRateLimiter(time.Minute, 2, 0)
 		for i := 0; i < 2; i++ {
 			if resp := registerOverPipe(t, service, tunnelRegistrationRequest{Type: "http", Port: "3000", Token: "gp_same"}); resp.Error == tooManyRegistrationsMessage {
 				t.Fatalf("attempt %d was rate limited", i+1)
@@ -68,7 +68,7 @@ func TestRegistrationRateLimits(t *testing.T) {
 
 	t.Run("per IP", func(t *testing.T) {
 		service := NewTCPService(nil, nil, nil, nil, deny).(*tcpService)
-		service.registrationsByIP = newOTPRateLimiter(time.Minute, 2, 0)
+		service.registrationsByIP = newRateLimiter(time.Minute, 2, 0)
 		for _, token := range []string{"gp_a", "gp_b"} {
 			registerOverPipe(t, service, tunnelRegistrationRequest{Type: "http", Port: "3000", Token: token})
 		}
