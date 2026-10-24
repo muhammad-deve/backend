@@ -1,6 +1,8 @@
 package app
 
 import (
+	"net/http"
+
 	"github.com/pocketbase/pocketbase"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/plugins/migratecmd"
@@ -8,6 +10,7 @@ import (
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/config"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/handler"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/hook"
+	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/model"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/service"
 )
 
@@ -36,6 +39,24 @@ func NewApp(config *config.Config) *pocketbase.PocketBase {
 		handlers.Register(e.Router)
 		hooks.Register(app)
 
+		// e.Next() builds PocketBase's router into e.Server.Handler. Tunnel
+		// hosts are then served in front of it, so none of PocketBase's global
+		// middlewares (CORS, security headers, body limit, request log) touch
+		// tunnel traffic.
+		if err := e.Next(); err != nil {
+			return err
+		}
+		e.Server.Handler = tunnelFirst(services.TCP(), e.Server.Handler)
+		return nil
+	})
+
+	// A deleted token ends the tunnels it opened, however it was deleted (the
+	// dashboard, the admin UI, or with its user). Their reconnects then fail
+	// with "authentication required".
+	app.OnRecordAfterDeleteSuccess(model.TokensCollection).BindFunc(func(e *core.RecordEvent) error {
+		if services != nil {
+			services.TCP().CloseSessionsForToken(e.Record.Id)
+		}
 		return e.Next()
 	})
 
@@ -53,4 +74,14 @@ func NewApp(config *config.Config) *pocketbase.PocketBase {
 	})
 
 	return app
+}
+
+// tunnelFirst serves tunnel hosts and passes every other request to next.
+func tunnelFirst(tunnels service.TCPI, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if tunnels.ServeTunnel(w, r) {
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }

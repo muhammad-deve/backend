@@ -25,13 +25,14 @@ func (r *Usage) AddTraffic(tunnelID string, bucketStart time.Time, delta model.U
 	}
 
 	return r.app.RunInTransaction(func(txApp core.App) error {
-		if _, err := txApp.FindRecordById(model.TunnelsCollection, tunnelID); err != nil {
+		tunnel, err := txApp.FindRecordById(model.TunnelsCollection, tunnelID)
+		if err != nil {
 			return err
 		}
 		if err := incrementLifetimeUsage(txApp, tunnelID, delta); err != nil {
 			return err
 		}
-		return incrementBucketUsage(txApp, tunnelID, bucketStart, delta)
+		return incrementBucketUsage(txApp, tunnelID, tunnel.GetString("user"), bucketStart, delta)
 	})
 }
 
@@ -62,7 +63,7 @@ func (r *Usage) Total(tunnelID string) (model.UsageTotal, error) {
 func (r *Usage) ListBuckets(userID string, from, to time.Time) ([]model.UsageBucketRecord, error) {
 	rows, err := r.app.FindRecordsByFilter(
 		model.TunnelUsageBucketsCollection,
-		"tunnel_id.user = {:user} && bucket_start >= {:from} && bucket_start < {:to}",
+		"user = {:user} && tunnel_id != '' && bucket_start >= {:from} && bucket_start < {:to}",
 		"bucket_start",
 		0,
 		0,
@@ -88,17 +89,18 @@ func (r *Usage) ListBuckets(userID string, from, to time.Time) ([]model.UsageBuc
 	return buckets, nil
 }
 
+// BytesForPeriod sums an account's traffic by the bucket's own user, so
+// buckets of tunnels deleted since still count.
 func (r *Usage) BytesForPeriod(userID string, from, to time.Time) (int64, error) {
 	var result struct {
 		Bytes int64 `db:"bytes"`
 	}
 	err := r.app.DB().NewQuery(`
-		SELECT COALESCE(SUM(bucket.bytes_transferred), 0) AS bytes
-		FROM tunnel_usage_buckets AS bucket
-		INNER JOIN tunnels AS tunnel ON tunnel.id = bucket.tunnel_id
-		WHERE tunnel.user = {:user}
-			AND bucket.bucket_start >= {:from}
-			AND bucket.bucket_start < {:to}
+		SELECT COALESCE(SUM(bytes_transferred), 0) AS bytes
+		FROM tunnel_usage_buckets
+		WHERE [[user]] = {:user}
+			AND bucket_start >= {:from}
+			AND bucket_start < {:to}
 	`).Bind(dbx.Params{
 		"user": userID,
 		"from": from.UTC(),
@@ -136,7 +138,7 @@ func incrementLifetimeUsage(app core.App, tunnelID string, delta model.UsageDelt
 	return app.Save(row)
 }
 
-func incrementBucketUsage(app core.App, tunnelID string, bucketStart time.Time, delta model.UsageDelta) error {
+func incrementBucketUsage(app core.App, tunnelID, userID string, bucketStart time.Time, delta model.UsageDelta) error {
 	collection, err := app.FindCollectionByNameOrId(model.TunnelUsageBucketsCollection)
 	if err != nil {
 		return err
@@ -155,6 +157,9 @@ func incrementBucketUsage(app core.App, tunnelID string, bucketStart time.Time, 
 		return err
 	}
 
+	if row.GetString("user") == "" {
+		row.Set("user", userID)
+	}
 	row.Set("request_count", row.GetFloat("request_count")+float64(delta.Requests))
 	row.Set("bytes_transferred", row.GetFloat("bytes_transferred")+float64(delta.Bytes))
 	return app.Save(row)

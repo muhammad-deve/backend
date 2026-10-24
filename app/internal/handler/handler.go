@@ -32,13 +32,8 @@ func (h *Handler) Register(router *router.Router[*core.RequestEvent]) {
 		Func:     h.publicSharePreflight,
 	})
 
-	router.BindFunc(func(e *core.RequestEvent) error {
-		handled, err := h.service.TCP().HandleTunnelRequest(e)
-		if handled || err != nil {
-			return err
-		}
-		return e.Next()
-	})
+	// Tunnel hosts never reach this router: app.NewApp serves them first
+	// through TCP().ServeTunnel.
 
 	api := router.Group("/api/v1")
 	{

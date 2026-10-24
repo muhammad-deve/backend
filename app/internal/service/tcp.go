@@ -1,10 +1,6 @@
 package service
 
 import (
-	"bufio"
-	"bytes"
-	"crypto/rand"
-	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -17,7 +13,6 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/yamux"
@@ -32,10 +27,15 @@ import (
 type TCPI interface {
 	Start() error
 	Stop()
-	HandleTunnelRequest(e *core.RequestEvent) (bool, error)
+	// ServeTunnel serves a request for a tunnel host and reports whether it
+	// did; requests for any other host are left to the caller.
+	ServeTunnel(w http.ResponseWriter, r *http.Request) bool
 	IsTunnelHost(host string) bool
 	StopTunnel(userID, subdomain string) error
 	DeleteTunnel(userID, subdomain string) error
+	// CloseSessionsForToken ends the tunnels opened with a token (by row id)
+	// and returns how many it closed.
+	CloseSessionsForToken(tokenID string) int
 }
 
 var (
@@ -82,8 +82,33 @@ func tunnelSessionConfig() *yamux.Config {
 	cfg := yamux.DefaultConfig()
 	cfg.KeepAliveInterval = 20 * time.Second
 	cfg.ConnectionWriteTimeout = 30 * time.Second
+	// A stream the server closed is reset if the CLI hasn't closed its end a
+	// minute later, instead of holding its buffer for the default 5 minutes.
+	cfg.StreamCloseTimeout = time.Minute
 	cfg.LogOutput = log.Writer()
 	return cfg
+}
+
+// maxCLIOpenedStreams is how many streams a CLI may open before its session is
+// closed. Released CLIs never open one; the server opens a stream per request.
+const maxCLIOpenedStreams = 16
+
+// refuseCLIStreams accepts and closes streams the CLI opens, so they can't pile
+// up in yamux's accept backlog, and ends a session that keeps opening them.
+func refuseCLIStreams(session *yamux.Session, subdomain string) {
+	defer recoverPanic("tunnel stream refusal")
+	for opened := 1; ; opened++ {
+		stream, err := session.Accept()
+		if err != nil {
+			return
+		}
+		_ = stream.Close()
+		if opened >= maxCLIOpenedStreams {
+			log.Printf("tunnel %s: CLI opened %d streams of its own; closing the session", subdomain, opened)
+			_ = session.Close()
+			return
+		}
+	}
 }
 
 type tunnelRegistrationResponse struct {
@@ -106,6 +131,12 @@ type tcpService struct {
 	shareTokens   map[string]string
 	shareExpires  map[string]time.Time
 	sessionOrder  map[string]uint64
+	// sessionTokens is the token row id each session registered with.
+	sessionTokens map[string]string
+	// stopped holds subdomains stopped from the dashboard (key stopKey) until
+	// their hold ends; revokedTokens holds tokens deleted moments ago.
+	stopped       map[string]time.Time
+	revokedTokens map[string]time.Time
 	nextSession   uint64
 	app           core.App
 	domain        string
@@ -126,7 +157,19 @@ type tcpService struct {
 	// recordMu serialises read-modify-write saves of tunnel rows with the
 	// minutes_used increment, so a save from a stale copy can't undo it.
 	recordMu sync.Mutex
-	geo      *geoip.DB
+	// claimMu makes finding, deciding on and saving a subdomain one step.
+	claimMu sync.Mutex
+	// randomName draws a generated subdomain; tests replace it.
+	randomName func() (string, error)
+	geo        *geoip.DB
+	// handshakes caps connections that haven't finished registering.
+	handshakes *handshakeLimiter
+	// Registrations reaching the database, per IP and per token.
+	registrationsByIP    *otpRateLimiter
+	registrationsByToken *otpRateLimiter
+	// hopSecret is TUNNEL_HOP_SECRET; see tunnelHopHeader.
+	hopSecret string
+	proxy     proxyLimits
 }
 
 // onlineDelta is connected time to add to one tunnel and its owner.
@@ -171,28 +214,37 @@ func NewTCPService(app core.App, tunnels repository.TunnelsI, usage repository.U
 	}
 
 	return &tcpService{
-		addr:          ":" + port,
-		conns:         make(map[string]net.Conn),
-		sessions:      make(map[string]*yamux.Session),
-		owners:        make(map[string]net.Conn),
-		tunnelIDs:     make(map[string]string),
-		sessionUsers:  make(map[string]string),
-		sessionCustom: make(map[string]bool),
-		sessionTypes:  make(map[string]string),
-		shareTokens:   make(map[string]string),
-		shareExpires:  make(map[string]time.Time),
-		sessionOrder:  make(map[string]uint64),
-		app:           app,
-		domain:        domain,
-		stats:         make(map[tunnelStatKey]*tunnelStat),
-		stopFlush:     make(chan struct{}),
-		tunnels:       tunnels,
-		usage:         usage,
-		billing:       billing,
-		tokens:        tokens,
-		quotaCache:    make(map[string]trafficQuotaCacheEntry),
-		onlineSince:   make(map[string]time.Time),
-		geo:           geoip.Open(""),
+		addr:                 ":" + port,
+		conns:                make(map[string]net.Conn),
+		sessions:             make(map[string]*yamux.Session),
+		owners:               make(map[string]net.Conn),
+		tunnelIDs:            make(map[string]string),
+		sessionUsers:         make(map[string]string),
+		sessionCustom:        make(map[string]bool),
+		sessionTypes:         make(map[string]string),
+		shareTokens:          make(map[string]string),
+		shareExpires:         make(map[string]time.Time),
+		sessionOrder:         make(map[string]uint64),
+		sessionTokens:        make(map[string]string),
+		stopped:              make(map[string]time.Time),
+		revokedTokens:        make(map[string]time.Time),
+		app:                  app,
+		domain:               domain,
+		stats:                make(map[tunnelStatKey]*tunnelStat),
+		stopFlush:            make(chan struct{}),
+		tunnels:              tunnels,
+		usage:                usage,
+		billing:              billing,
+		tokens:               tokens,
+		quotaCache:           make(map[string]trafficQuotaCacheEntry),
+		onlineSince:          make(map[string]time.Time),
+		geo:                  geoip.Open(""),
+		handshakes:           newHandshakeLimiter(maxPendingHandshakes, maxPendingHandshakesByIP),
+		registrationsByIP:    newOTPRateLimiter(time.Minute, maxRegistrationsPerIP, 0),
+		registrationsByToken: newOTPRateLimiter(time.Minute, maxRegistrationsPerToken, 0),
+		hopSecret:            strings.TrimSpace(os.Getenv("TUNNEL_HOP_SECRET")),
+		proxy:                defaultProxyLimits(),
+		randomName:           func() (string, error) { return randomSubdomain(6) },
 	}
 }
 
@@ -239,15 +291,7 @@ func (t *tcpService) Stop() {
 		if session != nil {
 			session.Close()
 		}
-		delete(t.sessions, subdomain)
-		delete(t.owners, subdomain)
-		delete(t.tunnelIDs, subdomain)
-		delete(t.sessionUsers, subdomain)
-		delete(t.sessionCustom, subdomain)
-		delete(t.sessionTypes, subdomain)
-		delete(t.shareTokens, subdomain)
-		delete(t.shareExpires, subdomain)
-		delete(t.sessionOrder, subdomain)
+		t.forgetSessionLocked(subdomain)
 	}
 	t.mu.Unlock()
 
@@ -258,28 +302,55 @@ func (t *tcpService) Stop() {
 	log.Printf("TCP tunnel listener stopped")
 }
 
+// acceptLoop runs until the listener is closed. Other Accept errors (for
+// example too many open files) are logged and retried after a short pause, so
+// one bad moment can't stop new tunnels until the next restart.
 func (t *tcpService) acceptLoop() {
+	var delay time.Duration
 	for {
 		conn, err := t.listener.Accept()
 		if err != nil {
-			log.Printf("TCP accept error: %v", err)
-			return
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			delay = acceptBackoff(delay)
+			log.Printf("TCP accept error: %v; retrying in %v", err, delay)
+			time.Sleep(delay)
+			continue
 		}
+		delay = 0
 
 		remoteAddr := conn.RemoteAddr().String()
+		ip := remoteIP(conn.RemoteAddr())
+		if !t.handshakes.begin(ip) {
+			log.Printf("refusing CLI connection from %s: too many pending handshakes", remoteAddr)
+			_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			t.sendRegistrationError(conn, "the server is busy, try again in a moment")
+			conn.Close()
+			continue
+		}
 		log.Printf("new CLI connection from %s", remoteAddr)
 
 		t.mu.Lock()
 		t.conns[remoteAddr] = conn
 		t.mu.Unlock()
 
-		go t.handleConnection(conn)
+		go t.handleConnection(conn, ip)
 	}
 }
 
-func (t *tcpService) handleConnection(conn net.Conn) {
+func (t *tcpService) handleConnection(conn net.Conn, ip string) {
 	var subdomain string
 	var sessionReserved bool
+
+	// Registered first so it runs last, after the cleanup below.
+	defer recoverPanic("tunnel connection")
+
+	// The handshake slot is freed once registration is answered, or when the
+	// connection ends, whichever comes first.
+	var handshakeDone sync.Once
+	endHandshake := func() { handshakeDone.Do(func() { t.handshakes.end(ip) }) }
+	defer endHandshake()
 
 	defer func() {
 		remoteAddr := conn.RemoteAddr().String()
@@ -290,15 +361,7 @@ func (t *tcpService) handleConnection(conn net.Conn) {
 		ownedSession := sessionReserved && subdomain != "" && t.owners[subdomain] == conn
 		if ownedSession {
 			t.endOnlineLocked(subdomain, time.Now())
-			delete(t.sessions, subdomain)
-			delete(t.owners, subdomain)
-			delete(t.tunnelIDs, subdomain)
-			delete(t.sessionUsers, subdomain)
-			delete(t.sessionCustom, subdomain)
-			delete(t.sessionTypes, subdomain)
-			delete(t.shareTokens, subdomain)
-			delete(t.shareExpires, subdomain)
-			delete(t.sessionOrder, subdomain)
+			t.forgetSessionLocked(subdomain)
 		}
 		t.mu.Unlock()
 
@@ -317,7 +380,13 @@ func (t *tcpService) handleConnection(conn net.Conn) {
 	_ = conn.SetDeadline(time.Now().Add(registrationTimeout))
 
 	var req tunnelRegistrationRequest
-	if err := json.NewDecoder(conn).Decode(&req); err != nil {
+	limited := &io.LimitedReader{R: conn, N: maxRegistrationBytes}
+	if err := json.NewDecoder(limited).Decode(&req); err != nil {
+		if limited.N <= 0 {
+			log.Printf("tunnel registration from %s is larger than %d bytes", conn.RemoteAddr(), maxRegistrationBytes)
+			t.sendRegistrationError(conn, "registration request is too large")
+			return
+		}
 		log.Printf("failed to read tunnel registration: %v", err)
 		return
 	}
@@ -342,14 +411,33 @@ func (t *tcpService) handleConnection(conn net.Conn) {
 		}
 	}
 
-	createdSubdomain, tunnelID, userID, maxActiveTunnels, isCustom, err := t.resolveTunnel(req)
-	if err != nil {
-		log.Printf("failed to register tunnel: %v", err)
-		t.sendRegistrationError(conn, fmt.Sprintf("failed to register tunnel: %v", err))
+	// Every registration below costs database work.
+	if allowed, _ := t.registrationsByIP.Allow(ip); !allowed {
+		log.Printf("too many tunnel registrations from %s", conn.RemoteAddr())
+		t.sendRegistrationError(conn, tooManyRegistrationsMessage)
 		return
 	}
-	subdomain = createdSubdomain
-	if err := t.reserveSession(subdomain, tunnelID, userID, maxActiveTunnels, isCustom, req, conn); err != nil {
+	if allowed, _ := t.registrationsByToken.Allow(tokenKey(req.Token)); !allowed {
+		log.Printf("too many tunnel registrations with one token from %s", conn.RemoteAddr())
+		t.sendRegistrationError(conn, tooManyRegistrationsMessage)
+		return
+	}
+
+	claim, err := t.resolveTunnel(req)
+	if err != nil {
+		var refused *refusal
+		if errors.As(err, &refused) {
+			log.Printf("tunnel registration from %s refused: %s", conn.RemoteAddr(), refused.text)
+			t.sendRegistrationError(conn, refused.text)
+			return
+		}
+		// Database and other internal errors stay in the log.
+		log.Printf("failed to register tunnel: %v", err)
+		t.sendRegistrationError(conn, internalRegistrationError)
+		return
+	}
+	subdomain = claim.subdomain
+	if err := t.reserveSession(claim, req, conn); err != nil {
 		t.sendRegistrationError(conn, err.Error())
 		return
 	}
@@ -369,6 +457,7 @@ func (t *tcpService) handleConnection(conn net.Conn) {
 
 	// The handshake is done; from here yamux keepalives detect a dead link.
 	_ = conn.SetDeadline(time.Time{})
+	endHandshake()
 
 	log.Printf("registered %s tunnel %s -> localhost:%s", req.Type, resp.URL, req.Port)
 
@@ -382,11 +471,19 @@ func (t *tcpService) handleConnection(conn net.Conn) {
 		return
 	}
 	defer session.Close()
+	go refuseCLIStreams(session, subdomain)
 
 	t.mu.Lock()
-	t.sessions[subdomain] = session
-	t.onlineSince[subdomain] = time.Now()
+	// Stop() may have dropped the reservation meanwhile.
+	stillOwned := t.owners[subdomain] == conn
+	if stillOwned {
+		t.sessions[subdomain] = session
+		t.onlineSince[subdomain] = time.Now()
+	}
 	t.mu.Unlock()
+	if !stillOwned {
+		return
+	}
 
 	<-session.CloseChan()
 }
@@ -453,6 +550,33 @@ func (t *tcpService) sendRegistrationError(conn net.Conn, msg string) {
 	}
 }
 
+// refusal is a registration error whose text is sent to the CLI as is. Any
+// other error is logged and the CLI gets internalRegistrationError. CLIs stop
+// retrying only when the text contains one of their permanent phrases
+// ("authentication required", "subdomain cannot", ...), so refusal texts
+// must keep them.
+type refusal struct {
+	text string
+	err  error
+}
+
+func (r *refusal) Error() string { return r.text }
+func (r *refusal) Unwrap() error { return r.err }
+
+// refuse sends err's text with the prefix registration refusals have always
+// had.
+func refuse(err error) error {
+	return &refusal{text: "failed to register tunnel: " + err.Error(), err: err}
+}
+
+// refuseWith sends text exactly.
+func refuseWith(text string) error {
+	return &refusal{text: text}
+}
+
+// internalRegistrationError has no permanent phrase, so CLIs retry.
+const internalRegistrationError = "failed to register tunnel: internal server error, try again"
+
 const tunnelUserID = "5743847505m28jb"
 
 // errInvalidToken signals that a CLI either supplied no token or a token that
@@ -467,11 +591,15 @@ var errInvalidToken = errors.New("authentication required: run `goport auth <tok
 func (t *tcpService) resolveUserID(token string) (string, error) {
 	token = strings.TrimSpace(token)
 	if token == "" {
-		return "", errInvalidToken
+		return "", refuse(errInvalidToken)
 	}
 	owner, err := t.tokens.Verify(token)
 	if errors.Is(err, ErrInvalidToken) {
-		return "", errInvalidToken
+		return "", refuse(errInvalidToken)
+	}
+	if errors.Is(err, ErrProRequired) {
+		// A token beyond the plan's device allowance.
+		return "", refuse(err)
 	}
 	if err != nil {
 		return "", err
@@ -479,63 +607,102 @@ func (t *tcpService) resolveUserID(token string) (string, error) {
 	return owner.UserID, nil
 }
 
-func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (string, string, string, int, bool, error) {
+// tunnelClaim is a registration that passed resolveTunnel.
+type tunnelClaim struct {
+	subdomain string
+	tunnelID  string
+	userID    string
+	// tokenID is the token's row id, for CloseSessionsForToken.
+	tokenID   string
+	maxActive int
+	// needsPro is true for a custom name the plan must cover.
+	needsPro bool
+}
+
+func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (tunnelClaim, error) {
 	if req.Reset && strings.TrimSpace(req.Subdomain) != "" {
-		return "", "", "", 0, false, fmt.Errorf("reset and custom subdomain cannot be used together")
+		return tunnelClaim{}, refuse(fmt.Errorf("reset and custom subdomain cannot be used together"))
 	}
 
 	userID, err := t.resolveUserID(req.Token)
 	if err != nil {
-		return "", "", "", 0, false, err
+		return tunnelClaim{}, err
 	}
+	tokenID := t.tokenID(strings.TrimSpace(req.Token))
 	limits, usedBytes, err := t.trafficAllowance(userID)
 	if err != nil {
-		return "", "", "", 0, false, fmt.Errorf("could not verify your subscription or monthly usage")
+		log.Printf("could not load the plan or usage of %s: %v", userID, err)
+		return tunnelClaim{}, refuse(fmt.Errorf("could not verify your subscription or monthly usage"))
 	}
 	if usedBytes >= limits.MonthlyBytes {
 		if limits.IsPro {
-			return "", "", "", 0, false, fmt.Errorf("monthly traffic limit reached for Pro (%d GB)", limits.MonthlyBytes/(1024*1024*1024))
+			return tunnelClaim{}, refuse(fmt.Errorf("monthly traffic limit reached for Pro (%d GB)", limits.MonthlyBytes/(1024*1024*1024)))
 		}
-		return "", "", "", 0, false, fmt.Errorf("monthly traffic limit reached for Free (%d GB); upgrade to Pro for %d GB", limits.MonthlyBytes/(1024*1024*1024), model.ProMonthlyBytes/(1024*1024*1024))
+		return tunnelClaim{}, refuse(fmt.Errorf("monthly traffic limit reached for Free (%d GB); upgrade to Pro for %d GB", limits.MonthlyBytes/(1024*1024*1024), model.ProMonthlyBytes/(1024*1024*1024)))
 	}
-	if req.Type == "share" && strings.TrimSpace(req.Resume) == "" {
-		subdomain, err := t.generateUniqueSubdomain()
+	claimed := func(subdomain, tunnelID string, needsPro bool, err error) (tunnelClaim, error) {
 		if err != nil {
-			return "", "", "", 0, false, err
+			return tunnelClaim{}, err
 		}
-		subdomain, tunnelID, err := t.saveTunnel(subdomain, false, userID, req.Port, req.Type)
-		return subdomain, tunnelID, userID, limits.MaxActiveTunnels, false, err
+		return tunnelClaim{subdomain, tunnelID, userID, tokenID, limits.MaxActiveTunnels, needsPro}, nil
+	}
+	// Checked before any row is written; reserveSession checks again under
+	// the lock. A held session of the same name is replaced, so it doesn't
+	// count.
+	full := func(subdomain string) error {
+		if t.activeSessions(userID, subdomain) >= limits.MaxActiveTunnels {
+			return refuseWith(planLimitMessage(limits.MaxActiveTunnels))
+		}
+		return nil
+	}
+
+	if req.Type == "share" && strings.TrimSpace(req.Resume) == "" {
+		if err := full(""); err != nil {
+			return tunnelClaim{}, err
+		}
+		subdomain, tunnelID, err := t.createRandomTunnel(userID, req.Port, req.Type)
+		return claimed(subdomain, tunnelID, false, err)
 	}
 
 	// A reconnecting CLI asks for the subdomain it already had, so a dropped
 	// connection does not move the public URL. A name that was claimed by someone
-	// else meanwhile, or a custom name the plan no longer covers, falls through to
-	// the normal flow below.
+	// else meanwhile, a custom name the plan no longer covers, or a saved name
+	// that breaks the naming rules falls through to the normal flow below.
 	if resume := strings.TrimSpace(req.Resume); resume != "" && !req.Reset {
 		record, err := t.findTunnelBySubdomain(resume)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return "", "", "", 0, false, err
+			return tunnelClaim{}, err
 		}
-		if err == nil && record.GetString("user") == userID {
+		if err == nil && record.GetString("user") == userID && validateLegacySubdomain(resume) == nil {
 			isCustom := record.GetBool("is_custom")
 			if !isCustom || limits.CustomSubdomains || isGrandfathered(record) {
+				if err := full(resume); err != nil {
+					return tunnelClaim{}, err
+				}
 				subdomain, tunnelID, err := t.saveTunnel(resume, isCustom, userID, req.Port, req.Type)
-				return subdomain, tunnelID, userID, limits.MaxActiveTunnels, needsPro(record), err
+				return claimed(subdomain, tunnelID, needsPro(record), err)
 			}
 		}
 	}
 
 	if strings.TrimSpace(req.Subdomain) != "" {
-		subdomain, err := normalizeRequestedSubdomain(req.Subdomain, t.domain)
-		if err != nil {
-			return "", "", "", 0, false, err
+		subdomain := cleanRequestedSubdomain(req.Subdomain, t.domain)
+		if err := validateSubdomain(subdomain); err != nil {
+			// A name the account already holds keeps working after the rules
+			// for new names got stricter.
+			if validateLegacySubdomain(subdomain) != nil || !t.ownsName(subdomain, userID) {
+				return tunnelClaim{}, refuse(err)
+			}
 		}
 		owned := t.ownsGrandfatheredName(subdomain, userID)
 		if !limits.CustomSubdomains && !owned {
-			return "", "", "", 0, false, fmt.Errorf("%w: custom subdomains are available on Pro; upgrade at https://goport.uz/dashboard#billing", ErrProRequired)
+			return tunnelClaim{}, refuse(fmt.Errorf("%w: custom subdomains are available on Pro; upgrade at https://goport.uz/dashboard#billing", ErrProRequired))
+		}
+		if err := full(subdomain); err != nil {
+			return tunnelClaim{}, err
 		}
 		subdomain, tunnelID, err := t.saveTunnel(subdomain, true, userID, req.Port, req.Type)
-		return subdomain, tunnelID, userID, limits.MaxActiveTunnels, !owned, err
+		return claimed(subdomain, tunnelID, !owned, err)
 	}
 
 	if !req.Reset {
@@ -546,85 +713,25 @@ func (t *tcpService) resolveTunnel(req tunnelRegistrationRequest) (string, strin
 		if err == nil {
 			subdomain := record.GetString("subdomain")
 			isCustom := record.GetBool("is_custom")
-			if subdomain != "" && (!isCustom || limits.CustomSubdomains || isGrandfathered(record)) {
+			// A saved name that breaks the naming rules (rows once written
+			// straight through the REST API) gets a fresh random name instead.
+			if validateLegacySubdomain(subdomain) == nil && (!isCustom || limits.CustomSubdomains || isGrandfathered(record)) {
+				if err := full(subdomain); err != nil {
+					return tunnelClaim{}, err
+				}
 				subdomain, tunnelID, err := t.saveTunnel(subdomain, isCustom, userID, req.Port, req.Type)
-				return subdomain, tunnelID, userID, limits.MaxActiveTunnels, needsPro(record), err
+				return claimed(subdomain, tunnelID, needsPro(record), err)
 			}
 		} else if !errors.Is(err, sql.ErrNoRows) {
-			return "", "", "", 0, false, err
+			return tunnelClaim{}, err
 		}
 	}
 
-	subdomain, err := t.generateUniqueSubdomain()
-	if err != nil {
-		return "", "", "", 0, false, err
+	if err := full(""); err != nil {
+		return tunnelClaim{}, err
 	}
-	subdomain, tunnelID, err := t.saveTunnel(subdomain, false, userID, req.Port, req.Type)
-	return subdomain, tunnelID, userID, limits.MaxActiveTunnels, false, err
-}
-
-func (t *tcpService) saveTunnel(subdomain string, isCustom bool, userID, localPort, protocol string) (string, string, error) {
-	// Every way a custom name is handed out (--custom, a reconnect, or a
-	// restart reusing the latest tunnel) comes through here, so a word added
-	// to blocked_words also stops names that were allowed before.
-	if isCustom && containsBlockedWord(subdomain, t.blockedWords()) {
-		return "", "", errBlockedSubdomain
-	}
-
-	collection, err := t.app.FindCollectionByNameOrId(model.TunnelsCollection)
-	if err != nil {
-		return "", "", err
-	}
-
-	if existing, err := t.findTunnelBySubdomain(subdomain); err == nil {
-		// The live session map decides whether a subdomain is in use, not the
-		// is_current column, which can be left stale by an unclean shutdown.
-		// Checking it before any write also stops a second CLI from rewriting the
-		// connection metadata of a tunnel that is still online.
-		if t.hasLiveSession(subdomain) && !t.releaseDeadSession(subdomain, userID) {
-			return "", "", fmt.Errorf("subdomain %q is currently in use", subdomain)
-		}
-
-		owner := existing.GetString("user")
-		if owner != "" && owner != userID {
-			if err := t.tunnels.DeleteWithLogs(existing.Id); err != nil {
-				return "", "", err
-			}
-		} else {
-			t.recordMu.Lock()
-			defer t.recordMu.Unlock()
-			// Re-read under the lock: the liveness probe above can take seconds,
-			// and saving the old copy would undo minutes added meanwhile.
-			if fresh, err := t.findTunnelBySubdomain(subdomain); err == nil {
-				existing = fresh
-			}
-			existing.Set("user", userID)
-			existing.Set("is_custom", isCustom)
-			existing.Set("is_current", false)
-			existing.Set("local_port", strings.TrimSpace(localPort))
-			existing.Set("protocol", normalizedProtocol(protocol))
-			if err := t.app.Save(existing); err != nil {
-				return "", "", err
-			}
-			return subdomain, existing.Id, nil
-		}
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return "", "", err
-	}
-
-	record := core.NewRecord(collection)
-	record.Set("user", userID)
-	record.Set("subdomain", subdomain)
-	record.Set("is_custom", isCustom)
-	record.Set("is_current", false)
-	record.Set("local_port", strings.TrimSpace(localPort))
-	record.Set("protocol", normalizedProtocol(protocol))
-
-	if err := t.app.Save(record); err != nil {
-		return "", "", err
-	}
-
-	return subdomain, record.Id, nil
+	subdomain, tunnelID, err := t.createRandomTunnel(userID, req.Port, req.Type)
+	return claimed(subdomain, tunnelID, false, err)
 }
 
 func normalizedProtocol(protocol string) string {
@@ -642,10 +749,16 @@ func (t *tcpService) StopTunnel(userID, subdomain string) error {
 
 	t.mu.Lock()
 	session := t.sessions[subdomain]
-	t.mu.Unlock()
-	if session == nil || session.IsClosed() {
+	liveOwner := t.sessionUsers[subdomain]
+	// The row says who owns the name; the session map says who is connected
+	// under it now. Only a session of the same account can be stopped.
+	if liveOwner != userID || session == nil || session.IsClosed() {
+		t.mu.Unlock()
 		return ErrTunnelInactive
 	}
+	// Without this the CLI resumes the tunnel within seconds.
+	t.markStoppedLocked(userID, subdomain, time.Now())
+	t.mu.Unlock()
 
 	if err := session.Close(); err != nil {
 		return err
@@ -660,10 +773,8 @@ func (t *tcpService) DeleteTunnel(userID, subdomain string) error {
 		return ErrTunnelNotFound
 	}
 
-	t.mu.Lock()
-	session := t.sessions[subdomain]
-	t.mu.Unlock()
-	if record.IsCurrent || (session != nil && !session.IsClosed()) {
+	// isReserved also covers a registration still completing its handshake.
+	if record.IsCurrent || t.isReserved(subdomain) {
 		return ErrTunnelActive
 	}
 
@@ -815,47 +926,37 @@ func sessionAnswers(session *yamux.Session, timeout time.Duration) bool {
 	}
 }
 
-func (t *tcpService) reserveSession(subdomain, tunnelID, userID string, maxActive int, isCustom bool, req tunnelRegistrationRequest, conn net.Conn) error {
+func (t *tcpService) reserveSession(claim tunnelClaim, req tunnelRegistrationRequest, conn net.Conn) error {
+	subdomain, userID, maxActive := claim.subdomain, claim.userID, claim.maxActive
 	t.mu.Lock()
 	defer t.mu.Unlock()
+
+	// The token was deleted while this registration was verifying it.
+	if claim.tokenID != "" && t.tokenRevokedLocked(claim.tokenID) {
+		return refuse(errInvalidToken)
+	}
 
 	if existing, ok := t.sessions[subdomain]; ok {
 		if existing == nil || !existing.IsClosed() {
 			return fmt.Errorf("subdomain %q is already connected", subdomain)
 		}
 		t.endOnlineLocked(subdomain, time.Now())
-		delete(t.sessions, subdomain)
-		delete(t.owners, subdomain)
-		delete(t.tunnelIDs, subdomain)
-		delete(t.sessionUsers, subdomain)
-		delete(t.sessionCustom, subdomain)
-		delete(t.sessionTypes, subdomain)
-		delete(t.shareTokens, subdomain)
-		delete(t.shareExpires, subdomain)
-		delete(t.sessionOrder, subdomain)
+		t.forgetSessionLocked(subdomain)
 	}
 
-	active := 0
-	for activeSubdomain, activeUserID := range t.sessionUsers {
-		if activeUserID != userID {
-			continue
-		}
-		if session, ok := t.sessions[activeSubdomain]; ok && (session == nil || !session.IsClosed()) {
-			active++
-		}
-	}
-	if active >= maxActive {
-		return fmt.Errorf("your plan allows up to %d active tunnels; stop one or upgrade at https://goport.uz/dashboard#billing", maxActive)
+	if t.activeSessionsLocked(userID, "") >= maxActive {
+		return refuseWith(planLimitMessage(maxActive))
 	}
 
 	t.sessions[subdomain] = nil
 	t.owners[subdomain] = conn
-	t.tunnelIDs[subdomain] = tunnelID
+	t.tunnelIDs[subdomain] = claim.tunnelID
 	t.sessionUsers[subdomain] = userID
-	// isCustom here means "needs Pro": custom names created before custom
-	// subdomains became Pro-only are passed as false so their traffic flows on
-	// any plan.
-	t.sessionCustom[subdomain] = isCustom
+	t.sessionTokens[subdomain] = claim.tokenID
+	// sessionCustom means "needs Pro": custom names created before custom
+	// subdomains became Pro-only are false so their traffic flows on any
+	// plan.
+	t.sessionCustom[subdomain] = claim.needsPro
 	t.sessionTypes[subdomain] = req.Type
 	if req.Type == "share" {
 		t.shareTokens[subdomain] = req.ShareToken
@@ -868,234 +969,45 @@ func (t *tcpService) reserveSession(subdomain, tunnelID, userID string, maxActiv
 	return nil
 }
 
-func normalizeRequestedSubdomain(value, domain string) (string, error) {
-	subdomain := strings.ToLower(strings.TrimSpace(value))
-	domain = strings.ToLower(strings.TrimSpace(domain))
-
-	subdomain = strings.TrimPrefix(subdomain, "https://")
-	subdomain = strings.TrimPrefix(subdomain, "http://")
-	if i := strings.IndexAny(subdomain, "/:"); i >= 0 {
-		subdomain = subdomain[:i]
-	}
-	subdomain = strings.TrimSuffix(subdomain, ".")
-	if domain != "" {
-		subdomain = strings.TrimSuffix(subdomain, "."+domain)
-	}
-
-	if err := validateSubdomain(subdomain); err != nil {
-		return "", err
-	}
-	return subdomain, nil
-}
-
-func validateSubdomain(subdomain string) error {
-	if len(subdomain) == 0 || len(subdomain) > 63 {
-		return fmt.Errorf("subdomain must be 1-63 characters")
-	}
-	if subdomain[0] == '-' || subdomain[len(subdomain)-1] == '-' {
-		return fmt.Errorf("subdomain cannot start or end with '-'")
-	}
-	if isReservedSubdomain(subdomain) {
-		return fmt.Errorf("subdomain %q is reserved", subdomain)
-	}
-
-	for _, ch := range subdomain {
-		if ch >= 'a' && ch <= 'z' {
-			continue
-		}
-		if ch >= '0' && ch <= '9' {
-			continue
-		}
-		if ch == '-' {
-			continue
-		}
-		return fmt.Errorf("subdomain can only contain lowercase letters, numbers, and '-'")
-	}
-	return nil
-}
-
-func isReservedSubdomain(subdomain string) bool {
-	switch subdomain {
-	case "api", "admin", "back", "dashboard", "www":
-		return true
-	default:
-		return false
-	}
-}
-
-func (t *tcpService) generateUniqueSubdomain() (string, error) {
-	blocked := t.blockedWords()
-	for i := 0; i < 10; i++ {
-		subdomain, err := randomSubdomain(6)
-		if err != nil {
-			return "", err
-		}
-		// Random letters can spell a blocked word too; just draw again.
-		if containsBlockedWord(subdomain, blocked) {
-			continue
-		}
-
-		_, err = t.app.FindFirstRecordByFilter("tunnels", "subdomain = {:subdomain}", dbx.Params{
-			"subdomain": subdomain,
-		})
-		if errors.Is(err, sql.ErrNoRows) {
-			return subdomain, nil
-		}
-		if err != nil {
-			return "", err
-		}
-	}
-
-	return "", fmt.Errorf("failed to generate unique subdomain")
-}
-
-func randomSubdomain(length int) (string, error) {
-	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
-
-	bytes := make([]byte, length)
-	if _, err := rand.Read(bytes); err != nil {
-		return "", err
-	}
-
-	for i := range bytes {
-		bytes[i] = alphabet[int(bytes[i])%len(alphabet)]
-	}
-
-	return string(bytes), nil
-}
-
-// tunnelForwardedHeader marks a request that has already been routed through a
-// tunnel hop. The target of a tunnel may itself be a GoPort backend (for example
-// when exposing this very service for testing). Because the original public Host
-// header is preserved end-to-end, without this marker the forwarded request would
-// match the subdomain rule again on the target backend, find no session in its own
-// map, and fail with "tunnel is not connected".
-const tunnelForwardedHeader = "X-Goport-Tunnel"
-
-func (t *tcpService) HandleTunnelRequest(e *core.RequestEvent) (bool, error) {
-	// Already came out of a tunnel hop, so don't intercept it again.
-	if e.Request.Header.Get(tunnelForwardedHeader) != "" {
-		return false, nil
-	}
-
-	subdomain, ok := t.subdomainFromHost(e.Request.Host)
-	if !ok {
-		return false, nil
-	}
-
+// activeSessions counts userID's live and still-registering sessions,
+// leaving out except.
+func (t *tcpService) activeSessions(userID, except string) int {
 	t.mu.Lock()
-	session := t.sessions[subdomain]
-	tunnelID := t.tunnelIDs[subdomain]
-	userID := t.sessionUsers[subdomain]
-	isCustom := t.sessionCustom[subdomain]
-	sessionType := t.sessionTypes[subdomain]
-	shareToken := t.shareTokens[subdomain]
-	shareExpiry := t.shareExpires[subdomain]
-	t.mu.Unlock()
-	if strings.HasPrefix(e.Request.URL.Path, "/s/") {
-		if sessionType != "share" || !sharePathMatches(e.Request.URL.Path, shareToken) {
-			http.NotFound(e.Response, e.Request)
-			return true, nil
-		}
-	} else if sessionType == "share" {
-		http.NotFound(e.Response, e.Request)
-		return true, nil
-	}
-	if !shareExpiry.IsZero() && !time.Now().Before(shareExpiry) {
-		http.Error(e.Response, "This share has expired.", http.StatusGone)
-		return true, nil
-	}
-
-	if session == nil || session.IsClosed() || tunnelID == "" {
-		http.Error(e.Response, "tunnel is not connected", http.StatusBadGateway)
-		return true, nil
-	}
-	limits, usedBytes, err := t.trafficAllowance(userID)
-	if err != nil {
-		http.Error(e.Response, "could not verify tunnel allowance", http.StatusServiceUnavailable)
-		return true, nil
-	}
-	if isCustom && !limits.CustomSubdomains {
-		http.Error(e.Response, "this custom subdomain requires an active GoPort Pro subscription", http.StatusPaymentRequired)
-		return true, nil
-	}
-	if !t.sessionWithinPlanLimit(subdomain, userID, limits.MaxActiveTunnels) {
-		http.Error(e.Response, "this tunnel is outside your current plan allowance; stop extra tunnels or upgrade to Pro", http.StatusPaymentRequired)
-		return true, nil
-	}
-	if usedBytes >= limits.MonthlyBytes {
-		http.Error(e.Response, "monthly traffic allowance reached", http.StatusTooManyRequests)
-		return true, nil
-	}
-
-	stream, err := session.Open()
-	if err != nil {
-		log.Printf("tunnel %s: failed to open stream: %v", subdomain, err)
-		http.Error(e.Response, "failed to open tunnel stream", http.StatusBadGateway)
-		return true, nil
-	}
-	defer stream.Close()
-
-	// Upgrade requests must keep their Connection and Upgrade headers all the
-	// way to the local application. Next.js uses this for the dev HMR socket.
-	upgradeRequest := isUpgradeRequest(e.Request)
-	outReq, err := buildForwardRequest(e.Request, upgradeRequest)
-	if err != nil {
-		log.Printf("tunnel %s: failed to build forward request: %v", subdomain, err)
-		http.Error(e.Response, "failed to prepare tunnel request", http.StatusBadGateway)
-		return true, nil
-	}
-
-	if err := outReq.Write(stream); err != nil {
-		log.Printf("tunnel %s: failed to write request to stream: %v", subdomain, err)
-		http.Error(e.Response, "failed to send request to tunnel", http.StatusBadGateway)
-		return true, nil
-	}
-
-	if upgradeRequest {
-		clientConn, _, err := http.NewResponseController(e.Response).Hijack()
-		if err != nil {
-			log.Printf("tunnel %s: failed to hijack upgrade connection: %v", subdomain, err)
-			_ = stream.Close()
-			return true, err
-		}
-		defer clientConn.Close()
-
-		// An upgraded connection is counted once, when it closes, together with
-		// everything relayed over it.
-		t.recordTraffic(tunnelID, subdomain, userID, copyTunnelStream(clientConn, stream))
-		return true, nil
-	}
-
-	resp, err := http.ReadResponse(bufio.NewReader(stream), outReq)
-	if err != nil {
-		log.Printf("tunnel %s: failed to read response from stream: %v", subdomain, err)
-		http.Error(e.Response, "failed to read tunnel response", http.StatusBadGateway)
-		return true, nil
-	}
-	defer resp.Body.Close()
-
-	copyHeaders(e.Response.Header(), resp.Header)
-	e.Response.WriteHeader(resp.StatusCode)
-	written, err := io.Copy(e.Response, resp.Body)
-	if err != nil && !isClosedErr(err) {
-		log.Printf("tunnel %s: error copying response body: %v", subdomain, err)
-		t.recordTraffic(tunnelID, subdomain, userID, written+maxInt64(outReq.ContentLength, 0))
-		return true, nil
-	}
-	t.recordTraffic(tunnelID, subdomain, userID, written+maxInt64(outReq.ContentLength, 0))
-	return true, nil
+	defer t.mu.Unlock()
+	return t.activeSessionsLocked(userID, except)
 }
 
-func sharePathMatches(requestPath, token string) bool {
-	if token == "" {
-		return false
+func (t *tcpService) activeSessionsLocked(userID, except string) int {
+	active := 0
+	for subdomain, owner := range t.sessionUsers {
+		if owner != userID || subdomain == except {
+			continue
+		}
+		if session, ok := t.sessions[subdomain]; ok && (session == nil || !session.IsClosed()) {
+			active++
+		}
 	}
-	prefix := "/s/" + token
-	if len(requestPath) < len(prefix) || subtle.ConstantTimeCompare([]byte(requestPath[:len(prefix)]), []byte(prefix)) != 1 {
-		return false
-	}
-	return len(requestPath) == len(prefix) || requestPath[len(prefix)] == '/'
+	return active
+}
+
+// planLimitMessage has no permanent phrase on purpose: the CLI keeps retrying
+// and connects once the user stops another tunnel.
+func planLimitMessage(maxActive int) string {
+	return fmt.Sprintf("your plan allows up to %d active tunnels; stop one or upgrade at https://goport.uz/dashboard#billing", maxActive)
+}
+
+// forgetSessionLocked drops every entry of a session. Must hold t.mu.
+func (t *tcpService) forgetSessionLocked(subdomain string) {
+	delete(t.sessions, subdomain)
+	delete(t.owners, subdomain)
+	delete(t.tunnelIDs, subdomain)
+	delete(t.sessionUsers, subdomain)
+	delete(t.sessionTokens, subdomain)
+	delete(t.sessionCustom, subdomain)
+	delete(t.sessionTypes, subdomain)
+	delete(t.shareTokens, subdomain)
+	delete(t.shareExpires, subdomain)
+	delete(t.sessionOrder, subdomain)
 }
 
 func (t *tcpService) sessionWithinPlanLimit(subdomain, userID string, maxActive int) bool {
@@ -1164,16 +1076,15 @@ func (t *tcpService) pendingBytesForUser(userID string, from time.Time) int64 {
 	return total
 }
 
-func maxInt64(a, b int64) int64 {
-	if a > b {
-		return a
-	}
-	return b
+// recordTraffic counts one finished request and the bytes it moved.
+func (t *tcpService) recordTraffic(tunnelID, subdomain, userID string, bytesTransferred int64) {
+	t.addTraffic(tunnelID, subdomain, userID, bytesTransferred, 1)
 }
 
-// recordTraffic keeps the completion timestamp with each delta so retries and
+// addTraffic keeps the completion timestamp with each delta so retries and
 // flushes around a bucket boundary cannot move traffic into the wrong period.
-func (t *tcpService) recordTraffic(tunnelID, subdomain, userID string, bytesTransferred int64) {
+// Long transfers add their bytes as they go, with requests set to 0.
+func (t *tcpService) addTraffic(tunnelID, subdomain, userID string, bytesTransferred, requests int64) {
 	if tunnelID == "" || subdomain == "" || userID == "" {
 		return
 	}
@@ -1191,7 +1102,7 @@ func (t *tcpService) recordTraffic(tunnelID, subdomain, userID string, bytesTran
 		stat = &tunnelStat{}
 		t.stats[key] = stat
 	}
-	stat.requests++
+	stat.requests += requests
 	if bytesTransferred > 0 {
 		stat.bytes += bytesTransferred
 	}
@@ -1221,11 +1132,17 @@ func (t *tcpService) flushLoop() {
 		case <-t.stopFlush:
 			return
 		case <-ticker.C:
-			t.flushStats()
+			t.safely("stats flush", t.flushStats)
 		case now := <-online.C:
-			t.flushOnline(now)
+			t.safely("online time flush", func() { t.flushOnline(now) })
 		}
 	}
+}
+
+// safely runs fn and logs a panic instead of ending the caller's loop.
+func (t *tcpService) safely(where string, fn func()) {
+	defer recoverPanic(where)
+	fn()
 }
 
 // endOnlineLocked queues the connected time a session built up since it was
@@ -1368,149 +1285,5 @@ func (t *tcpService) flushStats() {
 			stat.lastActive = delta.lastActive
 		}
 		t.statsMu.Unlock()
-	}
-}
-
-// buildForwardRequest reads the incoming request body and creates a fresh outbound
-// http.Request suitable for serializing over the tunnel stream with Request.Write.
-func buildForwardRequest(in *http.Request, preserveUpgradeHeaders bool) (*http.Request, error) {
-	var body io.Reader
-	var contentLength int64 = -1
-
-	if in.Body != nil && in.Body != http.NoBody {
-		buf, err := io.ReadAll(in.Body)
-		if err != nil {
-			return nil, fmt.Errorf("read body: %w", err)
-		}
-		_ = in.Body.Close()
-		body = bytes.NewReader(buf)
-		contentLength = int64(len(buf))
-	}
-
-	out, err := http.NewRequest(in.Method, in.URL.RequestURI(), body)
-	if err != nil {
-		return nil, err
-	}
-
-	// Copy request headers. Upgrade headers are only forwarded when this is an
-	// upgrade request; they are invalid on ordinary proxied requests.
-	for key, values := range in.Header {
-		if isHopByHopHeader(key) && !preserveUpgradeHeaders {
-			continue
-		}
-		// http.NewRequest may have set Content-Length from the body; skip duplicate.
-		if strings.EqualFold(key, "Content-Length") {
-			continue
-		}
-		for _, v := range values {
-			out.Header.Add(key, v)
-		}
-	}
-	out.Host = in.Host
-	// Mark the request as tunnel-forwarded so a target that is itself a GoPort
-	// backend serves it normally instead of re-intercepting it.
-	out.Header.Set(tunnelForwardedHeader, "1")
-	if contentLength >= 0 {
-		out.ContentLength = contentLength
-	}
-	if !preserveUpgradeHeaders {
-		out.Close = true
-		out.Header.Set("Connection", "close")
-	}
-
-	return out, nil
-}
-
-func isUpgradeRequest(req *http.Request) bool {
-	return strings.EqualFold(req.Header.Get("Upgrade"), "websocket") &&
-		strings.Contains(strings.ToLower(req.Header.Get("Connection")), "upgrade")
-}
-
-// copyTunnelStream relays an upgraded connection in both directions and reports
-// how many bytes moved. It returns as soon as either direction ends, so bytes
-// still in flight the other way can be missed; the total only feeds aggregate
-// usage figures.
-func copyTunnelStream(a, b net.Conn) int64 {
-	var transferred atomic.Int64
-
-	done := make(chan struct{}, 2)
-	go func() {
-		n, _ := io.Copy(a, b)
-		transferred.Add(n)
-		_ = closeWrite(a)
-		done <- struct{}{}
-	}()
-	go func() {
-		n, _ := io.Copy(b, a)
-		transferred.Add(n)
-		_ = closeWrite(b)
-		done <- struct{}{}
-	}()
-	<-done
-
-	return transferred.Load()
-}
-
-func closeWrite(conn net.Conn) error {
-	if writer, ok := conn.(interface{ CloseWrite() error }); ok {
-		return writer.CloseWrite()
-	}
-	return nil
-}
-
-func isClosedErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "use of closed network connection") ||
-		strings.Contains(msg, "broken pipe") ||
-		strings.Contains(msg, "connection reset by peer")
-}
-
-// IsTunnelHost reports whether host is a tunnel subdomain rather than the
-// site or API itself.
-func (t *tcpService) IsTunnelHost(host string) bool {
-	_, ok := t.subdomainFromHost(host)
-	return ok
-}
-
-func (t *tcpService) subdomainFromHost(host string) (string, bool) {
-	host = strings.ToLower(strings.TrimSpace(host))
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
-
-	domain := strings.ToLower(strings.TrimSpace(t.domain))
-	suffix := "." + domain
-	if host == domain || host == "www."+domain || host == "back."+domain || !strings.HasSuffix(host, suffix) {
-		return "", false
-	}
-
-	subdomain := strings.TrimSuffix(host, suffix)
-	if subdomain == "" || strings.Contains(subdomain, ".") {
-		return "", false
-	}
-
-	return subdomain, true
-}
-
-func copyHeaders(dst, src http.Header) {
-	for key, values := range src {
-		if isHopByHopHeader(key) {
-			continue
-		}
-		for _, value := range values {
-			dst.Add(key, value)
-		}
-	}
-}
-
-func isHopByHopHeader(key string) bool {
-	switch strings.ToLower(key) {
-	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade":
-		return true
-	default:
-		return false
 	}
 }
