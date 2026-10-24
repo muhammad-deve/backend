@@ -7,6 +7,7 @@ import (
 
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
+	"github.com/pocketbase/pocketbase/tools/types"
 	"gitlab.yurtal.tech/company/pocketbase-app-template/internal/model"
 )
 
@@ -69,8 +70,8 @@ func (r *Usage) ListBuckets(userID string, from, to time.Time) ([]model.UsageBuc
 		0,
 		dbx.Params{
 			"user": userID,
-			"from": from.UTC(),
-			"to":   to.UTC(),
+			"from": dbDate(from),
+			"to":   dbDate(to),
 		},
 	)
 	if err != nil {
@@ -103,8 +104,8 @@ func (r *Usage) BytesForPeriod(userID string, from, to time.Time) (int64, error)
 			AND bucket_start < {:to}
 	`).Bind(dbx.Params{
 		"user": userID,
-		"from": from.UTC(),
-		"to":   to.UTC(),
+		"from": dbDate(from),
+		"to":   dbDate(to),
 	}).One(&result)
 	if err != nil {
 		return 0, err
@@ -147,7 +148,7 @@ func incrementBucketUsage(app core.App, tunnelID, userID string, bucketStart tim
 	row, err := app.FindFirstRecordByFilter(
 		model.TunnelUsageBucketsCollection,
 		"tunnel_id = {:tunnel} && bucket_start = {:bucket}",
-		dbx.Params{"tunnel": tunnelID, "bucket": bucketStart},
+		dbx.Params{"tunnel": tunnelID, "bucket": dbDate(bucketStart)},
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		row = core.NewRecord(collection)
@@ -163,4 +164,12 @@ func incrementBucketUsage(app core.App, tunnelID, userID string, bucketStart tim
 	row.Set("request_count", row.GetFloat("request_count")+float64(delta.Requests))
 	row.Set("bytes_transferred", row.GetFloat("bytes_transferred")+float64(delta.Bytes))
 	return app.Save(row)
+}
+
+// dbDate formats t the way PocketBase stores date fields. Dates are compared
+// as text in SQL, so a time.Time bound directly (formatted by the driver or the
+// filter parser in another layout) never equals a stored value, and only
+// orders correctly by luck.
+func dbDate(t time.Time) string {
+	return t.UTC().Format(types.DefaultDateLayout)
 }

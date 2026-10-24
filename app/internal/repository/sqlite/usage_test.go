@@ -139,3 +139,33 @@ func TestPocketBaseDeleteKeepsUsageToo(t *testing.T) {
 		t.Fatalf("BytesForPeriod = %d, %v; want 300", bytes, err)
 	}
 }
+
+// Stats are flushed every few seconds, so one hourly bucket is written many
+// times. Each flush must add to the same row.
+func TestTrafficAddsUpWithinOneBucket(t *testing.T) {
+	app := migratedApp(t)
+	usage := NewUsage(app)
+	alice := newUser(t, app, "alice@example.com")
+	tunnel := newTunnel(t, app, alice.Id, "alice-one")
+	bucket := time.Now().UTC().Truncate(model.UsageBucketDuration)
+	for i := 0; i < 3; i++ {
+		if err := usage.AddTraffic(tunnel.Id, bucket, model.UsageDelta{Requests: 1, Bytes: 100}); err != nil {
+			t.Fatalf("flush %d: %v", i+1, err)
+		}
+	}
+	monthStart := time.Date(bucket.Year(), bucket.Month(), 1, 0, 0, 0, 0, time.UTC)
+	bytes, err := usage.BytesForPeriod(alice.Id, monthStart, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes != 300 {
+		t.Fatalf("monthly bytes = %d, want 300", bytes)
+	}
+	buckets, err := usage.ListBuckets(alice.Id, bucket, bucket.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(buckets) != 1 || buckets[0].Requests != 3 {
+		t.Fatalf("buckets = %+v, want one bucket with 3 requests", buckets)
+	}
+}
